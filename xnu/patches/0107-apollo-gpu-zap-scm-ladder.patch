@@ -1,0 +1,241 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -76,9 +76,10 @@
+  *             shader" (a650_zap.mdt/.b02, ADT /sweet-gpu "zap-metadata" and
+  *             "zap-segment", mkadt.py --zap-mdt --zap-seg); only then can the
+  *             command processor be told to leave secure mode, which it comes
+- *             out of reset locked in (CP_SET_SECURE_MODE 0). Staged behind
+- *             sweetgpuzap (0 off, the default, after a plain PAS call hung
+- *             apollo; 1 only the safe TrustZone queries; 2 the whole thing)
++ *             out of reset locked in (CP_SET_SECURE_MODE 0). The SCM calls are
++ *             a ladder set by sweetgpuzap (0 off and safe, the default, after a
++ *             blind PAS call hung apollo; 1 the no-memory queries; 2 += the
++ *             signature; 3 += the load and leaving secure mode)
+  * Steps 18-19 port HackiOS steps 18 and 20; step 20 ports HackiOS steps 19 and
+  * 21 (the zap shader, then out of secure mode) with the a650's PAS image 13.
+  * The zap calls are SMCs the hypervisor passes to TrustZone (qcom_scm-smc.c);
+@@ -346,6 +347,7 @@
+ #define SCM_PAS_MEM_SETUP     SCM_CALL(2, 2)
+ #define SCM_PAS_AUTH_AND_RESET SCM_CALL(2, 5)
+ #define SCM_PAS_SHUTDOWN      SCM_CALL(2, 6)
++#define SCM_PAS_IS_SUPPORTED  SCM_CALL(2, 7) /* a no-memory query: does TrustZone manage this image? */
+ #define SCM_ONE_VALUE         1u            /* argument descriptor: one plain number */
+ #define SCM_VALUE_AND_BUFFER  (2u | (2u << 6)) /* two: a number, then an address of memory TrustZone may use */
+ #define SCM_THREE_VALUES      3u            /* three plain numbers */
+@@ -1621,35 +1623,45 @@
+ 	/*
+ 	 * The 3D core came out of reset locked in secure mode; on a phone only
+ 	 * TrustZone lets it out, by authenticating the vendor's signed zap shader
+-	 * and running it. Linux does the same before a6xx leaves secure mode
+-	 * (a6xx_zap_shader_init -> qcom_mdt_load -> qcom_scm_pas_*; the GPU is PAS
+-	 * image 13), then has the command processor leave secure mode. The zap
+-	 * metadata (.mdt) and its one loadable segment (.b02) come from the ADT.
++	 * (Linux a6xx_zap_shader_init -> qcom_mdt_load -> qcom_scm_pas_*; the GPU
++	 * is PAS image 13), after which the command processor is told to leave
++	 * secure mode. The zap metadata (.mdt = ELF header + hashes) and its one
++	 * loadable segment (.b02) come from the ADT (mkadt.py --zap-mdt --zap-seg).
+ 	 *
+-	 * Boot (sweetgpu=20, no sweetgpuzap): the first SCM call this kernel made,
+-	 * a yielding PAS_SHUTDOWN (smc 0x42000206), did not return -- apollo hung,
+-	 * touch and the rest with it (a live hang; a reboot clears it). HackiOS
+-	 * asks TrustZone a harmless question first (step 11: is the no-memory
+-	 * "is-call-available" query available, the atomic call Linux makes first),
+-	 * which was skipped here. So the SMCs are staged behind sweetgpuzap, the
+-	 * way the touch driver stages its accesses:
+-	 *   0 (default)  do nothing: step 20 is a no-op, no SCM call, no risk
+-	 *   1            only the atomic, no-memory queries (safe): does TrustZone
+-	 *                answer this kernel the way it answers Linux?
+-	 *   2            the full zap load (the yielding PAS calls, one of which
+-	 *                hung) and CP_SET_SECURE_MODE
++	 * These are SMCs. Boot 20 (0105, sweetgpu=20) hung apollo on the very
++	 * first one -- a yielding PAS_SHUTDOWN fired blind (smc 0x42000206) that
++	 * never returned, taking touch down with it. HackiOS does not start there:
++	 * it asks TrustZone the harmless, atomic, no-memory questions Linux asks
++	 * first (its step 11), then the signature (step 12), then the load. So
++	 * step 20 is a ladder, each level one SMC class riskier, chosen by
++	 * sweetgpuzap and safe by default:
++	 *   0 (default)  nothing: no SCM call at all, so sweetgpu=20 cannot hang
++	 *   1            only the atomic, no-memory queries: is "is-call-available"
++	 *                available (64- then 32-bit), are the PAS calls, and which
++	 *                images TrustZone "supports" (the GPU, and audio/modem/
++	 *                video for comparison) -- HackiOS step 11
++	 *   2            + the signature of the zap .mdt (PAS_INIT_IMAGE): the first
++	 *                yielding call with a buffer, but it touches no GPU -- step 12
++	 *   3            + where the image goes, the segment, authenticate and run,
++	 *                then CP_SET_SECURE_MODE -- HackiOS steps 19 and 21
++	 * The blind PAS_SHUTDOWN that hung is gone; a loaded shader is handed back
++	 * only in the teardown, and only once one was really authenticated here, so
++	 * that call is made only after a yielding call has already come back.
+ 	 */
+ 	unsigned zap_stage = 0;
+ 	(void)PE_parse_boot_argn("sweetgpuzap", &zap_stage, sizeof(zap_stage));
+ 	if (zap_stage == 0) {
+-		printf("SWEET GPU: step 20: held back (sweetgpuzap=0): a plain TrustZone PAS call hung apollo. "
+-		    "sweetgpuzap=1 probes TrustZone safely; =2 attempts the zap shader\n");
++		printf("SWEET GPU: step 20: held back (sweetgpuzap=0): a blind TrustZone PAS call hung apollo. "
++		    "sweetgpuzap=1 = the safe queries, =2 += the signature, =3 += load and leave secure mode\n");
+ 		goto collapse;
+ 	}
+-	/* stage 1+: the atomic, no-memory query Linux asks first (qcom_scm __qcom_scm_is_call_available) */
++
++	/* stage 1: the atomic (SCM_FAST), no-memory questions Linux asks first (HackiOS step 11) */
+ 	{
++		static const struct { const char *name; uint32_t id; } images[] =
++		    { { "audio", 1 }, { "modem", 4 }, { "video", 9 }, { "GPU zap shader", PAS_GPU } };
+ 		uint64_t how = SCM_FAST | SCM_64 | SCM_SIP, ans = 0;
+-		printf("SWEET GPU: step 20: ask TrustZone what Linux asks first: is \"is-call-available\" available (64-bit)?\n");
++		printf("SWEET GPU: step 20: ask TrustZone what Linux asks first: is \"is-call-available\" available? (64-bit)\n");
+ 		if (gpu_scm("whether it can be asked (64-bit)", how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE,
+ 		    SCM_SIP | SCM_IS_CALL_AVAILABLE, 0, 0, &ans) != 0 || ans != 1) {
+ 			how = SCM_FAST | SCM_SIP;        /* Linux's second try: 32-bit arguments */
+@@ -1657,23 +1669,28 @@
+ 			printf("SWEET GPU: step 20: the same, the 32-bit way\n");
+ 			if (gpu_scm("whether it can be asked (32-bit)", how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE,
+ 			    SCM_SIP | SCM_IS_CALL_AVAILABLE, 0, 0, &ans) != 0 || ans != 1) {
+-				printf("SWEET GPU: step 20: TrustZone does not answer the way it answers Linux\n");
++				printf("SWEET GPU: step 20: TrustZone does not answer the way it answers Linux; stopping\n");
+ 				goto collapse;
+ 			}
+ 		}
+ 		ans = 0;
+-		(void)gpu_scm("for the signature call", how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE,
++		(void)gpu_scm("is the signature call there", how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE,
+ 		    SCM_SIP | SCM_PAS_INIT_IMAGE, 0, 0, &ans);
+ 		ans = 0;
+-		(void)gpu_scm("for the authenticate-and-reset call", how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE,
++		(void)gpu_scm("is authenticate-and-reset there", how | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE,
+ 		    SCM_SIP | SCM_PAS_AUTH_AND_RESET, 0, 0, &ans);
+-		printf("SWEET GPU: step 20: TrustZone answers this kernel's queries\n");
++		for (unsigned i = 0; i < sizeof(images) / sizeof(images[0]); ++i) {
++			ans = 0;
++			(void)gpu_scm(images[i].name, how | SCM_PAS_IS_SUPPORTED, SCM_ONE_VALUE, images[i].id, 0, 0, &ans);
++		}
++		printf("SWEET GPU: step 20: TrustZone answered the safe queries (the lines above say how)\n");
+ 	}
+ 	if (zap_stage < 2) {
+-		printf("SWEET GPU: step 20: stopping after the safe probe (sweetgpuzap=1); =2 to attempt the zap shader\n");
++		printf("SWEET GPU: step 20: stopping after the safe queries (sweetgpuzap=1); =2 checks the signature\n");
+ 		goto collapse;
+ 	}
+ 
++	/* the zap metadata from the ADT (stages 2 and 3); the segment is needed only at stage 3 */
+ 	const uint8_t *zap_mdt = NULL, *zap_seg = NULL;
+ 	unsigned int zap_mdt_size = 0, zap_seg_size = 0;
+ 	{
+@@ -1687,63 +1704,69 @@
+ 				zap_seg = prop;
+ 		}
+ 	}
+-	if (!zap_mdt || !zap_seg || zap_seg_size == 0 || zap_seg_size > ZAP_MEMORY_SIZE) {
+-		printf("SWEET GPU: step 20: no /sweet-gpu zap-metadata/zap-segment in the ADT "
+-		    "(mkadt.py --zap-mdt a650_zap.mdt --zap-seg a650_zap.b02)\n");
++	if (!zap_mdt) {
++		printf("SWEET GPU: step 20: no /sweet-gpu zap-metadata in the ADT (mkadt.py --zap-mdt a650_zap.mdt)\n");
+ 		goto collapse;
+ 	}
+ 
+-	/* a kernel before this one may have left a zap shader in TrustZone; have it given up first */
+-	printf("SWEET GPU: step 20: ask TrustZone to give up a zap shader a kernel before this one may have left\n");
+-	printf("SWEET GPU:   %s\n", gpu_zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
+-	    "TrustZone does not give it up: the next answers tell whether it keeps one");
+-
++	/* stage 2: the signature. A yielding call that passes the .mdt, but touches no GPU (HackiOS step 12). */
+ 	uint64_t zap_header_pa = 0, zap_answer = ~0ull;
+-	printf("SWEET GPU: step 20: zap metadata %u bytes, segment %u bytes\n", zap_mdt_size, zap_seg_size);
++	int32_t sig;
+ 	if (!gpu_zap_header(zap_mdt, zap_mdt_size, &zap_header_pa))
+ 		goto collapse;
+-
+-	printf("SWEET GPU: step 20: hand TrustZone the signature to check (image %u)\n", PAS_GPU);
+-	if (gpu_scm("to take the zap shader's signature", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_GPU,
+-	    zap_header_pa, 0, &zap_answer) != 0 || zap_answer != 0) {
+-		printf("SWEET GPU: step 20: TrustZone does not take the signature (answer %#llx): taken to mean it keeps a zap "
+-		    "shader from before, used as it is\n", (unsigned long long)zap_answer);
+-		zap_loaded = true;
+-		goto leave_secure;
++	printf("SWEET GPU: step 20: hand TrustZone the zap shader's signature to check (image %u)\n", PAS_GPU);
++	sig = gpu_scm("to take the zap shader's signature", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER,
++	    PAS_GPU, zap_header_pa, 0, &zap_answer);
++	if (sig == 0 && zap_answer == 0)
++		printf("SWEET GPU: step 20: TRUSTZONE ACCEPTS THE ZAP SHADER'S SIGNATURE FROM THIS KERNEL\n");
++	else
++		printf("SWEET GPU: step 20: TrustZone does not take the signature (returns %d, answer %#llx): a kernel before "
++		    "this one may already hold one\n", sig, (unsigned long long)zap_answer);
++	if (zap_stage < 3) {
++		printf("SWEET GPU: step 20: stopping after the signature (sweetgpuzap=2); =3 loads it and leaves secure mode\n");
++		goto collapse;
+ 	}
+-	zap_answer = ~0ull;
+-	printf("SWEET GPU: step 20: tell TrustZone where the image goes: %#x (%#x bytes)\n", ZAP_MEMORY_PA, ZAP_MEMORY_SIZE);
+-	if (gpu_scm("where the image goes", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_GPU, ZAP_MEMORY_PA,
+-	    ZAP_MEMORY_SIZE, &zap_answer) != 0 || zap_answer != 0) {
+-		printf("SWEET GPU: step 20: TrustZone does not take the place (answer %#llx): taken to mean it keeps a zap "
+-		    "shader from before, used as it is\n", (unsigned long long)zap_answer);
++
++	/* stage 3: where it goes, the segment, authenticate and run; then leave secure mode (HackiOS steps 19, 21) */
++	if (!zap_seg || zap_seg_size == 0 || zap_seg_size > ZAP_MEMORY_SIZE) {
++		printf("SWEET GPU: step 20: no /sweet-gpu zap-segment in the ADT (mkadt.py --zap-seg a650_zap.b02)\n");
++		goto collapse;
++	}
++	if (sig == 0 && zap_answer == 0) {
++		zap_answer = ~0ull;
++		printf("SWEET GPU: step 20: tell TrustZone where the image goes: %#x (%#x bytes)\n", ZAP_MEMORY_PA, ZAP_MEMORY_SIZE);
++		if (gpu_scm("where the image goes", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_GPU, ZAP_MEMORY_PA,
++		    ZAP_MEMORY_SIZE, &zap_answer) != 0 || zap_answer != 0) {
++			printf("SWEET GPU: step 20: TrustZone does not take the place (answer %#llx)\n", (unsigned long long)zap_answer);
++			goto collapse;
++		}
++		/* only now is that memory ours to write: TrustZone has just said it is not yet its own */
++		{
++			vm_offset_t zap_va = ml_io_map_wcomb(ZAP_MEMORY_PA, ZAP_MEMORY_SIZE);
++			volatile uint8_t *zap = (volatile uint8_t *)zap_va;
++			printf("SWEET GPU: step 20: reserved memory begins %02x %02x %02x %02x, the segment %02x %02x %02x %02x; "
++			    "writing %u bytes at %#x\n", zap[0], zap[1], zap[2], zap[3], zap_seg[0], zap_seg[1], zap_seg[2],
++			    zap_seg[3], zap_seg_size, ZAP_MEMORY_PA);
++			for (unsigned int i = 0; i < ZAP_MEMORY_SIZE; ++i)
++				zap[i] = (i < zap_seg_size) ? zap_seg[i] : 0;
++			__asm__ volatile("dsb sy" ::: "memory");  /* the write-combine write lands before TrustZone reads it */
++		}
++		zap_answer = ~0ull;
++		printf("SWEET GPU: step 20: ask TrustZone to authenticate the zap shader and run it\n");
++		if (gpu_scm("to authenticate the zap shader and run it", SCM_64 | SCM_SIP | SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE,
++		    PAS_GPU, 0, 0, &zap_answer) != 0 || zap_answer != 0) {
++			printf("SWEET GPU: step 20: TrustZone does not authenticate the zap shader (answer %#llx)\n",
++			    (unsigned long long)zap_answer);
++			goto collapse;
++		}
+ 		zap_loaded = true;
+-		goto leave_secure;
+-	}
+-	/* only now is that memory ours to write: TrustZone has just said it is not yet its own */
+-	{
+-		vm_offset_t zap_va = ml_io_map_wcomb(ZAP_MEMORY_PA, ZAP_MEMORY_SIZE);
+-		volatile uint8_t *zap = (volatile uint8_t *)zap_va;
+-		printf("SWEET GPU: step 20: reserved memory begins %02x %02x %02x %02x, the segment %02x %02x %02x %02x; "
+-		    "writing %u bytes at %#x\n", zap[0], zap[1], zap[2], zap[3], zap_seg[0], zap_seg[1], zap_seg[2], zap_seg[3],
+-		    zap_seg_size, ZAP_MEMORY_PA);
+-		for (unsigned int i = 0; i < ZAP_MEMORY_SIZE; ++i)
+-			zap[i] = (i < zap_seg_size) ? zap_seg[i] : 0;
+-		__asm__ volatile("dsb sy" ::: "memory");   /* the write-combine write lands before TrustZone reads it */
+-	}
+-	zap_answer = ~0ull;
+-	printf("SWEET GPU: step 20: ask TrustZone to authenticate the zap shader and run it\n");
+-	if (gpu_scm("to authenticate the zap shader and run it", SCM_64 | SCM_SIP | SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE,
+-	    PAS_GPU, 0, 0, &zap_answer) != 0 || zap_answer != 0) {
+-		printf("SWEET GPU: step 20: TrustZone does not authenticate the zap shader (answer %#llx)\n",
+-		    (unsigned long long)zap_answer);
+-		goto collapse;
++		printf("SWEET GPU: step 20: TRUSTZONE HAS AUTHENTICATED AND STARTED THE ZAP SHADER\n");
++	} else {
++		printf("SWEET GPU: step 20: the signature was refused; taking it that TrustZone keeps a shader from before and "
++		    "trying to leave secure mode with it\n");
+ 	}
+-	zap_loaded = true;
+-	printf("SWEET GPU: step 20: TRUSTZONE HAS AUTHENTICATED AND STARTED THE ZAP SHADER\n");
+ 
+-leave_secure:
+-	/* tell the command processor to leave secure mode (it asks the zap shader); the ring picks up after CP_ME_INIT */
++	/* command the 3D core out of secure mode; the ring picks up after CP_ME_INIT (wptr 9 -> 11) */
+ 	printf("SWEET GPU: step 20: command the 3D core out of secure mode (CP_SET_SECURE_MODE 0)\n");
+ 	ring[at++] = (7u << 28) | 1u | (gpu_parity(1) << 15) | (CP_SET_SECURE_MODE << 16) | (gpu_parity(CP_SET_SECURE_MODE) << 23);
+ 	ring[at++] = 0;                              /* 0 = not secure */
