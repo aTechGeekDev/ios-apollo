@@ -1,0 +1,11 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -697,6 +697,8 @@
+ 		session = x6;
+ 		if (x0 != SCM_INTERRUPTED) {
+ 			*answer = x1;
++			printf("SWEET GPU:   TrustZone returns %d, answer %#llx%s\n", (int32_t)x0, (unsigned long long)x1,
++			    i ? " (after resuming an interrupted call)" : "");
+ 			return (int32_t)x0;
+ 		}
+ 	}

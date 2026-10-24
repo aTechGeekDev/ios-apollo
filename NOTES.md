@@ -4,6 +4,8 @@
 
 ### >>> APOLLO PORT, UPDATE 2026-10-23 (read first; sweet history follows) <<<
 
+**2026-10-24: 0108 = gpu_scm logs the result of every TrustZone call (`returns %d, answer %#llx`).** Trivial but needed: without it stage 1's queries (is-call-available, is-supported for GPU/audio/modem/video) printed only "about to ask" and no answer, so the probe told us nothing. Now each SMC prints its return and answer word. Test with `sweetgpu=20 sweetgpuzap=1`.
+
 **2026-10-24: 0107 = step 20 reworked into a safe TrustZone ladder; the blind PAS_SHUTDOWN that hung is removed. Written, NOT booted yet.** Supersedes 0106's staging. The driver is sound through step 19 (boots 11-19 all passed, 3D core takes commands); the only blocker is leaving secure mode, which is one TrustZone interaction, so step 20 is reworked rather than the driver rewritten. `sweetgpuzap` is now a 0-3 ladder, each rung one SMC class riskier, safe by default:
 - **0 (default):** step 20 is a no-op -- no SCM call at all, so `sweetgpu=20` can no longer hang the phone.
 - **1:** only the atomic (`SCM_FAST`), no-memory queries HackiOS asks first (its step 11, skipped in 0105): is-call-available 64- then 32-bit; is-call-available for PAS_INIT_IMAGE and PAS_AUTH_AND_RESET; PAS_IS_SUPPORTED for the GPU and, for comparison, audio(1)/modem(4)/video(9). Fast calls return at once, so this is the safe way to learn whether TrustZone talks to this kernel and how it answers.
