@@ -1,0 +1,49 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -77,9 +77,9 @@
+  *             "zap-segment", mkadt.py --zap-mdt --zap-seg); only then can the
+  *             command processor be told to leave secure mode, which it comes
+  *             out of reset locked in (CP_SET_SECURE_MODE 0). The SCM calls are
+- *             a ladder set by sweetgpuzap (0 off and safe, the default, after a
+- *             blind PAS call hung apollo; 1 the no-memory queries; 2 += the
+- *             signature; 3 += the load and leaving secure mode)
++ *             a ladder set by sweetgpuzap (0 off; 1 the no-memory queries; 2 +=
++ *             the signature; 3 += the load and leaving secure mode, the default
++ *             since boots 22-24 verified every rung)
+  * Steps 18-19 port HackiOS steps 18 and 20; step 20 ports HackiOS steps 19 and
+  * 21 (the zap shader, then out of secure mode) with the a650's PAS image 13.
+  * The zap calls are SMCs the hypervisor passes to TrustZone (qcom_scm-smc.c);
+@@ -1636,25 +1636,27 @@
+ 	 * it asks TrustZone the harmless, atomic, no-memory questions Linux asks
+ 	 * first (its step 11), then the signature (step 12), then the load. So
+ 	 * step 20 is a ladder, each level one SMC class riskier, chosen by
+-	 * sweetgpuzap and safe by default:
+-	 *   0 (default)  nothing: no SCM call at all, so sweetgpu=20 cannot hang
++	 * sweetgpuzap; boots 22-24 climbed it clean (TrustZone answers, resumes an
++	 * interrupted yielding call, authenticates our a650_zap.mdt, and the core
++	 * leaves secure mode), so the full ladder is the default now:
++	 *   0            nothing: no SCM call at all (explicit opt-out)
+ 	 *   1            only the atomic, no-memory queries: is "is-call-available"
+ 	 *                available (64- then 32-bit), are the PAS calls, and which
+ 	 *                images TrustZone "supports" (the GPU, and audio/modem/
+ 	 *                video for comparison) -- HackiOS step 11
+ 	 *   2            + the signature of the zap .mdt (PAS_INIT_IMAGE): the first
+ 	 *                yielding call with a buffer, but it touches no GPU -- step 12
+-	 *   3            + where the image goes, the segment, authenticate and run,
++	 *   3 (default)  + where the image goes, the segment, authenticate and run,
+ 	 *                then CP_SET_SECURE_MODE -- HackiOS steps 19 and 21
+ 	 * The blind PAS_SHUTDOWN that hung is gone; a loaded shader is handed back
+ 	 * only in the teardown, and only once one was really authenticated here, so
+ 	 * that call is made only after a yielding call has already come back.
+ 	 */
+-	unsigned zap_stage = 0;
++	unsigned zap_stage = 3;        /* boots 22-24: the whole ladder works; leave secure mode by default */
+ 	(void)PE_parse_boot_argn("sweetgpuzap", &zap_stage, sizeof(zap_stage));
+ 	if (zap_stage == 0) {
+-		printf("SWEET GPU: step 20: held back (sweetgpuzap=0): a blind TrustZone PAS call hung apollo. "
+-		    "sweetgpuzap=1 = the safe queries, =2 += the signature, =3 += load and leave secure mode\n");
++		printf("SWEET GPU: step 20: held back (sweetgpuzap=0). The ladder is verified (boots 22-24, THE 3D CORE "
++		    "IS OUT OF SECURE MODE); default is 3 (full). 1 = the safe queries only, 2 += the signature\n");
+ 		goto collapse;
+ 	}
+ 
