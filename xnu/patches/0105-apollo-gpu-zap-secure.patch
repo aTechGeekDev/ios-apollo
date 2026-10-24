@@ -1,0 +1,266 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -72,10 +72,21 @@
+  *  19  write  the core's registers as Linux's hw_init for the a650 sets them
+  *             before the command processor starts, then start it and give it
+  *             its first command, CP_ME_INIT (Linux a6xx_cp_init)
+- * Steps 18-19 port HackiOS steps 18 and 20 with Linux's a650 values.
++ *  20  asks    TrustZone to authenticate and run the vendor's signed "zap
++ *             shader" (a650_zap.mdt/.b02, ADT /sweet-gpu "zap-metadata" and
++ *             "zap-segment", mkadt.py --zap-mdt --zap-seg); only then can the
++ *             command processor be told to leave secure mode, which it comes
++ *             out of reset locked in (CP_SET_SECURE_MODE 0)
++ * Steps 18-19 port HackiOS steps 18 and 20; step 20 ports HackiOS steps 19 and
++ * 21 (the zap shader, then out of secure mode) with the a650's PAS image 13.
++ * The zap calls are SMCs the hypervisor passes to TrustZone (qcom_scm-smc.c);
++ * Linux's a6xx_zap_shader_init / qcom_scm_pas_* do the same before a6xx leaves
++ * secure mode.
+  * After step 4 or later the CX half is collapsed again before returning,
+  * unless boot-arg sweetgpukeep=1. A 3D core powered by step 17 is given
+- * back first (OOB clear, "prepare slumber", RPMh channel to sleep).
++ * back first (OOB clear, "prepare slumber", RPMh channel to sleep); a zap
++ * shader loaded in step 20 is handed back to TrustZone (as the next kernel
++ * loads its own, there being no phone restart between our kernels).
+  *
+  * Addresses: apollo live DT (qcom,gpucc@3d90000 "qcom,gpucc-kona",
+  * gpu_cx_gdsc 0x3d9106c, gpu_gx_domain_addr 0x3d91508, gpu_cx_hw_ctrl
+@@ -322,6 +333,22 @@
+ #define GPU_APRIV_VALUE       ((1u << 6) | (1u << 5) | (1u << 3) | (1u << 2) | (1u << 1))  /* a650 has HW APRIV */
+ #define GPU_SQE_MIN_VERSION   0x095u        /* Linux a6xx_ucode_check_version for a650_sqe.fw */
+ #define CP_ME_INIT            0x48u
++#define CP_SET_SECURE_MODE    0x66u         /* the command that takes the 3D core out of secure mode */
++/* TrustZone (SCM) calls that authenticate a firmware image, convention qcom_scm-smc.c */
++#define SCM_64                (1ull << 30)
++#define SCM_SIP               (2ull << 24)  /* a call of the SoC maker's, not an Arm standard one */
++#define SCM_CALL(svc, cmd)    (((uint64_t)(svc) << 8) | (cmd))
++#define SCM_PAS_INIT_IMAGE    SCM_CALL(2, 1)
++#define SCM_PAS_MEM_SETUP     SCM_CALL(2, 2)
++#define SCM_PAS_AUTH_AND_RESET SCM_CALL(2, 5)
++#define SCM_PAS_SHUTDOWN      SCM_CALL(2, 6)
++#define SCM_ONE_VALUE         1u            /* argument descriptor: one plain number */
++#define SCM_VALUE_AND_BUFFER  (2u | (2u << 6)) /* two: a number, then an address of memory TrustZone may use */
++#define SCM_THREE_VALUES      3u            /* three plain numbers */
++#define SCM_INTERRUPTED       1             /* a preempted call says so, and is made again so */
++#define PAS_GPU               13u           /* the GPU's image number (Linux qcom_scm: the zap shader) */
++#define ZAP_MEMORY_PA         0x8681a000u   /* apollo live DT reserved-memory pil_gpu_mem (the zap image's place) */
++#define ZAP_MEMORY_SIZE       0x1000u       /* the a650 zap shader's one loadable segment is under a page */
+ #define CORE_STREAM          0u            /* apollo DT gfx3d_user iommus <0x0 0x401>: streams 0 and 1 */
+ #define CORE_STREAM_MASK      0x401u        /* boot 19: mask 0x400 read back 0; written as the DT has it */
+ #define CORE_MATCH            0u            /* match 1 is the GMU's */
+@@ -636,10 +663,93 @@
+ 	return (0x9669u >> (0xfu & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^ (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1u;
+ }
+ 
++/* ---- TrustZone: one SMC, for the zap shader of step 20 (HackiOS's scm(), convention qcom_scm-smc.c) ---- */
++/*
++ * The hypervisor passes the SMC on to TrustZone. A call that may be preempted
++ * returns SCM_INTERRUPTED and is made again with x0 = SCM_INTERRUPTED, the
++ * other words unchanged, until it completes (Linux __scm_smc_do). Result: 0 or
++ * TrustZone's own error, plus one word of answer.
++ */
++static int32_t
++gpu_scm(const char *what, uint64_t function, uint64_t args, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t *answer)
++{
++	uint64_t session = 0;
++	printf("SWEET GPU:   about to ask TrustZone %s: smc %#llx, args %#llx (%#llx, %#llx, %#llx)\n", what,
++	    (unsigned long long)function, (unsigned long long)args, (unsigned long long)a0, (unsigned long long)a1,
++	    (unsigned long long)a2);
++	for (int i = 0; i < 100; ++i) {
++		register uint64_t x0 __asm__("x0") = (i == 0) ? function : SCM_INTERRUPTED;
++		register uint64_t x1 __asm__("x1") = args;
++		register uint64_t x2 __asm__("x2") = a0;
++		register uint64_t x3 __asm__("x3") = a1;
++		register uint64_t x4 __asm__("x4") = a2;
++		register uint64_t x5 __asm__("x5") = 0;
++		register uint64_t x6 __asm__("x6") = session;
++		register uint64_t x7 __asm__("x7") = 0;
++		__asm__ volatile("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++		    : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++		session = x6;
++		if (x0 != SCM_INTERRUPTED) {
++			*answer = x1;
++			return (int32_t)x0;
++		}
++	}
++	printf("SWEET GPU:   TrustZone keeps saying the call was interrupted\n");
++	return -1;
++}
++
++/*
++ * The zap shader's metadata (a650_zap.mdt = the 32-bit ELF header, its program
++ * headers and the hash segment) copied into a page-aligned piece of our memory,
++ * flushed from the cache (TrustZone reads memory, not this core's cache); its
++ * physical address goes back in *phys. The file is checked to be exactly the
++ * header, the headers and the hashes (HackiOS zap_header, Linux
++ * qcom_mdt_pas_init): a 32-bit ELF, program headers from byte 52, 32 bytes
++ * each, the hash segment's size the file size of program header 1.
++ */
++static bool
++gpu_zap_header(const uint8_t *mdt, unsigned int size, uint64_t *phys)
++{
++	vm_offset_t page = 0;
++	if (size < 52u + 2u * 32u || mdt[0] != 0x7f || mdt[1] != 'E' || mdt[2] != 'L' || mdt[3] != 'F' || mdt[4] != 1) {
++		printf("SWEET GPU: step 20: zap-metadata is not a 32-bit ELF header (%02x %02x %02x %02x)\n", mdt[0], mdt[1],
++		    mdt[2], mdt[3]);
++		return false;
++	}
++	uint32_t segments = mdt[44] | ((uint32_t)mdt[45] << 8);
++	uint32_t hashes = mdt[100] | ((uint32_t)mdt[101] << 8) | ((uint32_t)mdt[102] << 16) | ((uint32_t)mdt[103] << 24);
++	printf("SWEET GPU: step 20: %u ELF segments, header and table %u bytes, hashes %u, file %u\n", segments,
++	    52u + 32u * segments, hashes, size);
++	if (segments < 2 || 52u + 32u * segments + hashes != size) {
++		printf("SWEET GPU: step 20: not the header followed by the hashes alone: not what TrustZone takes\n");
++		return false;
++	}
++	if (kmem_alloc(kernel_map, &page, round_page(size), KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) !=
++	    KERN_SUCCESS) {
++		printf("SWEET GPU: step 20: no memory for the zap header\n");
++		return false;
++	}
++	for (unsigned int i = 0; i < size; ++i)
++		((uint8_t *)page)[i] = mdt[i];
++	gpu_to_memory(page, round_page(size));
++	*phys = kvtophys(page);
++	return true;
++}
++
++/* TrustZone is to give up any zap shader a kernel before this one left (vendor kgsl_zap_shader_unload). */
++static bool
++gpu_zap_unload(void)
++{
++	uint64_t answer = ~0ull;
++	/* like Linux's qcom_scm_pas_shutdown, a call that may be preempted (no SCM_FAST) */
++	return gpu_scm("give up the zap shader", SCM_64 | SCM_SIP | SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_GPU, 0, 0,
++	    &answer) == 0 && answer == 0;
++}
++
+ /* ---- HFI: messages through the queues of step 13 ---- */
+ static volatile uint32_t *gmu_hfi_q;          /* uncached view of the HFI page */
+ static uint32_t hfi_qoff, hfi_seq;
+-static bool gmu_talks, gmu_tables, gx_asked, rsc_programmed, gmu_log_shown, core_smmu_on, core_started;
++static bool gmu_talks, gmu_tables, gx_asked, rsc_programmed, gmu_log_shown, core_smmu_on, core_started, zap_loaded;
+ static vm_offset_t gpu_core;                 /* the 3D core's registers, for the teardown */
+ 
+ static volatile uint32_t *
+@@ -1500,6 +1610,108 @@
+ 		goto collapse;
+ 	}
+ 	printf("SWEET GPU: step 19: THE 3D CORE TAKES COMMANDS\n");
++	if (steps < 20)
++		goto collapse;
++
++	/* ---- step 20: the zap shader, then the 3D core out of secure mode ---- */
++	/*
++	 * The 3D core came out of reset locked in secure mode; on a phone only
++	 * TrustZone lets it out, by authenticating the vendor's signed zap shader
++	 * and running it. Linux does the same before a6xx leaves secure mode
++	 * (a6xx_zap_shader_init -> qcom_mdt_load -> qcom_scm_pas_*; the GPU is PAS
++	 * image 13), then has the command processor leave secure mode. The zap
++	 * metadata (.mdt) and its one loadable segment (.b02) come from the ADT.
++	 */
++	const uint8_t *zap_mdt = NULL, *zap_seg = NULL;
++	unsigned int zap_mdt_size = 0, zap_seg_size = 0;
++	{
++		const void *prop = NULL;
++		DTEntry node;
++		if (SecureDTLookupEntry(NULL, "/sweet-gpu", &node) == kSuccess) {
++			if (SecureDTGetProperty(node, "zap-metadata", &prop, &zap_mdt_size) == kSuccess)
++				zap_mdt = prop;
++			prop = NULL;
++			if (SecureDTGetProperty(node, "zap-segment", &prop, &zap_seg_size) == kSuccess)
++				zap_seg = prop;
++		}
++	}
++	if (!zap_mdt || !zap_seg || zap_seg_size == 0 || zap_seg_size > ZAP_MEMORY_SIZE) {
++		printf("SWEET GPU: step 20: no /sweet-gpu zap-metadata/zap-segment in the ADT "
++		    "(mkadt.py --zap-mdt a650_zap.mdt --zap-seg a650_zap.b02)\n");
++		goto collapse;
++	}
++
++	/* a kernel before this one may have left a zap shader in TrustZone; have it given up first */
++	printf("SWEET GPU: step 20: ask TrustZone to give up a zap shader a kernel before this one may have left\n");
++	printf("SWEET GPU:   %s\n", gpu_zap_unload() ? "TrustZone has given up what it had (it says so with none, too)" :
++	    "TrustZone does not give it up: the next answers tell whether it keeps one");
++
++	uint64_t zap_header_pa = 0, zap_answer = ~0ull;
++	printf("SWEET GPU: step 20: zap metadata %u bytes, segment %u bytes\n", zap_mdt_size, zap_seg_size);
++	if (!gpu_zap_header(zap_mdt, zap_mdt_size, &zap_header_pa))
++		goto collapse;
++
++	printf("SWEET GPU: step 20: hand TrustZone the signature to check (image %u)\n", PAS_GPU);
++	if (gpu_scm("to take the zap shader's signature", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE, SCM_VALUE_AND_BUFFER, PAS_GPU,
++	    zap_header_pa, 0, &zap_answer) != 0 || zap_answer != 0) {
++		printf("SWEET GPU: step 20: TrustZone does not take the signature (answer %#llx): taken to mean it keeps a zap "
++		    "shader from before, used as it is\n", (unsigned long long)zap_answer);
++		zap_loaded = true;
++		goto leave_secure;
++	}
++	zap_answer = ~0ull;
++	printf("SWEET GPU: step 20: tell TrustZone where the image goes: %#x (%#x bytes)\n", ZAP_MEMORY_PA, ZAP_MEMORY_SIZE);
++	if (gpu_scm("where the image goes", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_GPU, ZAP_MEMORY_PA,
++	    ZAP_MEMORY_SIZE, &zap_answer) != 0 || zap_answer != 0) {
++		printf("SWEET GPU: step 20: TrustZone does not take the place (answer %#llx): taken to mean it keeps a zap "
++		    "shader from before, used as it is\n", (unsigned long long)zap_answer);
++		zap_loaded = true;
++		goto leave_secure;
++	}
++	/* only now is that memory ours to write: TrustZone has just said it is not yet its own */
++	{
++		vm_offset_t zap_va = ml_io_map_wcomb(ZAP_MEMORY_PA, ZAP_MEMORY_SIZE);
++		volatile uint8_t *zap = (volatile uint8_t *)zap_va;
++		printf("SWEET GPU: step 20: reserved memory begins %02x %02x %02x %02x, the segment %02x %02x %02x %02x; "
++		    "writing %u bytes at %#x\n", zap[0], zap[1], zap[2], zap[3], zap_seg[0], zap_seg[1], zap_seg[2], zap_seg[3],
++		    zap_seg_size, ZAP_MEMORY_PA);
++		for (unsigned int i = 0; i < ZAP_MEMORY_SIZE; ++i)
++			zap[i] = (i < zap_seg_size) ? zap_seg[i] : 0;
++		__asm__ volatile("dsb sy" ::: "memory");   /* the write-combine write lands before TrustZone reads it */
++	}
++	zap_answer = ~0ull;
++	printf("SWEET GPU: step 20: ask TrustZone to authenticate the zap shader and run it\n");
++	if (gpu_scm("to authenticate the zap shader and run it", SCM_64 | SCM_SIP | SCM_PAS_AUTH_AND_RESET, SCM_ONE_VALUE,
++	    PAS_GPU, 0, 0, &zap_answer) != 0 || zap_answer != 0) {
++		printf("SWEET GPU: step 20: TrustZone does not authenticate the zap shader (answer %#llx)\n",
++		    (unsigned long long)zap_answer);
++		goto collapse;
++	}
++	zap_loaded = true;
++	printf("SWEET GPU: step 20: TRUSTZONE HAS AUTHENTICATED AND STARTED THE ZAP SHADER\n");
++
++leave_secure:
++	/* tell the command processor to leave secure mode (it asks the zap shader); the ring picks up after CP_ME_INIT */
++	printf("SWEET GPU: step 20: command the 3D core out of secure mode (CP_SET_SECURE_MODE 0)\n");
++	ring[at++] = (7u << 28) | 1u | (gpu_parity(1) << 15) | (CP_SET_SECURE_MODE << 16) | (gpu_parity(CP_SET_SECURE_MODE) << 23);
++	ring[at++] = 0;                              /* 0 = not secure */
++	gpu_to_memory(core_ring.mem, 4u * at);
++	gpu_wr(gpu, GPU_CP_RB_WPTR, at);
++	uint32_t srptr = ~0u, sstatus = ~0u;
++	for (unsigned i = 0; i < 20000 && (srptr != at || (sstatus & GPU_BUSY)); ++i) {
++		delay(100);
++		srptr = gpu_rd(gpu, GPU_CP_RB_RPTR);
++		sstatus = gpu_rd(gpu, GPU_RBBM_STATUS);
++	}
++	uint32_t sfault = gpu_rd(gpu, GPU_CP_HW_FAULT);
++	bool srefused = gpu_smmu_faulted(smmu, pg, npg, CORE_CONTEXT, "CORE");
++	printf("SWEET GPU:   rptr %u of %u, status %#x int %#x cp fault %#x cp int %#x protect %#x\n", srptr, at, sstatus,
++	    gpu_rd(gpu, GPU_RBBM_INT_0_STATUS), sfault, gpu_rd(gpu, GPU_CP_INTERRUPT_STATUS), gpu_rd(gpu, GPU_CP_PROTECT_STATUS));
++	if (srptr != at || (sstatus & GPU_BUSY) || sfault || srefused) {
++		printf("SWEET GPU: step 20: the command processor does not get through CP_SET_SECURE_MODE\n");
++		goto collapse;
++	}
++	printf("SWEET GPU: step 20: THE 3D CORE IS OUT OF SECURE MODE\n");
+ 
+ collapse:
+ 	{
+@@ -1547,6 +1759,12 @@
+ 					printf("SWEET GPU: GX was still on: gx gdsc %#010x -> %#010x\n", gx, gpu_rd(cc, GPUCC_GX_GDSC));
+ 				}
+ 			}
++			if (zap_loaded) {
++				/* give the zap shader back to TrustZone; the next kernel loads its own (there is no phone restart) */
++				printf("SWEET GPU: zap shader %s\n", gpu_zap_unload() ? "given back to TrustZone" :
++				    "NOT given back: TrustZone keeps it; the next kernel will find it there");
++				zap_loaded = false;
++			}
+ 			if (rsc_programmed && gmu_rscc) {
+ 				/* vendor a6xx_rscc_sleep_sequence: the GMU's RPMh votes dropped */
+ 				gpu_wr(gmu_va, GMU_RSCC_CONTROL_REQ, 1);

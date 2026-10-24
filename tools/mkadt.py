@@ -4,13 +4,16 @@
 Only what the early boot path actually reads (see NOTES.md); every MMIO
 address comes from the sweet live FDT. Usage:
   mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--touch-fw FW.bin] [--gmu-fw a650_gmu.bin]
-            [--sqe-fw a650_sqe.fw]
+            [--sqe-fw a650_sqe.fw] [--zap-mdt a650_zap.mdt] [--zap-seg a650_zap.b02]
 --touch-fw embeds the NT36675 touch firmware (Xiaomi's
 novatek_nt36675_j3s_fw01.bin, not in git) as /sweet-touch "firmware"; the
 apollo touch driver downloads it into the chip over SPI. --gmu-fw embeds the
 Adreno 650 GMU firmware (from the phone's /vendor/firmware, not in git) as
 /sweet-gpu "gmu-firmware" for sweet_gpu.c (sweetgpu=11 and up). --sqe-fw adds
-the 3D core's microcode as "sqe-firmware" (sweetgpu=18 and up).
+the 3D core's microcode as "sqe-firmware" (sweetgpu=18 and up). --zap-mdt and
+--zap-seg add the GPU zap shader's metadata (a650_zap.mdt) and its loadable
+segment (a650_zap.b02) as "zap-metadata" / "zap-segment"; TrustZone unlocks
+the 3D core from secure mode with them (sweetgpu=20 and up).
 """
 import hashlib, os, struct, sys
 
@@ -270,8 +273,16 @@ if __name__ == '__main__':
         sqe = open(sys.argv[sys.argv.index('--sqe-fw') + 1], 'rb').read()
         print(f'SQE microcode: {len(sqe)} bytes', file=sys.stderr)
         gpu_extra.append(('sqe-firmware', sqe))
+    if '--zap-mdt' in sys.argv:
+        zap_mdt = open(sys.argv[sys.argv.index('--zap-mdt') + 1], 'rb').read()
+        print(f'zap metadata: {len(zap_mdt)} bytes', file=sys.stderr)
+        gpu_extra.append(('zap-metadata', zap_mdt))
+    if '--zap-seg' in sys.argv:
+        zap_seg = open(sys.argv[sys.argv.index('--zap-seg') + 1], 'rb').read()
+        print(f'zap segment: {len(zap_seg)} bytes', file=sys.stderr)
+        gpu_extra.append(('zap-segment', zap_seg))
     if gpu_extra and not gmu_fw:
-        sys.exit('--sqe-fw needs --gmu-fw')
+        sys.exit('--sqe-fw, --zap-mdt and --zap-seg need --gmu-fw')
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, touch_fw=touch_fw, gmu_fw=gmu_fw,
                  gpu_extra=gpu_extra)
     blob = adt.serialize(root)
