@@ -1,0 +1,233 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -80,8 +80,18 @@
+  *             a ladder set by sweetgpuzap (0 off; 1 the no-memory queries; 2 +=
+  *             the signature; 3 += the load and leaving secure mode, the default
+  *             since boots 22-24 verified every rung)
++ *  21  write  a page of ours mapped for the core; CP_MEM_WRITE puts a word in
++ *             it, read back by the CPU: the core writes our memory on command
++ *  22  write  a 1080x2400 picture in our memory (rows of 4352 bytes, the 2D
++ *             engine's pitch is in 64-byte units), filled by the core's 2D
++ *             engine in three bands (orange, white, blue from the top), its
++ *             caches flushed, checked by the CPU, then copied to the panel's
++ *             framebuffer (0x9c000000, rows of 4320 bytes)
+  * Steps 18-19 port HackiOS steps 18 and 20; step 20 ports HackiOS steps 19 and
+  * 21 (the zap shader, then out of secure mode) with the a650's PAS image 13.
++ * Boot 24: step 20 passes (THE 3D CORE IS OUT OF SECURE MODE). Steps 21-22
++ * port HackiOS steps 21 (the test write) and 22 (the frame; Mesa
++ * fd6_blitter.cc fd6_clear_surface), with the a650's CCU offset.
+  * The zap calls are SMCs the hypervisor passes to TrustZone (qcom_scm-smc.c);
+  * Linux's a6xx_zap_shader_init / qcom_scm_pas_* do the same before a6xx leaves
+  * secure mode.
+@@ -368,6 +378,40 @@
+ #define PTE_CORE              (PTE_GMU | PTE_UNPRIVILEGED)
+ #define SMMU_SCTLR_HUPCF      (1u << 8)     /* serve other requests after a fault (Linux qcom_adreno_smmu) */
+ 
++/* Steps 21-22: commands (Mesa adreno_pm4.xml) and the 2D engine (a6xx.xml, register numbers in words) */
++#define CP_WAIT_FOR_IDLE      0x26u
++#define CP_BLIT               0x2cu
++#define CP_MEM_WRITE          0x3du
++#define CP_EVENT_WRITE        0x46u
++#define CP_SET_MARKER         0x65u
++#define CP_BLIT_OP_SCALE      3u
++#define RM6_BLIT2DSCALE       12u           /* CP_SET_MARKER mode: 2D blits follow */
++#define EVENT_FLUSH_COLOR_TS  0x1du         /* PC_CCU_FLUSH_COLOR_TS */
++#define EVENT_CACHE_FLUSH_TS  0x04u
++#define REG_GRAS_2D_BLIT_CNTL 0x8400u
++#define REG_GRAS_2D_DST_TL    0x8405u
++#define REG_GRAS_2D_DST_BR    0x8406u
++#define REG_RB_2D_BLIT_CNTL   0x8c00u
++#define REG_RB_2D_PIXEL_CNTL  0x8c01u
++#define REG_RB_2D_DST_INFO    0x8c17u
++#define REG_RB_2D_DST         0x8c18u
++#define REG_RB_2D_DST_PITCH   0x8c1au
++#define REG_RB_2D_SOLID_C0    0x8c2cu
++#define REG_RB_CCU_CNTL       0x8e07u
++#define REG_SP_2D_DST_FORMAT  0xacc0u
++#define FMT6_8_8_8_8_UNORM    0x30u
++#define BLIT_SOLID_8888       ((1u << 7) | (FMT6_8_8_8_8_UNORM << 8) | (0xfu << 20) | (0x10u << 24))
++#define DST_BGRA_LINEAR       (FMT6_8_8_8_8_UNORM | (1u << 10))   /* blue first in memory, as the panel's */
++#define CCU_CNTL_BYPASS       0x18000000u   /* color offset = 3 CCUs x 64 KiB (Mesa a650 num_ccu 3), sysmem */
++#define CORE_SCRATCH_VA       0x01200000u
++#define CORE_TARGET_VA        0x10000000u
++#define TARGET_W              1080u
++#define TARGET_H              2400u
++#define TARGET_ROW            4352u         /* 1088 pixels: the next multiple of 64 bytes */
++#define FB_PA                 0x9c000000u   /* mkadt.py FB: cont_splash_region, a8r8g8b8 */
++#define FB_ROW                (TARGET_W * 4u)
++#define TEST_WORD             0x600dc0deu
++
+ #define CMD_DB_PA             0x80860000u   /* kona.dtsi reserved-memory cmd_db, qcom,cmd-db */
+ #define CMD_DB_SIZE           0x20000u
+ #define CMD_DB_DATA           144u          /* version, magic, 8 slave headers of 16 bytes, checksum, reserved */
+@@ -754,6 +798,78 @@
+ 	    &answer) == 0 && answer == 0;
+ }
+ 
++/* ---- the core's ring (steps 21-22) ---- */
++static void
++ring_pkt7(volatile uint32_t *ring, uint32_t *at, uint32_t op, uint32_t words)
++{
++	ring[(*at)++] = (7u << 28) | words | (gpu_parity(words) << 15) | (op << 16) | (gpu_parity(op) << 23);
++}
++
++/* One register of the core written by command, in order with the others. */
++static void
++ring_reg(volatile uint32_t *ring, uint32_t *at, uint32_t reg, uint32_t val)
++{
++	ring[(*at)++] = (4u << 28) | 1u | (gpu_parity(1) << 7) | (reg << 8) | (gpu_parity(reg) << 27);
++	ring[(*at)++] = val;
++}
++
++/* After pages are added to a live context: its tables out to memory, its TLB forgotten. */
++static void
++gpu_smmu_refresh(vm_offset_t smmu, uint32_t pg, uint32_t npg, uint32_t context, struct gpu_space *sp)
++{
++	uint32_t cb = (npg + context) * pg;
++	for (unsigned i = 0; i < sp->count; ++i)
++		gpu_to_memory((vm_offset_t)sp->table[i], 4096);
++	gpu_wr(smmu, cb + SMMU_CB_TLBIASID, context);
++	gpu_wr(smmu, cb + SMMU_CB_TLBSYNC, 1);
++	for (unsigned i = 0; i < 100 && (gpu_rd(smmu, cb + SMMU_CB_TLBSTATUS) & 1u); ++i)
++		delay(10);
++}
++
++/* Ring words [from, to) out to memory, the core told, and waited for: read to the end, idle, no fault. */
++static bool
++ring_run(vm_offset_t gpu, vm_offset_t smmu, uint32_t pg, uint32_t npg, vm_offset_t ring_mem, uint32_t from, uint32_t to,
++    const char *what)
++{
++	uint32_t rptr = ~0u, status = ~0u;
++	gpu_to_memory(ring_mem + 4u * from, 4u * (to - from));
++	printf("SWEET GPU:   ring words %u..%u: %s\n", from, to - 1, what);
++	gpu_wr(gpu, GPU_CP_RB_WPTR, to);
++	for (unsigned i = 0; i < 20000 && (rptr != to || (status & GPU_BUSY)); ++i) {
++		delay(100);
++		rptr = gpu_rd(gpu, GPU_CP_RB_RPTR);
++		status = gpu_rd(gpu, GPU_RBBM_STATUS);
++	}
++	uint32_t fault = gpu_rd(gpu, GPU_CP_HW_FAULT);
++	bool refused = gpu_smmu_faulted(smmu, pg, npg, CORE_CONTEXT, "CORE");
++	printf("SWEET GPU:   rptr %u of %u, status %#x int %#x cp fault %#x cp int %#x protect %#x\n", rptr, to, status,
++	    gpu_rd(gpu, GPU_RBBM_INT_0_STATUS), fault, gpu_rd(gpu, GPU_CP_INTERRUPT_STATUS), gpu_rd(gpu, GPU_CP_PROTECT_STATUS));
++	return rptr == to && !(status & GPU_BUSY) && !fault && !refused;
++}
++
++/* One band of solid colour by the 2D engine (Mesa fd6_clear_surface; HackiOS ring_fill). */
++static void
++ring_fill(volatile uint32_t *ring, uint32_t *at, uint32_t top, uint32_t bottom, uint32_t r, uint32_t g, uint32_t b)
++{
++	ring_reg(ring, at, REG_GRAS_2D_DST_TL, top << 16);
++	ring_reg(ring, at, REG_GRAS_2D_DST_BR, (TARGET_W - 1u) | ((bottom - 1u) << 16));
++	ring_reg(ring, at, REG_RB_2D_SOLID_C0, r);
++	ring_reg(ring, at, REG_RB_2D_SOLID_C0 + 1u, g);
++	ring_reg(ring, at, REG_RB_2D_SOLID_C0 + 2u, b);
++	ring_reg(ring, at, REG_RB_2D_SOLID_C0 + 3u, 255);
++	ring_reg(ring, at, REG_RB_2D_BLIT_CNTL, BLIT_SOLID_8888);
++	ring_reg(ring, at, REG_GRAS_2D_BLIT_CNTL, BLIT_SOLID_8888);
++	ring_reg(ring, at, REG_SP_2D_DST_FORMAT, 1u | (FMT6_8_8_8_8_UNORM << 3) | (0xfu << 12));
++	ring_reg(ring, at, REG_RB_2D_PIXEL_CNTL, 0);
++	ring_reg(ring, at, REG_RB_2D_DST_INFO, DST_BGRA_LINEAR);
++	ring_reg(ring, at, REG_RB_2D_DST, CORE_TARGET_VA);
++	ring_reg(ring, at, REG_RB_2D_DST + 1u, 0);
++	ring_reg(ring, at, REG_RB_2D_DST_PITCH, TARGET_ROW >> 6);
++	ring_pkt7(ring, at, CP_WAIT_FOR_IDLE, 0);
++	ring_pkt7(ring, at, CP_BLIT, 1);
++	ring[(*at)++] = CP_BLIT_OP_SCALE;
++}
++
+ /* ---- HFI: messages through the queues of step 13 ---- */
+ static volatile uint32_t *gmu_hfi_q;          /* uncached view of the HFI page */
+ static uint32_t hfi_qoff, hfi_seq;
+@@ -1791,6 +1907,91 @@
+ 		goto collapse;
+ 	}
+ 	printf("SWEET GPU: step 20: THE 3D CORE IS OUT OF SECURE MODE\n");
++	if (steps < 21)
++		goto collapse;
++
++	/* ---- step 21: a word written to our memory on command ---- */
++	static struct gpu_block core_scratch, core_target;
++	printf("SWEET GPU: step 21: map a page for the core; have it write %#x there (CP_MEM_WRITE)\n", TEST_WORD);
++	if (!gpu_block_new(&core_space, &core_scratch, CORE_SCRATCH_VA, 4096, PTE_CORE)) {
++		printf("SWEET GPU: step 21: no memory\n");
++		goto collapse;
++	}
++	gpu_smmu_refresh(smmu, pg, npg, CORE_CONTEXT, &core_space);
++	uint32_t from = at;
++	ring_pkt7(ring, &at, CP_MEM_WRITE, 3);
++	ring[at++] = CORE_SCRATCH_VA;
++	ring[at++] = 0;
++	ring[at++] = TEST_WORD;
++	if (!ring_run(gpu, smmu, pg, npg, core_ring.mem, from, at, "CP_MEM_WRITE")) {
++		printf("SWEET GPU: step 21: the command processor does not get through CP_MEM_WRITE\n");
++		goto collapse;
++	}
++	gpu_to_memory(core_scratch.mem, 64);
++	uint32_t word = *(volatile uint32_t *)core_scratch.mem;
++	printf("SWEET GPU: step 21: the page reads %#x: %s\n", word,
++	    word == TEST_WORD ? "THE 3D CORE WRITES OUR MEMORY ON COMMAND" : "not what the core was told to write");
++	if (word != TEST_WORD || steps < 22)
++		goto collapse;
++
++	/* ---- step 22: a frame filled by the core's 2D engine, on the panel ---- */
++	printf("SWEET GPU: step 22: a %ux%u picture (%u bytes) for the core, filled in three bands by its 2D engine\n",
++	    TARGET_W, TARGET_H, TARGET_ROW * TARGET_H);
++	if (!gpu_block_new(&core_space, &core_target, CORE_TARGET_VA, TARGET_ROW * TARGET_H, PTE_CORE)) {
++		printf("SWEET GPU: step 22: no memory\n");
++		goto collapse;
++	}
++	gpu_smmu_refresh(smmu, pg, npg, CORE_CONTEXT, &core_space);
++	from = at;
++	ring_pkt7(ring, &at, CP_SET_MARKER, 1);
++	ring[at++] = RM6_BLIT2DSCALE;
++	ring_reg(ring, &at, REG_RB_CCU_CNTL, CCU_CNTL_BYPASS);
++	ring_fill(ring, &at, 0, 800, 255, 128, 0);           /* orange */
++	ring_fill(ring, &at, 800, 1600, 255, 255, 255);      /* white */
++	ring_fill(ring, &at, 1600, TARGET_H, 0, 128, 255);   /* blue */
++	/* out of the core's caches into memory; each event writes its word when done (Linux a6xx_submit) */
++	ring_pkt7(ring, &at, CP_EVENT_WRITE, 4);
++	ring[at++] = EVENT_FLUSH_COLOR_TS;
++	ring[at++] = CORE_SCRATCH_VA + 32u;
++	ring[at++] = 0;
++	ring[at++] = 0x0c0c0c0cu;
++	ring_pkt7(ring, &at, CP_EVENT_WRITE, 4);
++	ring[at++] = EVENT_CACHE_FLUSH_TS;
++	ring[at++] = CORE_SCRATCH_VA + 16u;
++	ring[at++] = 0;
++	ring[at++] = 0x0d0e0d0eu;
++	ring_pkt7(ring, &at, CP_WAIT_FOR_IDLE, 0);
++	if (!ring_run(gpu, smmu, pg, npg, core_ring.mem, from, at, "three solid fills, flushes")) {
++		printf("SWEET GPU: step 22: the core does not get through the fills\n");
++		goto collapse;
++	}
++	gpu_to_memory(core_scratch.mem, 64);
++	printf("SWEET GPU:   flush words %#x %#x (told 0xc0c0c0c, 0xd0e0d0e)\n",
++	    ((volatile uint32_t *)core_scratch.mem)[8], ((volatile uint32_t *)core_scratch.mem)[4]);
++	gpu_to_memory(core_target.mem, core_target.size);
++	const volatile uint8_t *px = (const volatile uint8_t *)core_target.mem;
++	const uint32_t mid = 1200u * TARGET_ROW + 540u * 4u, last = 2399u * TARGET_ROW + 1079u * 4u;
++	printf("SWEET GPU:   pixels (b g r a): first %02x %02x %02x %02x (told 00 80 ff ff), middle %02x %02x %02x %02x "
++	    "(ff ff ff ff), last %02x %02x %02x %02x (ff 80 00 ff)\n", px[0], px[1], px[2], px[3], px[mid], px[mid + 1],
++	    px[mid + 2], px[mid + 3], px[last], px[last + 1], px[last + 2], px[last + 3]);
++	if (px[2] != 0xff || px[1] != 0x80 || px[mid] != 0xff || px[mid + 2] != 0xff || px[last] != 0xff || px[last + 2] != 0) {
++		printf("SWEET GPU: step 22: the picture is not what the core was told to draw\n");
++		goto collapse;
++	}
++	printf("SWEET GPU: step 22: THE GPU HAS DRAWN A PICTURE; copying it to the panel (%#x)\n", FB_PA);
++	vm_offset_t fb_va = ml_io_map_wcomb(FB_PA, round_page(FB_ROW * TARGET_H));
++	if (!fb_va) {
++		printf("SWEET GPU: step 22: framebuffer map failed\n");
++		goto collapse;
++	}
++	for (uint32_t y = 0; y < TARGET_H; ++y) {
++		const volatile uint32_t *src = (const volatile uint32_t *)(core_target.mem + y * TARGET_ROW);
++		volatile uint32_t *dst = (volatile uint32_t *)(fb_va + y * FB_ROW);
++		for (uint32_t x = 0; x < TARGET_W; ++x)
++			dst[x] = src[x];
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("SWEET GPU: step 22: A PICTURE DRAWN BY THE GPU IS ON THE PANEL: orange, white, blue from the top\n");
+ 
+ collapse:
+ 	{
