@@ -37,6 +37,12 @@ The next steps and the full engineering history are in [`NOTES.md`](NOTES.md).
 [████████████████████]  100 %
 ```
 
+**GPU: 6 of 9 steps done** (power and clocks, GMU firmware, GMU messages and 3D core power, microcode and commands, out of secure mode, first GPU-drawn frame; next: kernel GPU service, Mesa freedreno, CoreAnimation bridge)
+
+```
+[█████████████░░░░░░░]  67 %
+```
+
 | # | Milestone | State |
 | --- | --- | --- |
 | 1 | Shim boots on apollo (`fastboot boot`, SM8250 GIC/timers/PSCI) | ✅ Done |
@@ -53,7 +59,7 @@ The next steps and the full engineering history are in [`NOTES.md`](NOTES.md).
 | 12 | USB device mode, USB Ethernet and the live kernel log (0072–0077 retargeted to SM8250) | ⏳ Planned |
 | 13 | Battery and charging readout | ⏳ Planned |
 | 14 | Wi-Fi, Bluetooth, audio, cameras, sensors, cellular | 🔭 Long term |
-| 15 | GPU acceleration (Adreno 650), following [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel)'s Adreno 642L work: (1) probe, (2) GMU, (3) 3D core and zap shader, (4) Mesa freedreno + CoreAnimation bridge | 🔄 Phase 2 done (2026-10-24): **the GMU's firmware runs** (`a650_gmu.bin` through our SMMU context, `fw_init_result 0x100`) and its HFI queues are up. Phase 3 (2026-10-24, boot 17): **the GMU powers the 3D core**, which answers its first register reads; then everything is handed back cleanly. Boot 20 (0104, `sweetgpu=19`): **the 3D core takes commands**: SQE microcode running, command processor started, `CP_ME_INIT` read and executed with no faults. Boot 24 (0105–0109, `sweetgpu=20`): **the 3D core is out of secure mode** — TrustZone authenticates the signed zap shader (`a650_zap.mdt`/`.b02` via `mkadt.py --zap-mdt --zap-seg`, PAS image 13) into `pil_gpu_mem 0x8681a000`, and `CP_SET_SECURE_MODE 0` goes through the ring with no faults. (Boot 21 hung on a blind `PAS_SHUTDOWN`-of-nothing; the SCM calls were reworked into a staged, verified `sweetgpuzap` ladder — `0` off, `1` atomic queries, `2` += signature, `3` += the full load, now the default — and that call was removed.) In test (0110–0111, `sweetgpu=22`): the core writes a word into our memory, then its 2D engine fills a frame that is copied to the panel. After that: Mesa freedreno + the CoreAnimation bridge |
+| 15 | GPU acceleration (Adreno 650), following [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel)'s Adreno 642L work: (1) probe, (2) GMU, (3) 3D core and zap shader, (4) Mesa freedreno + CoreAnimation bridge | 🔄 Phase 2 done (2026-10-24): **the GMU's firmware runs** (`a650_gmu.bin` through our SMMU context, `fw_init_result 0x100`) and its HFI queues are up. Phase 3 (2026-10-24, boot 17): **the GMU powers the 3D core**, which answers its first register reads; then everything is handed back cleanly. Boot 20 (0104, `sweetgpu=19`): **the 3D core takes commands**: SQE microcode running, command processor started, `CP_ME_INIT` read and executed with no faults. Boot 24 (0105–0109, `sweetgpu=20`): **the 3D core is out of secure mode** — TrustZone authenticates the signed zap shader (`a650_zap.mdt`/`.b02` via `mkadt.py --zap-mdt --zap-seg`, PAS image 13) into `pil_gpu_mem 0x8681a000`, and `CP_SET_SECURE_MODE 0` goes through the ring with no faults. (Boot 21 hung on a blind `PAS_SHUTDOWN`-of-nothing; the SCM calls were reworked into a staged, verified `sweetgpuzap` ladder — `0` off, `1` atomic queries, `2` += signature, `3` += the full load, now the default — and that call was removed.) Boot 26 (0110–0111, `sweetgpu=22`): **the GPU draws**: the core writes our memory on command, and its 2D engine fills a 1080×2400 frame (orange, white, blue) that is checked and shown on the panel. Next, phase 4: a kernel GPU service, Mesa freedreno, the CoreAnimation bridge |
 
 The touch steps are pins, clocks, pin mux, SPI, chip ID, firmware download, finger reports and iOS gestures, all done. Milestones 14 and 15 were never done on sweet either: they need drivers for hardware Apple's userland knows nothing about, so treat them as research, not scheduled work.
 
