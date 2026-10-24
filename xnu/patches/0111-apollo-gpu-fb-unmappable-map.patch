@@ -1,0 +1,45 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -122,6 +122,8 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++extern void ml_io_unmap(vm_offset_t, vm_size_t);
+ extern uint64_t kvtophys(vm_offset_t);
+ extern kern_return_t thread_terminate(thread_t);
+ void sweet_gpu_init(void);
+@@ -410,6 +412,9 @@
+ #define TARGET_ROW            4352u         /* 1088 pixels: the next multiple of 64 bytes */
+ #define FB_PA                 0x9c000000u   /* mkadt.py FB: cont_splash_region, a8r8g8b8 */
+ #define FB_ROW                (TARGET_W * 4u)
++#ifndef VM_WIMG_WCOMB
++#define VM_WIMG_WCOMB         0x6u          /* osfmk/arm/memory_types.h: not cacheable | coherent */
++#endif
+ #define TEST_WORD             0x600dc0deu
+ 
+ #define CMD_DB_PA             0x80860000u   /* kona.dtsi reserved-memory cmd_db, qcom,cmd-db */
+@@ -1979,7 +1984,14 @@
+ 		goto collapse;
+ 	}
+ 	printf("SWEET GPU: step 22: THE GPU HAS DRAWN A PICTURE; copying it to the panel (%#x)\n", FB_PA);
+-	vm_offset_t fb_va = ml_io_map_wcomb(FB_PA, round_page(FB_ROW * TARGET_H));
++	/*
++	 * Boot 25 panicked here: ml_io_map_wcomb takes its addresses from
++	 * io_map's 8 MiB permanent submap (xnu-8796 arm/io_map.c IO_MAP_SIZE),
++	 * which a 10 MB framebuffer cannot fit. The unmappable kind comes from
++	 * the kernel map's data range and is given back after the copy.
++	 */
++	const vm_size_t fb_size = round_page(FB_ROW * TARGET_H);
++	vm_offset_t fb_va = ml_io_map_unmappable(FB_PA, fb_size, VM_WIMG_WCOMB);
+ 	if (!fb_va) {
+ 		printf("SWEET GPU: step 22: framebuffer map failed\n");
+ 		goto collapse;
+@@ -1991,6 +2003,7 @@
+ 			dst[x] = src[x];
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	ml_io_unmap(fb_va, fb_size);
+ 	printf("SWEET GPU: step 22: A PICTURE DRAWN BY THE GPU IS ON THE PANEL: orange, white, blue from the top\n");
+ 
+ collapse:
