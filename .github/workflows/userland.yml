@@ -1,0 +1,34 @@
+name: userland
+
+# iOS arm64 programs for the phone, built with Xcode's iPhoneOS SDK and
+# ad-hoc signed. Artifact: sweet-userland (see userland/README.md).
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "userland/**"
+      - ".github/workflows/userland.yml"
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sweet-gpu-test
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir -p out
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" \
+            -O2 -Wall -Wextra -Werror -framework IOKit \
+            -o out/sweet-gpu-test userland/gpu-test/sweet-gpu-test.c
+          codesign -s - -f out/sweet-gpu-test
+          file out/sweet-gpu-test
+          otool -L out/sweet-gpu-test
+          codesign -dv out/sweet-gpu-test 2>&1
+          (cd out && shasum -a 256 * > SHA256SUMS && cat SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweet-userland
+          path: out/

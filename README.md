@@ -201,6 +201,7 @@ The driver lines start with `SWEET ...`, and crash reports start with `CRASH nam
 | --- | --- |
 | `shim/` | Bare-metal boot shim (C + asm) packed as an Android boot.img v2 |
 | `xnu/patches/` | The XNU patch series (0001–0112, applied in order by CI) plus staging scripts for libpthread, HFS and BearSSL |
+| `userland/` | Programs for the phone (`sweet-gpu-test`), built by the `userland` CI workflow; how to put them on the phone is in [`userland/README.md`](userland/README.md) |
 | `.github/workflows/xnu.yml` | `validate` (Ubuntu, seconds), then the kernel `build` (macOS) |
 | `tools/validate-repo.py` | Patch-series and script checks (numbering, hunk headers, replay of series-created files) |
 | `tools/mkadt.py` | Apple Device Tree from the board's MMIO layout and the iPhone X identity |
