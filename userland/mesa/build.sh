@@ -8,6 +8,9 @@
 #
 # OUT/lib/libOSMesa.8.dylib     install name /usr/local/lib/libOSMesa.8.dylib, ad hoc signed
 #                               (programs declare what they use of it: userland/gl-test)
+# MESA_WORK/meta/gl.xml, exported-gl.txt
+#                               the Khronos registry Mesa has and the gl* functions the library
+#                               exports: for userland/ca-bridge/mkeagl.py (not for the phone)
 #
 # Mesa itself is not in the repository: the pinned release is fetched and checked, then
 # patches/*.patch go on top and sweet-drm/ (a stand-in for libdrm that talks to SweetGPU) is put
@@ -83,5 +86,8 @@ lib=$out/lib/libOSMesa.8.dylib
 xcrun strip -x -o "$lib" build/src/gallium/targets/osmesa/libOSMesa.8.dylib
 xcrun install_name_tool -id /usr/local/lib/libOSMesa.8.dylib "$lib"
 codesign -s - -f "$lib"
+mkdir -p "$work/meta"
+cp mesa-$VERSION/src/mapi/glapi/registry/gl.xml "$work/meta/gl.xml"
+nm -gU "$lib" | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > "$work/meta/exported-gl.txt"
 echo "build.sh: Mesa $VERSION: $lib, $(stat -f %z "$lib") bytes, $(nm -gU "$lib" | grep -c ' _gl') gl* functions," \
 	"SweetGPU named $(strings "$lib" | grep -c '^SweetGPU$') time(s)"
