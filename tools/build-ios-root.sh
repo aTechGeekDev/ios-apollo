@@ -11,15 +11,19 @@
 # the console log (sweet-root-tweaks.py --oslog; boot with
 # sweetnull=backboardd,SpringBoard,com.apple.datamigrator,...). A run without it
 # takes that out again.
-# With no arguments, sweet-userland/sweet-gpu-test is added if it is there.
+# With no PROGRAM, the test programs of sweet-userland/ that are there, and its
+# lib/ files (tools/sweet-root-install.sh). Flashing replaces the phone's root:
+# what the phone has written there since (its first-boot setup, which took
+# hours once) is gone. To add to the root the phone has, use sweet-root-add.sh.
 #   1. the three disk images of the iPhone X (iPhone10,3) iOS 16.7.16 (20H392)
 #      IPSW (OS, SystemOS and AppOS, ~7.5 GB), found through its
 #      BuildManifest.plist, into research/ipsw/ (kept: the next run reuses them)
 #   2. tools/mkiosroot.sh: research/ios-root/ios16-root.img, 16 GiB HFS+
 #   3. tools/sweet-root-tweaks.py (Setup skipped, activation, no baseband
-#      daemon, ...) and every PROGRAM into /usr/local/bin, each with a launchd
-#      job LABEL that runs it at boot (its output reaches the console log
-#      with boot-arg sweetnull=backboardd,SpringBoard,NAME)
+#      daemon, ...) and tools/sweet-root-install.sh: every PROGRAM into
+#      /usr/local/bin, each with a launchd job LABEL that runs it at boot (its
+#      output reaches the console log with boot-arg sweetnull=...,NAME), and
+#      sweet-userland/lib/* into /usr/local/lib
 #   4. research/ios-root/ios16-root.simg (img2simg)
 #   5. it ASKS, then flashes that to userdata (phone in fastboot, ~7 minutes).
 #      Anything but "yes" writes nothing to the phone.
@@ -46,11 +50,8 @@ while [ "${1:-}" = --reuse ] || [ "${1:-}" = --oslog ]; do
 	if [ "$1" = --reuse ]; then reuse=1; export SWEET_REUSE=1; else oslog=--oslog; export SWEET_OSLOG=--oslog; fi
 	shift
 done
-if [ $# -eq 0 ] && [ -f "$here/sweet-userland/sweet-gpu-test" ]; then
-	set -- "$here/sweet-userland/sweet-gpu-test" com.sweet.gputest
-fi
 if [ $(($# % 2)) -ne 0 ] || [ "${1:-}" = -h ] || [ "${1:-}" = --help ]; then
-	sed -n '2,31p' "$0"
+	sed -n '2,35p' "$0"
 	exit 1
 fi
 # Run again under systemd-inhibit: no suspend, idle sleep or lid-close sleep until the end.
@@ -160,17 +161,7 @@ sudo mkdir -p "$mnt"
 sudo mount -t hfsplus -o loop,force "$img" "$mnt" || die "could not mount $img (is the hfsplus kernel module there? sudo modprobe hfsplus)"
 [ -f "$mnt/System/Library/xpc/launchd.plist" ] || die "$img does not look like an iOS root (no launchd.plist)"
 sudo python3 "$here/tools/sweet-root-tweaks.py" $oslog "$mnt"
-for ((i = 0; i < ${#programs[@]}; i += 2)); do
-	prog=${programs[i]}
-	label=${programs[i + 1]}
-	name=$(basename "$prog")
-	sudo mkdir -p "$mnt/usr/local/bin"
-	sudo install -m 0755 "$prog" "$mnt/usr/local/bin/$name"
-	python3 "$here/tools/add-launchd-job.py" "$mnt/System/Library/xpc/launchd.plist" /tmp/sweet-launchd.plist \
-		"$label" "/usr/local/bin/$name" >/dev/null
-	sudo cp /tmp/sweet-launchd.plist "$mnt/System/Library/xpc/launchd.plist"
-	printf 'added /usr/local/bin/%s, run at boot by launchd job %s\n' "$name" "$label"
-done
+sudo "$here/tools/sweet-root-install.sh" "$mnt" "${programs[@]}"
 sync
 sudo umount "$mnt"
 # A fresh journaled volume always reads "needs minor repair" to Linux fsck -n: shown, not fatal.

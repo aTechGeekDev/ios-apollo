@@ -1,28 +1,35 @@
 #!/usr/bin/env bash
-# Put a program on the phone's iOS root and run it once at every boot.
+# Put programs and libraries on the iOS root the phone has (keeping everything the phone wrote
+# there, like its finished first-boot setup), each program run once at every boot.
 #
-#   tools/sweet-root-add.sh PROGRAM LABEL
+#   tools/sweet-root-add.sh [PROGRAM LABEL]...
 #   e.g. tools/sweet-root-add.sh sweet-userland/sweet-gpu-test com.sweet.gputest
+#   With no PROGRAM: the test programs of sweet-userland/ that are there and its lib/ files
+#   (libOSMesa.8.dylib), as tools/sweet-root-install.sh does.
 #
 # Start with the phone in recovery (fastboot boot recovery/recovery.img).
 # Leftovers of earlier runs in research/ are deleted first. Then:
 #   1. the phone's iOS root (first 16 GiB of userdata) is copied to
 #      research/apollo-root-base.img (~20 minutes)
 #   2. ... and copied again to research/apollo-root-new.img
-#   3. PROGRAM goes into that copy (/usr/local/bin) with a launchd job LABEL
-#      that runs it at boot (its output reaches the console log that
-#      tools/sweet-log-pull.sh reads with boot-arg sweetnull=...,NAME)
+#   3. tools/sweet-root-install.sh puts every PROGRAM into that copy
+#      (/usr/local/bin) with a launchd job LABEL that runs it at boot (its
+#      output reaches the console log that tools/sweet-log-pull.sh reads with
+#      boot-arg sweetnull=...,NAME), and sweet-userland/lib/* into /usr/local/lib
 #   4. research/apollo-root-new.simg collects only the changed blocks
 #   5. it ASKS, then reboots the phone to fastboot and flashes those blocks to
-#      userdata. Answer anything but "yes" and nothing is written.
+#      userdata. Answer anything but "yes" and nothing is written. After the
+#      flash the copy is what the phone has: it becomes
+#      research/ios-root/ios16-root.img (what build-ios-root.sh --reuse starts
+#      from), and the first copy is deleted.
 # Two progress bars: the whole job and the current step. The PC is kept from
 # sleeping while it runs (a suspend cuts the USB copy from the phone).
 # Needs: adb, fastboot, python3, sudo, fsck.hfsplus (hfsprogs), the hfsplus
 # kernel module, and about 33 GB free under research/.
 set -euo pipefail
 
-if [ $# -ne 2 ]; then
-	sed -n '2,22p' "$0"
+if [ $(($# % 2)) -ne 0 ] || [ "${1:-}" = -h ] || [ "${1:-}" = --help ]; then
+	sed -n '2,28p' "$0"
 	exit 1
 fi
 # Run again under systemd-inhibit: no suspend, idle sleep or lid-close sleep until the end.
@@ -33,9 +40,6 @@ if [ -z "${SWEET_NO_SLEEP:-}" ] && command -v systemd-inhibit >/dev/null &&
 		--who=sweet-root-add --why="copying the phone's iOS root" "$0" "$@"
 fi
 [ -n "${SWEET_NO_SLEEP:-}" ] || printf 'note: could not stop the PC from sleeping; keep it awake until this ends\n'
-program=$1
-label=$2
-name=$(basename "$program")
 here=$(cd "$(dirname "$0")/.." && pwd)
 base=$here/research/apollo-root-base.img
 new=$here/research/apollo-root-new.img
@@ -77,7 +81,9 @@ say() { printf '\n\n== %s\n' "$*"; }
 die() { printf '\n\nSTOPPED: %s\n' "$*" >&2; exit 1; }
 
 # --- checks
-[ -f "$program" ] || die "no program at $program"
+for ((i = 1; i <= $#; i += 2)); do
+	[ -f "${!i}" ] || die "no program at ${!i}"
+done
 for tool in adb fastboot python3 sudo fsck.hfsplus; do
 	command -v "$tool" >/dev/null || die "$tool is not installed"
 done
@@ -121,20 +127,16 @@ follow_size $! "$new" 2 "copying" || die "the copy failed"
 show 2 1 1 "copied"
 
 # --- 3. the edit
-say "3/4 adding $name and the launchd job $label"
+say "3/4 adding the programs and libraries (tools/sweet-root-install.sh)"
 show 3 0 5 "checking the filesystem (fsck)"
 sudo fsck.hfsplus -fy "$new" >"$fscklog" 2>&1 || true     # never cleanly unmounted on the phone: repairs are expected
 show 3 1 5 "mounting"
 sudo mkdir -p "$mnt"
 sudo mount -t hfsplus -o loop,force "$new" "$mnt"
 [ -f "$mnt/System/Library/xpc/launchd.plist" ] || die "this does not look like the iOS root (no launchd.plist)"
-show 3 2 5 "installing $name"
-sudo mkdir -p "$mnt/usr/local/bin"
-sudo install -m 0755 "$program" "$mnt/usr/local/bin/$name"
-show 3 3 5 "adding the launchd job"
-python3 "$here/tools/add-launchd-job.py" "$mnt/System/Library/xpc/launchd.plist" /tmp/sweet-launchd.plist \
-	"$label" "/usr/local/bin/$name" >/dev/null
-sudo cp /tmp/sweet-launchd.plist "$mnt/System/Library/xpc/launchd.plist"
+show 3 2 5 "installing"
+printf '\n'
+sudo "$here/tools/sweet-root-install.sh" "$mnt" "$@"
 show 3 4 5 "unmounting"
 sync
 sudo umount "$mnt"
@@ -164,6 +166,10 @@ printf 'waiting for fastboot...\n'
 until fastboot devices | grep -q fastboot; do sleep 2; done
 fastboot flash userdata "$simg"
 
-say "done: the phone runs /usr/local/bin/$name at every boot"
-printf 'The phone now holds %s.\n' "${new#"$here"/}"
-printf 'Next: boot the kernel as usual; the program'"'"'s output is in the log (tools/sweet-log-pull.sh).\n'
+# the copy is now what the phone has: keep it as the root image build-ios-root.sh --reuse starts from
+mkdir -p "$here/research/ios-root"
+mv -f "$new" "$here/research/ios-root/ios16-root.img"
+rm -f "$base" "$simg"
+say "done: the programs are on the phone and run at every boot"
+printf 'research/ios-root/ios16-root.img is now a copy of the phone'"'"'s root.\n'
+printf 'Next: boot the kernel as usual; the programs'"'"' output is in the log (tools/sweet-log-pull.sh).\n'
