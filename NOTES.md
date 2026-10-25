@@ -4,6 +4,40 @@
 
 ### >>> APOLLO PORT, UPDATE 2026-10-23 (read first; sweet history follows) <<<
 
+### >>> NEXT SESSION / FRESH MACHINE (2026-10-25 night handoff) <<<
+
+**Everything is BUILT, nothing new is run on the phone yet.** Latest artifacts:
+- kernel: xnu.yml run **40241992775** (patch 0114; `kernel.development.sweet` 17,366,128 bytes) — artifact `xnu-kernel`.
+- userland: userland.yml run **40242220938** — artifact `sweet-userland`: `sweet-gpu-test`, `sweet-gl-test`, `lib/libOSMesa.8.dylib`, `lib/libsweet-gl.dylib`, `lib/libsweet-ca.dylib`.
+The phone currently holds the **warm root** (fresh IPSW build that finished iOS first-boot/data-migration and reached the lock screen, boot 31). Keep it: do NOT reflash a fresh (unbooted) root, or the hours-long first boot comes back.
+
+**The user will next use a Kali with files from ~2 days prior (2026-10-23).** After `git pull`, these gitignored local files may be MISSING or stale there, needed to build the boot image:
+- `research/apollo-gpu/` (Adreno firmware `a650_gmu.bin`, `a650_sqe.fw`, `a650_zap.mdt`, `a650_zap.b00/.b01/.b02`): almost certainly absent (pulled from the phone on 10-24). Get them back with **`tools/pull-gpu-fw.sh`** (phone in recovery; pulls `/vendor/firmware/*` into `research/apollo-gpu/`).
+- `research/apollo-fw/novatek_nt36675_j3s_fw01.bin` (touch firmware): re-download per README step 3 (curl the `.ihex` from MiCode `apollo-q-oss`, `objcopy`; sha256 `429137d3...be628`).
+- `dtb/boot_unpacked/dtb` (stock DTB the shim needs): `python3 tools/unpack_bootv2.py backup/boot.img dtb/boot_unpacked` (needs `backup/boot.img`).
+- `recovery/recovery.img` (for log pulls and `sweet-root-add.sh`): must be present.
+- `research/ios-root/ios16-root.img` will NOT exist there, so `build-ios-root.sh --reuse` can't be used — use `sweet-root-add.sh` instead (it pulls the warm root FROM the phone).
+
+**Deploy the new programs+libraries onto the warm root (preferred — keeps first boot done):**
+```
+git pull
+rm -rf sweet-userland && gh run download 40242220938 -R aTechGeekDev/ios-apollo -n sweet-userland -D sweet-userland
+fastboot boot recovery/recovery.img && adb wait-for-recovery && tools/sweet-root-add.sh   # ~20 min pull + flash changed blocks
+```
+`sweet-root-add.sh` (no args) installs the known test programs + `sweet-userland/lib/*` (libOSMesa, libsweet-gl, libsweet-ca) via `sweet-root-install.sh`, and afterwards saves its copy as `research/ios-root/ios16-root.img`.
+
+**Kernel 0114 + boot image** (needs the firmware above):
+```
+rm -rf xnu/out && gh run download 40241992775 -R aTechGeekDev/ios-apollo -n xnu-kernel -D xnu/out
+python3 tools/mkadt.py shim/out/apollo.adt --highmem --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin   --gmu-fw research/apollo-gpu/a650_gmu.bin --sqe-fw research/apollo-gpu/a650_sqe.fw   --zap-mdt research/apollo-gpu/a650_zap.mdt --zap-seg research/apollo-gpu/a650_zap.b02
+```
+**Boot A — Mesa alone** (bridge off): mkpayload cmdline = the usual boot-30 args + `sweetnull=backboardd,SpringBoard,sweet-gpu-test,sweet-gl-test` (GPU on: `sweetgpu=22 sweetgpukeep=1`); expect log `sweet-gl-test: ... MESA DRAWS WITH THE GPU`.
+**Boot B — the bridge**: same, add `sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd`; expect `sweet-ca:` + `sweet-gl:` lines and the screen drawn by the GPU. Full cmdline ~365 chars (boot-args buffer is 608, mkpayload truncates at 607 — fine). If it hangs/black, boot without `sweetinject` (nothing else changes).
+Log: `fastboot boot recovery/recovery.img && adb wait-for-recovery && tools/sweet-log-pull.sh logs/apollo-bootNN.txt`.
+
+**Code review (this session, no changes made to kernel/userland):** reviewed 0114 (SweetGPU surfaceBuffer refcounting, cache-push, the gGPULock/sweet_surface_lock ordering — no inversion/deadlock; present() wait path) and the bridge port — all sound. README cleaned (lock screen, GPU up, Mesa+bridge built; patch table 0113/0114 reordered; added CoreAnimation boot-args). Added `tools/pull-gpu-fw.sh`. Did NOT touch the secure-mode/zap code (0105–0109). Model switched to Opus 4.8 mid-session; attribution lines updated accordingly.
+
+
 **🎉 BOOT 30: A PROGRAM DRIVES THE GPU (log uploaded `apollo-boot30.txt`, 2897 lines).** `|sweet-gpu-test| sweet-gpu-test: Adreno 650, chip id 0x6050002, GMEM 1152 KiB, 305 MHz`; command buffer handle 1 GPU 0x20000000 mapped at 0x102210000, target handle 2 GPU 0x20010000 at 0x102214000 (16 KiB each, write-combined: 0113 holds); submissions 0..63 = fences 2..65, `64 submissions, 19 us each (submit + wait), 0 words wrong: A PROGRAM DRIVES THE GPU`. Output reached the log through the 0048 tee (`sweetnull=backboardd,SpringBoard,sweet-gpu-test`). GPU phase 4a/userland test DONE; next GPU step: Mesa freedreno (HackiOS redwood-drm, service name SweetGPU). **Apple logo in boot 30, from the log:** same as boot 29: datamigrator exec'd 3 times (lines 926, 1759, 2204), no AKS calls, no plugin wrapper, backboardd 6 swaps then idle, samples 0-6 (~13 min) SpringBoard stuck. **Next diagnosis:** `build-ios-root.sh --reuse --oslog` (sweet-root-tweaks.py --oslog: OS_ACTIVITY_DT_MODE=YES for backboardd, SpringBoard and the datamigrator XPC service Info.plist) + boot-arg `sweetnull=backboardd,SpringBoard,sweet-gpu-test,com.apple.datamigrator` (proc_selfname copies p_name, full name) -> their os_log in the console log should say what backboardd waits for and what datamigrator decides.
 
 **2026-10-25 night: CoreAnimation bridge BUILT (kernel 0114 run 40241992775, kernel.development.sweet 17,366,128 bytes; userland run 40242220938 = sweet-gpu-test, sweet-gl-test, lib/libOSMesa.8.dylib, lib/libsweet-gl.dylib, lib/libsweet-ca.dylib), not yet run.** 0114: sweet_amfi.c policy "AMFI" (only mpo_policy_syscall; 0x5a -> 0xff all allowed only while boot-arg sweetinject exists, else ENOPOLICY); kern_exec.c sweet_exec_inject() matches the basename of the saved executable path (ip_strings after "executable_path=") against `sweetinject=LIB:NAME[,NAME]` and adds DYLD_INSERT_LIBRARIES=LIB after the environment (parser tested in user space); SweetGPU.cpp newBuffer() helper, surfaceBuffer() (0x7e; SURFACE_DESCRIBE 0xffffffff; whole surface memory from offset 0, page-rounded allocSize; physical panel surface too), submit pushes surface buffers (dc civac over the cached kernel mapping) when seed (state page +0xc) changed / first time / >= 4 ms since, records surfaces named with MSM_SUBMIT_BO_WRITE -> fence (32-entry table); sweet_gpu_surface_ready(id, kernel, size) for the framebuffer: false while that fence is not done, pushes once when done; SweetFramebuffer present() returns false (re-marks dirty, next tick) when any layer is not ready. Userland `userland/ca-bridge/`: eagl.c (HackiOS 4205 lines; names, IOKit decls, dlopen OpenGLES when EAGLContext missing), sweet_gl_osmesa.c, sweet_gl.h, mkeagl.py + eagl_slots.txt (409 entries: 355 passed to Mesa, 30 by hand, 24 none; generated in CI from Mesa's gl.xml + exports, kept by build.sh in mesa-work/meta), sweet_ca.c loader (backboardd only; caenv=; sweetgl=0 off; waits for SweetGPU up to sweetgl_wait=60 s because the GPU comes up ~15 s after the window server; then dlopen /usr/local/lib/libsweet-gl.dylib). eagl.c's own boot-args (gltrace=, glframes=1, glwait=, glblit=, glcopy=1, ...) work as in HackiOS; "SweetWaitsForGPU" registry property is not set by our framebuffer yet, so eagl.c waits for every frame itself (glFinish) — correct, slower; set it later (the framebuffer does wait since 0114). **Test order:** (1) sweet-gl-test (Mesa alone) with 0114 kernel + new artifact via sweet-root-add.sh; (2) then add boot-arg `sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd` (and sweetnull with backboardd) -> log `sweet-ca:` / `sweet-gl:` lines, screen drawn by the GPU.

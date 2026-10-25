@@ -4,7 +4,7 @@
 
 This repository is a fork of **ios-sweet**. ios-sweet builds Apple's open-source XNU kernel (xnu-8796, the iOS 16 generation) for the Redmi Note 10 Pro (`sweet`, SM7150), then runs the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X** on it: launchd, the system daemons, backboardd, SpringBoard and the stock apps. On `sweet` it reaches the iOS home screen with touch, buttons, all eight cores and USB networking.
 
-This fork moves that work to `apollo`. As of **2026-10-24** the Mi 10T boots XNU on six cores and reaches **iOS Setup**, and **touch, power, volume-up and volume-down all work**. The kernel loads the touch chip's firmware over SPI at every boot. The section [apollo port status](#apollo-port-status) has the details.
+This fork moves that work to `apollo`. As of **2026-10-25** the Mi 10T boots XNU on all eight cores to the **iOS lock screen**, with **touch, power and the volume buttons** working and the touch firmware loaded over SPI at every boot. The **Adreno 650 GPU is up**: a program draws through it (boot 30), and an OpenGL ES stack (Mesa) and a CoreAnimation bridge are built for the phone. The section [apollo port status](#apollo-port-status) has the details.
 
 > Experimental bring-up, not a usable phone OS. Apple's security model is mostly switched off, and installing the iOS root **erases Android's `userdata` partition**.
 
@@ -12,13 +12,14 @@ This fork moves that work to `apollo`. As of **2026-10-24** the Mi 10T boots XNU
 
 | Area | State on apollo |
 | --- | --- |
-| Boot | Stock bootloader → `fastboot boot` shim → XNU → iOS 16.7 userland from `userdata` → **Setup (Siri page) on screen**. Kernel log readable from recovery |
+| Boot | Stock bootloader → `fastboot boot` shim → XNU → iOS 16.7 userland from `userdata` → **lock screen** (home screen, Control Center, Settings, app switcher, home gesture all usable). First boot of a fresh root runs iOS data migration once (can take an hour or more); boots after it are quick. Kernel log readable from recovery |
 | Boot shim | GIC, PSCI, IMEM restart reason and timer PPIs retargeted to SM8250 (virtual timer INTID 27, physical timer INTID 30, restart reason at `0x146bf65c`) |
 | Device tree (ADT) | `tools/mkadt.py`: 1080×2400 framebuffer at `0x9c000000` (35 MiB splash region), virtual timer INTID 27, 4 GiB from `0x1_00000000`, root compatible gains `xiaomi,apollo` / `qcom,sm8250` (`xiaomi,sweet` stays: `SweetPlatformExpert` matches it). `--touch-fw` embeds the touch firmware |
 | CPU | **All eight cores** with `cpus=8` (four A55, three A77, one A77 prime). `sweet_cpufreq.c` (0098) raises each cluster to its top EPSS level at boot: silver 1804 MHz, gold 2419 MHz, prime 2841 MHz (was 1516 / 710 MHz). No thermal management yet; `sweetcpufreq=N` caps at N MHz |
 | Buttons | **Working** (0082, 0084): power and volume-down on the PON block, volume-up on PM8150 GPIO6 (PPID `0x0c5`), probed automatically; `sweetvolup=0xPPID` overrides |
 | Touch | **Working** (0082–0094, first touch 2026-10-24). Novatek NT36675 on QUP0 SE4 SPI (`spi@990000`), reset GPIO 38, IRQ GPIO 39 (rising edge). The driver finds the pins (south TLMM tile), votes the SE4 clocks in GCC (DFS level 0 = 19.2 MHz), muxes GPIO 8–11 to `qup4`, sets up SPI at 4.8 MHz, reads the chip ID (`0e 00 00 72 66 03`), downloads the firmware with hardware CRC (reset state `0xa0`) and polls the event buffer at `0x22D00`. The chip has no flash: its firmware (`novatek_nt36675_j3s_fw01.bin`, built into Xiaomi's kernel and published in their kernel source; not in git) goes into the ADT with `mkadt.py --touch-fw` |
-| Display | Kernel text and the iOS GUI on the bootloader framebuffer. A bottom band of the Setup page is drawn red (unexplained) |
+| Display | Kernel text and the iOS GUI on the bootloader framebuffer (software-rendered by CoreAnimation, copied to the panel). The GPU path (Mesa + the CoreAnimation bridge) is built but not yet run on the phone |
+| GPU | **Adreno 650 up** (`sweetgpu=22 sweetgpukeep=1`): GMU and 3D core brought up, out of secure mode, a GPU-drawn frame on the panel, and the `SweetGPU` IOKit service through which `sweet-gpu-test` drove the GPU (boot 30). Mesa (OpenGL ES) and the CoreAnimation bridge are built; next is running them on the phone |
 | Not ported yet | Display power (0079), USB device mode / Ethernet (0072–0077), battery, the `/memory` size check |
 
 The next steps and the full engineering history are in [`NOTES.md`](NOTES.md).
@@ -37,10 +38,10 @@ The next steps and the full engineering history are in [`NOTES.md`](NOTES.md).
 [████████████████████]  100 %
 ```
 
-**GPU: 7 of 9 steps done** (power and clocks, GMU firmware, GMU messages and 3D core power, microcode and commands, out of secure mode, first GPU-drawn frame, kernel GPU service; next: Mesa freedreno, CoreAnimation bridge)
+**GPU: 8 of 9 steps done** (power and clocks, GMU firmware, GMU messages and 3D core power, microcode and commands, out of secure mode, first GPU-drawn frame, kernel GPU service, a program drives the GPU; last step: the OpenGL ES + CoreAnimation stack on the phone — Mesa freedreno and the bridge are built, not yet run there)
 
 ```
-[████████████████░░░░]  78 %
+[██████████████████░░]  89 %
 ```
 
 | # | Milestone | State |
@@ -59,7 +60,7 @@ The next steps and the full engineering history are in [`NOTES.md`](NOTES.md).
 | 12 | USB device mode, USB Ethernet and the live kernel log (0072–0077 retargeted to SM8250) | ⏳ Planned |
 | 13 | Battery and charging readout | ⏳ Planned |
 | 14 | Wi-Fi, Bluetooth, audio, cameras, sensors, cellular | 🔭 Long term |
-| 15 | GPU acceleration (Adreno 650), following [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel)'s Adreno 642L work: (1) probe, (2) GMU, (3) 3D core and zap shader, (4) Mesa freedreno + CoreAnimation bridge | 🔄 Phase 2 done (2026-10-24): **the GMU's firmware runs** (`a650_gmu.bin` through our SMMU context, `fw_init_result 0x100`) and its HFI queues are up. Phase 3 (2026-10-24, boot 17): **the GMU powers the 3D core**, which answers its first register reads; then everything is handed back cleanly. Boot 20 (0104, `sweetgpu=19`): **the 3D core takes commands**: SQE microcode running, command processor started, `CP_ME_INIT` read and executed with no faults. Boot 24 (0105–0109, `sweetgpu=20`): **the 3D core is out of secure mode** — TrustZone authenticates the signed zap shader (`a650_zap.mdt`/`.b02` via `mkadt.py --zap-mdt --zap-seg`, PAS image 13) into `pil_gpu_mem 0x8681a000`, and `CP_SET_SECURE_MODE 0` goes through the ring with no faults. (Boot 21 hung on a blind `PAS_SHUTDOWN`-of-nothing; the SCM calls were reworked into a staged, verified `sweetgpuzap` ladder — `0` off, `1` atomic queries, `2` += signature, `3` += the full load, now the default — and that call was removed.) Boot 26 (0110–0111, `sweetgpu=22`): **the GPU draws**: the core writes our memory on command, and its 2D engine fills a 1080×2400 frame (orange, white, blue) that is checked and shown on the panel. Boot 27 (0112, `sweetgpu=22 sweetgpukeep=1`): **the GPU is kept on and offered to programs** as the `SweetGPU` IOKit service (msm DRM interface); a self-test submission through it passes. Boot 30 (0113): **an iOS program drives the GPU**: `sweet-gpu-test` opens `SweetGPU`, makes and maps two buffers, and 64 `CP_MEM_WRITE` submissions come back with their fences in 19 µs each, every word right. Mesa 25.0.7 with freedreno on `SweetGPU` builds for iOS (`userland/mesa`, after HackiOS; `sweet-gl-test` draws a triangle with OpenGL ES and checks it), not yet run on the phone. The CoreAnimation bridge (HackiOS's `eagl.c` as `libsweet-gl.dylib`, loaded into backboardd by `libsweet-ca.dylib` through 0114's `sweetinject`) builds; not yet run. Next: Mesa on the phone, then the bridge |
+| 15 | GPU acceleration (Adreno 650), following [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel)'s Adreno 642L work: (1) probe, (2) GMU, (3) 3D core and zap shader, (4) Mesa freedreno + CoreAnimation bridge | 🔄 Phase 4 in progress (2026-10-25): **the GMU's firmware runs** (`a650_gmu.bin` through our SMMU context, `fw_init_result 0x100`) and its HFI queues are up. Phase 3 (2026-10-24, boot 17): **the GMU powers the 3D core**, which answers its first register reads; then everything is handed back cleanly. Boot 20 (0104, `sweetgpu=19`): **the 3D core takes commands**: SQE microcode running, command processor started, `CP_ME_INIT` read and executed with no faults. Boot 24 (0105–0109, `sweetgpu=20`): **the 3D core is out of secure mode** — TrustZone authenticates the signed zap shader (`a650_zap.mdt`/`.b02` via `mkadt.py --zap-mdt --zap-seg`, PAS image 13) into `pil_gpu_mem 0x8681a000`, and `CP_SET_SECURE_MODE 0` goes through the ring with no faults. (Boot 21 hung on a blind `PAS_SHUTDOWN`-of-nothing; the SCM calls were reworked into a staged, verified `sweetgpuzap` ladder — `0` off, `1` atomic queries, `2` += signature, `3` += the full load, now the default — and that call was removed.) Boot 26 (0110–0111, `sweetgpu=22`): **the GPU draws**: the core writes our memory on command, and its 2D engine fills a 1080×2400 frame (orange, white, blue) that is checked and shown on the panel. Boot 27 (0112, `sweetgpu=22 sweetgpukeep=1`): **the GPU is kept on and offered to programs** as the `SweetGPU` IOKit service (msm DRM interface); a self-test submission through it passes. Boot 30 (0113): **an iOS program drives the GPU**: `sweet-gpu-test` opens `SweetGPU`, makes and maps two buffers, and 64 `CP_MEM_WRITE` submissions come back with their fences in 19 µs each, every word right. Mesa 25.0.7 with freedreno on `SweetGPU` builds for iOS (`userland/mesa`, after HackiOS; `sweet-gl-test` draws a triangle with OpenGL ES and checks it), not yet run on the phone. The CoreAnimation bridge (HackiOS's `eagl.c` as `libsweet-gl.dylib`, loaded into backboardd by `libsweet-ca.dylib` through 0114's `sweetinject`) builds; not yet run. Next: Mesa on the phone, then the bridge |
 
 The touch steps are pins, clocks, pin mux, SPI, chip ID, firmware download, finger reports and iOS gestures, all done. Milestones 14 and 15 were never done on sweet either: they need drivers for hardware Apple's userland knows nothing about, so treat them as research, not scheduled work.
 
@@ -175,6 +176,9 @@ Without `--touch-fw`, the kernel boots normally and touch stops before the firmw
 | `ufslogsecs=N` | Persistent-log flush interval in seconds (use 1 when chasing hangs) |
 | `sweetvolup=0xPPID` | PMIC GPIO peripheral for volume-up (SID << 8 \| peripheral) |
 | `sweetusb=2` | USB device mode, CDC-ECM Ethernet and the live log |
+| `sweetnull=A,B,...` | Copy what these programs write to `/dev/null` (a launchd job's default stdout) into the console log; e.g. `backboardd,SpringBoard,sweet-gpu-test,sweet-gl-test` |
+| `sweetinject=LIB:A,B,...` | Start programs `A,B` with `DYLD_INSERT_LIBRARIES=LIB` (0114); for the CoreAnimation bridge: `sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd` |
+| `sweetgl=0`, `sweetgl_wait=S` | Keep CoreAnimation's software renderer; how long the bridge waits for `SweetGPU` (default 60 s) |
 
 ### 4. Flash the root and boot
 
@@ -201,7 +205,7 @@ The driver lines start with `SWEET ...`, and crash reports start with `CRASH nam
 | --- | --- |
 | `shim/` | Bare-metal boot shim (C + asm) packed as an Android boot.img v2 |
 | `xnu/patches/` | The XNU patch series (0001–0114, applied in order by CI) plus staging scripts for libpthread, HFS and BearSSL |
-| `userland/` | Programs for the phone (`sweet-gpu-test`), built by the `userland` CI workflow; how to put them on the phone is in [`userland/README.md`](userland/README.md) |
+| `userland/` | Programs and libraries for the phone — `gpu-test` and `gl-test`, Mesa (`mesa/`, OpenGL ES on the GPU) and the CoreAnimation bridge (`ca-bridge/`) — built by the `userland` CI workflow; how to put them on the phone is in [`userland/README.md`](userland/README.md) |
 | `.github/workflows/xnu.yml` | `validate` (Ubuntu, seconds), then the kernel `build` (macOS) |
 | `tools/validate-repo.py` | Patch-series and script checks (numbering, hunk headers, replay of series-created files) |
 | `tools/mkadt.py` | Apple Device Tree from the board's MMIO layout and the iPhone X identity |
@@ -265,8 +269,8 @@ Not in git: partition backups, live device trees, recovery images, Apple firmwar
 | **0110** | **apollo:** GPU steps 21–22: `CP_MEM_WRITE` into our page; a 1080×2400 frame filled by the 2D engine in three bands, checked, copied to the panel |
 | **0111** | **apollo:** step 22 maps the 10 MB panel framebuffer from the kernel's data range (`ml_io_map_unmappable`) instead of the 8 MiB I/O map pool, and releases it |
 | **0112** | **apollo:** the GPU kept on (`sweetgpukeep=1`): address allocator, mapping, ring submission with fences, a self-test; the `SweetGPU` IOKit service and user client (msm DRM ABI of HackiOS's RedwoodGPU) |
-| **0114** | **apollo:** kernel half of the CoreAnimation bridge: a policy named "AMFI" lets dyld honour inserted libraries while boot-arg `sweetinject=LIB:PROG,...` is set, and exec adds `DYLD_INSERT_LIBRARIES` for those programs; `SweetGPU` request 0x7e makes a GPU buffer of an IOSurface (cache pushed before the GPU uses it); the panel copy waits for surfaces the GPU is still drawing |
 | **0113** | **apollo:** fix of Apple's `pmap_sync_page_attributes_phys`: the page-to-address shift was done in 32 bits, so a cache-mode change of any page above 4 GiB (all of apollo's kernel memory) panicked in `phystokv_range`; boot 28 hit it when `sweet-gpu-test` made its first write-combined buffer |
+| **0114** | **apollo:** kernel half of the CoreAnimation bridge: a policy named "AMFI" lets dyld honour inserted libraries while boot-arg `sweetinject=LIB:PROG,...` is set, and exec adds `DYLD_INSERT_LIBRARIES` for those programs; `SweetGPU` request 0x7e makes a GPU buffer of an IOSurface (cache pushed before the GPU uses it); the panel copy waits for surfaces the GPU is still drawing |
 
 ## Key hardware facts
 
