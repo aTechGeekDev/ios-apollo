@@ -176,6 +176,8 @@ Without `--touch-fw`, the kernel boots normally and touch stops before the firmw
 | `sweetvolup=0xPPID` | PMIC GPIO peripheral for volume-up (SID << 8 \| peripheral) |
 | `sweetusb=2` | USB device mode, CDC-ECM Ethernet and the live log |
 
+Or all of it in one go, from a CI kernel run (waits for a run still building, then downloads, builds the ADT with the touch and GPU firmware, packs the boot image with the boot-args above plus `sweetgpu=22 sweetgpukeep=1`, and `fastboot boot`s it): `tools/apollo-boot.sh [RUN_ID]`.
+
 ### 4. Flash the root and boot
 
 ```sh
@@ -206,6 +208,7 @@ The driver lines start with `SWEET ...`, and crash reports start with `CRASH nam
 | `tools/validate-repo.py` | Patch-series and script checks (numbering, hunk headers, replay of series-created files) |
 | `tools/mkadt.py` | Apple Device Tree from the board's MMIO layout and the iPhone X identity |
 | `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload |
+| `tools/apollo-boot.sh` | Downloads a CI kernel, builds the ADT and boot image, and boots the phone with it |
 | `tools/build-ios-root.sh` | Downloads the IPSW's disk images, builds the root (`mkiosroot.sh` + `sweet-root-tweaks.py` + programs) and flashes it |
 | `tools/mkiosroot.sh`, `sweet-root-tweaks.py` | HFS+ iOS root from the IPSW images, and the bring-up changes to it |
 | `tools/sweet-log-pull.sh`, `sweet-log.py`, `sweet-usbnet.sh` | Persistent log from recovery; live log over USB Ethernet |
