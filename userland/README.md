@@ -5,17 +5,25 @@ iPhoneOS SDK, ad-hoc signed) into the `sweet-userland` artifact.
 
 | Program | What it does |
 |---|---|
-| `gpu-test/sweet-gpu-test` | Opens the `SweetGPU` service (kernel 0113+, boot-args `sweetgpu=22 sweetgpukeep=1`), makes and maps two buffers, submits 64 `CP_MEM_WRITE` command buffers and waits for each fence. Success line: `A PROGRAM DRIVES THE GPU` |
+| `gpu-test/sweet-gpu-test` | Opens the `SweetGPU` service (kernel 0113+, boot-args `sweetgpu=22 sweetgpukeep=1`), makes and maps two buffers, submits 64 `CP_MEM_WRITE` command buffers and waits for each fence. Success line: `A PROGRAM DRIVES THE GPU` (boot 30) |
+| `gl-test/sweet-gl-test` | OpenGL ES 2 through Mesa (`lib/libOSMesa.8.dylib`): one triangle drawn by the GPU into a 256 x 256 texture, read back and checked (background, the three corner colours, the covered area), then 100 frames timed. Says when Mesa fell back to software. Success line: `MESA DRAWS WITH THE GPU` |
+| `mesa/` | `build.sh` builds Mesa 25.0.7 (`libOSMesa.8.dylib`: OpenGL ES 2/3, freedreno on the GPU, softpipe without it; installed to `/usr/local/lib`). `patches/` and `sweet-drm/` (the libdrm stand-in that turns DRM requests into `SweetGPU` calls) are adapted from [HackiOS](https://github.com/oosexgang/hackios-xnu-userland) (MIT) |
 
 A program's output reaches the kernel's console log only with its name in
 boot-arg `sweetnull` (patch 0048 copies what those programs write to
 `/dev/null`, launchd's default for a job's stdout):
-`sweetnull=backboardd,SpringBoard,sweet-gpu-test`. Writing to `/dev/console`
-does not reach that log.
+`sweetnull=backboardd,SpringBoard,sweet-gpu-test,sweet-gl-test`. Writing to
+`/dev/console` does not reach that log.
 
 ## Putting a program on the phone
 
-### A fresh iOS root with the program (recommended)
+The root on the phone has done its first-boot setup (that once took hours), so
+add to it (`sweet-root-add.sh`, below) rather than flash a fresh one. Both
+scripts install through `tools/sweet-root-install.sh`: with no program named,
+every test program of `sweet-userland/` that is there, each with its launchd
+job, and `sweet-userland/lib/*` into `/usr/local/lib`.
+
+### A fresh iOS root with the programs
 
 On the Linux PC, with the built programs in `sweet-userland/`:
 
@@ -42,12 +50,12 @@ Needs `curl apfs-fuse hfsprogs rsync android-sdk-libsparse-utils fastboot adb`
 first, and the PC is kept from sleeping while it runs. If api.ipsw.me does not
 answer, give the IPSW link yourself: `IPSW_URL=https://... tools/build-ios-root.sh`.
 
-### Adding a program to the root already on the phone
+### Adding programs to the root already on the phone (recommended)
 
 With the phone in recovery (`fastboot boot recovery/recovery.img`):
 
 ```sh
-tools/sweet-root-add.sh sweet-userland/sweet-gpu-test com.sweet.gputest
+tools/sweet-root-add.sh                 # or: tools/sweet-root-add.sh PROGRAM LABEL [PROGRAM LABEL]...
 ```
 
 It deletes what earlier tries left in `research/`, copies the phone's iOS root
@@ -58,6 +66,10 @@ current step, adds the program to
 console log that `tools/sweet-log-pull.sh` reads), and builds an image of only
 the changed blocks. It then asks before it writes anything: only `yes` makes it
 reboot the phone to fastboot and flash those blocks to `userdata`.
+
+After the flash, the edited copy (which is now what the phone has) becomes
+`research/ios-root/ios16-root.img`, so a later `build-ios-root.sh --reuse`
+starts from a root that has done its first boot.
 
 Needs `hfsprogs` (`fsck.hfsplus`), the `hfsplus` kernel module and sudo. The
 root is pulled fresh every time, because every boot with `rootrw=1` changes it.
