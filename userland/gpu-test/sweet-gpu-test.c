@@ -8,9 +8,11 @@
  * sweet_gpu.c has brought the GPU up and offered it), opens it, asks the parameters freedreno asks first, makes a
  * command buffer and a target buffer, maps both, writes CP_MEM_WRITE packets
  * (one per submission) into the command buffer, submits, waits for each fence,
- * and checks every word the GPU wrote. Prints to stdout (run by launchd with
- * StandardOutPath /dev/console it lands in the kernel's console log, read by
- * tools/sweet-log-pull.sh). Exit 0 when every check passes.
+ * and checks every word the GPU wrote. Prints to stdout: launchd points it at
+ * /dev/null, which the kernel copies into its console log (read by
+ * tools/sweet-log-pull.sh) for the programs named in boot-arg sweetnull, e.g.
+ * sweetnull=backboardd,SpringBoard,sweet-gpu-test (patch 0048). Exit 0 when
+ * every check passes.
  *
  * The iOS SDK has no IOKit headers, so the few IOKitLib calls used are
  * declared here (IOKit.framework is linked as usual).
@@ -216,16 +218,17 @@ main(int argc, char **argv)
 			printf("sweet-gpu-test: submission %u failed: %#x\n", i, kr);
 			return 1;
 		}
-		deadline = now_ns() + 1000000000ull;
+		/* 2 s: SweetGPU reports the core's state only for waits of a second or more */
+		deadline = now_ns() + 2000000000ull;
 		w.fence = s.fence;
 		w.timeout.seconds = (int64_t)(deadline / 1000000000ull);
 		w.timeout.nanoseconds = (int64_t)(deadline % 1000000000ull);
 		if ((kr = call(MSM_WAIT_FENCE, &w, sizeof(w))) != KERN_SUCCESS) {
-			printf("sweet-gpu-test: fence %u of submission %u not done within 1 s: %#x\n", s.fence, i, kr);
+			printf("sweet-gpu-test: fence %u of submission %u not done within 2 s: %#x\n", s.fence, i, kr);
 			return 1;
 		}
 		took_ns += now_ns() - began;
-		if (i < 2)
+		if (i < 2 || (i + 1) % 16 == 0)
 			printf("sweet-gpu-test: submission %u: fence %u done, word %#x\n", i, s.fence, target.cpu[i]);
 	}
 	for (unsigned i = 0; i < submissions; i++)

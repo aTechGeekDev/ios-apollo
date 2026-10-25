@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Build a fresh iOS root for the phone from Apple's IPSW and flash it to userdata.
 #
-#   tools/build-ios-root.sh [PROGRAM LABEL]...
+#   tools/build-ios-root.sh [--reuse] [PROGRAM LABEL]...
 #   e.g. tools/build-ios-root.sh sweet-userland/sweet-gpu-test com.sweet.gputest
 #
+# --reuse: skip steps 1-2 and start from the research/ios-root/ios16-root.img
+# an earlier run left (never booted: the phone has its own copy), to bring a
+# changed sweet-root-tweaks.py or new programs to the phone without a rebuild.
 # With no arguments, sweet-userland/sweet-gpu-test is added if it is there.
 #   1. the three disk images of the iPhone X (iPhone10,3) iOS 16.7.16 (20H392)
 #      IPSW (OS, SystemOS and AppOS, ~7.5 GB), found through its
@@ -11,7 +14,8 @@
 #   2. tools/mkiosroot.sh: research/ios-root/ios16-root.img, 16 GiB HFS+
 #   3. tools/sweet-root-tweaks.py (Setup skipped, activation, no baseband
 #      daemon, ...) and every PROGRAM into /usr/local/bin, each with a launchd
-#      job LABEL that runs it at boot (output in the console log)
+#      job LABEL that runs it at boot (its output reaches the console log
+#      with boot-arg sweetnull=backboardd,SpringBoard,NAME)
 #   4. research/ios-root/ios16-root.simg (img2simg)
 #   5. it ASKS, then flashes that to userdata (phone in fastboot, ~7 minutes).
 #      Anything but "yes" writes nothing to the phone.
@@ -30,12 +34,18 @@ out=$here/research/ios-root
 img=$out/ios16-root.img
 simg=$out/ios16-root.simg
 mnt=/mnt/iosroot
+reuse=${SWEET_REUSE:-}
 
+if [ "${1:-}" = --reuse ]; then
+	reuse=1
+	export SWEET_REUSE=1            # kept across the systemd-inhibit re-run below
+	shift
+fi
 if [ $# -eq 0 ] && [ -f "$here/sweet-userland/sweet-gpu-test" ]; then
 	set -- "$here/sweet-userland/sweet-gpu-test" com.sweet.gputest
 fi
 if [ $(($# % 2)) -ne 0 ] || [ "${1:-}" = -h ] || [ "${1:-}" = --help ]; then
-	sed -n '2,22p' "$0"
+	sed -n '2,27p' "$0"
 	exit 1
 fi
 # Run again under systemd-inhibit: no suspend, idle sleep or lid-close sleep until the end.
@@ -87,7 +97,13 @@ trap cleanup EXIT
 if mountpoint -q "$mnt" 2>/dev/null; then
 	sudo umount "$mnt" || die "$mnt is still mounted from an earlier try and does not unmount"
 fi
-for old in "$img" "$simg"; do
+if [ -n "$reuse" ]; then
+	[ -f "$img" ] || die "--reuse: no ${img#"$here"/} from an earlier run; run without --reuse"
+	olds=("$simg")
+else
+	olds=("$img" "$simg")
+fi
+for old in "${olds[@]}"; do
 	if [ -e "$old" ]; then
 		printf 'deleting %s from an earlier try\n' "${old#"$here"/}"
 		rm -f "$old"
@@ -96,9 +112,14 @@ done
 free_kb=$(df -Pk "$out" | awk 'NR == 2 { print $4 }')
 have_kb=$(du -sk "$ipswdir" | awk '{ print $1 }')
 need_kb=$(((40 * 1024 * 1024) - have_kb))
+[ -z "$reuse" ] || need_kb=$((14 * 1024 * 1024))         # the sparse image only
 [ "$free_kb" -gt "$need_kb" ] || die "need about $((need_kb / 1024 / 1024)) GB free under research/ (have $((free_kb / 1024 / 1024)) GB)"
 
 # --- 1. the IPSW's disk images
+if [ -n "$reuse" ]; then
+	step 1 "skipped (--reuse)"
+	step 2 "skipped (--reuse): ${img#"$here"/} from an earlier run"
+else
 step 1 "downloading the IPSW's disk images ($device $build) into ${ipswdir#"$here"/}"
 url=${IPSW_URL:-}
 if [ -z "$url" ]; then
@@ -125,6 +146,7 @@ done
 step 2 "building ${img#"$here"/} from them (tools/mkiosroot.sh)"
 "$here/tools/mkiosroot.sh" "$ipswdir/$os_dmg" "$ipswdir/$sysos_dmg" "$ipswdir/$appos_dmg" "$img" 16G ||
 	die "building the root failed (its output is above)"
+fi
 
 # --- 3. the changes
 step 3 "the repo's changes (tools/sweet-root-tweaks.py) and the programs"

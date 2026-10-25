@@ -5,9 +5,12 @@
 
 IN is /System/Library/xpc/launchd.plist (binary plist, read by launchd when
 booted with launchd_unsecure_cache=1). The job runs PROGRAM once at boot as
-root, with stdout/stderr on /dev/console, which the kernel keeps in its
-console log (tools/sweet-log-pull.sh). An existing job with the same LABEL is
-replaced.
+root. Its stdout/stderr stay launchd's default /dev/null: the kernel copies
+what the programs named in boot-arg sweetnull write there into its console
+log (patch 0048; tools/sweet-log-pull.sh), e.g.
+sweetnull=backboardd,SpringBoard,sweet-gpu-test. (/dev/console does not reach
+that log: boot 29 has no line of sweet-gpu-test's.) An existing job with the
+same LABEL is replaced.
 """
 import plistlib, sys
 
@@ -27,8 +30,6 @@ def main():
         'RunAtLoad': True,
         'KeepAlive': False,
         'UserName': 'root',
-        'StandardOutPath': '/dev/console',
-        'StandardErrorPath': '/dev/console',
     }
     with open(dst, 'wb') as f:
         plistlib.dump(plist, f, fmt=plistlib.FMT_BINARY)

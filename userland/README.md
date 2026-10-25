@@ -5,7 +5,13 @@ iPhoneOS SDK, ad-hoc signed) into the `sweet-userland` artifact.
 
 | Program | What it does |
 |---|---|
-| `gpu-test/sweet-gpu-test` | Opens the `SweetGPU` service (kernel 0112+, boot-args `sweetgpu=22 sweetgpukeep=1`), makes and maps two buffers, submits 64 `CP_MEM_WRITE` command buffers and waits for each fence. Success line: `A PROGRAM DRIVES THE GPU` |
+| `gpu-test/sweet-gpu-test` | Opens the `SweetGPU` service (kernel 0113+, boot-args `sweetgpu=22 sweetgpukeep=1`), makes and maps two buffers, submits 64 `CP_MEM_WRITE` command buffers and waits for each fence. Success line: `A PROGRAM DRIVES THE GPU` |
+
+A program's output reaches the kernel's console log only with its name in
+boot-arg `sweetnull` (patch 0048 copies what those programs write to
+`/dev/null`, launchd's default for a job's stdout):
+`sweetnull=backboardd,SpringBoard,sweet-gpu-test`. Writing to `/dev/console`
+does not reach that log.
 
 ## Putting a program on the phone
 
@@ -22,7 +28,9 @@ SystemOS, AppOS, about 7.5 GB, into `research/ipsw/`; kept, so a second run
 skips this), builds the 16 GiB HFS+ root (`tools/mkiosroot.sh`), applies the
 repo's changes (`tools/sweet-root-tweaks.py`), adds
 `sweet-userland/sweet-gpu-test` to `/usr/local/bin` with a launchd job that
-runs it at every boot, and makes `research/ios-root/ios16-root.simg`. Then it
+runs it at every boot, and makes `research/ios-root/ios16-root.simg`.
+`--reuse` starts from the image an earlier run left instead (no download, no
+rebuild): for a changed `sweet-root-tweaks.py` or a new program build. Then it
 asks: only `yes` flashes that to `userdata` (phone in fastboot, about 7
 minutes). This replaces the whole iOS root on the phone, so anything an
 earlier boot wrote there is gone. Other programs:

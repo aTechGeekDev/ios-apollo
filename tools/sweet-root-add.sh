@@ -10,8 +10,8 @@
 #      research/apollo-root-base.img (~20 minutes)
 #   2. ... and copied again to research/apollo-root-new.img
 #   3. PROGRAM goes into that copy (/usr/local/bin) with a launchd job LABEL
-#      that runs it at boot (output in the console log that
-#      tools/sweet-log-pull.sh reads)
+#      that runs it at boot (its output reaches the console log that
+#      tools/sweet-log-pull.sh reads with boot-arg sweetnull=...,NAME)
 #   4. research/apollo-root-new.simg collects only the changed blocks
 #   5. it ASKS, then reboots the phone to fastboot and flashes those blocks to
 #      userdata. Answer anything but "yes" and nothing is written.

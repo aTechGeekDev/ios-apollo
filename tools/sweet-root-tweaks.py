@@ -14,8 +14,12 @@ screen (image versions v8-v14 in NOTES.md):
                   crash-loops and Setup blocks on its CoreTelephony XPC)
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
-  migration       LastSystemVersion so DataMigration does not run for an hour
-                  on every boot
+  migration       LastSystemVersion, in the plain file and in the ByHost
+                  (kCFPreferencesCurrentHost) file datamigrator reads, named
+                  by the IOPlatformUUID the kernel derives from mkadt.py's
+                  /chosen unique-chip-id + chip-id; without it DataMigration
+                  runs on every boot and holds SpringBoard at the Apple logo
+                  (images v11/v12; apollo boot 29)
   audio           VirtualAudio HAL plug-in disabled (mediaserverd crash)
   MediaToolbox    StartRecorderServer=false (camera filter prewarm calls a
                   NULL OpenGL function without a GPU -> mediaserverd crash loop)
@@ -27,10 +31,11 @@ screen (image versions v8-v14 in NOTES.md):
                   comes from its Hactivation branch, selected by the /chosen
                   security-status properties in tools/mkadt.py
 """
-import glob, os, plistlib, shutil, sys
+import glob, hashlib, os, plistlib, shutil, struct, sys, uuid
 
 BUILD, VERSION = '20H392', '16.7.16'
 MOBILE = 501
+SWEET_ECID, CHIP_ID = 0x5357454554000001, 0x8015      # tools/mkadt.py /chosen
 
 
 def load(path):
@@ -52,6 +57,32 @@ def merge_pref(root, name, values):
     data.update(values)
     save(path, data, MOBILE, MOBILE, 0o600)
     print('pref', name, sorted(values))
+
+
+def platform_uuid():
+    """IOPlatformUUID as XNU makes it on arm (IOPlatformExpertDevice::generatePlatformUUID):
+    a name-based SHA-1 UUID of /chosen unique-chip-id (8 bytes) + chip-id (4 bytes)."""
+    space = bytes.fromhex('a6dd4ccbb5e84af5acddb6dc6a0542b8')
+    d = bytearray(hashlib.sha1(space + struct.pack('<QI', SWEET_ECID, CHIP_ID)).digest()[:16])
+    d[6] = (d[6] & 0x0f) | 0x50
+    d[8] = (d[8] & 0x3f) | 0x80
+    return str(uuid.UUID(bytes=bytes(d))).upper()
+
+
+def merge_host_pref(root, name, values):
+    """Merge keys into the ByHost NAME.<platform UUID>.plist files (upper and lower case UUID)."""
+    d = os.path.join(root, 'private/var/mobile/Library/Preferences/ByHost')
+    if not os.path.isdir(d):
+        os.makedirs(d)
+        os.chown(d, MOBILE, MOBILE)
+        os.chmod(d, 0o755)
+    host = platform_uuid()
+    for u in (host, host.lower()):
+        path = os.path.join(d, f'{name}.{u}.plist')
+        data = load(path) if os.path.exists(path) else {}
+        data.update(values)
+        save(path, data, MOBILE, MOBILE, 0o600)
+    print('host pref', name, host, sorted(values))
 
 
 def launchd(root):
@@ -133,6 +164,7 @@ def main():
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})
+    merge_host_pref(root, 'com.apple.migration', {'LastSystemVersion': BUILD})
     merge_pref(root, 'com.apple.springboard', {
         'BKNoWatchdogs': True,
         'FBLaunchWatchdogExceptions': {'com.apple.purplebuddy': 100.0},
