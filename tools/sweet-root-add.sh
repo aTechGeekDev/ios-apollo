@@ -45,7 +45,13 @@ free_kb=$(df -Pk "$here/research" | awk 'NR == 2 { print $4 }')
 adb get-state 2>/dev/null | grep -q recovery || die "the phone is not in recovery: fastboot boot recovery/recovery.img, wait for it, run again"
 
 say "1/4 copying the phone's iOS root to $base (about 12 minutes)"
-adb exec-out "dd if=/dev/block/sda34 bs=1048576 count=$size_mib 2>/dev/null" > "$base.part"
+adb exec-out "dd if=/dev/block/sda34 bs=1048576 count=$size_mib 2>/dev/null" > "$base.part" &
+pull=$!
+while kill -0 "$pull" 2>/dev/null; do
+	sleep 20
+	printf '   %d of %d MiB\n' $(($(stat -c %s "$base.part") / 1048576)) "$size_mib"
+done
+wait "$pull" || die "adb stopped copying: run again"
 [ "$(stat -c %s "$base.part")" -eq $((size_mib * 1048576)) ] || die "the copy is short ($(stat -c %s "$base.part") bytes): run again"
 mv "$base.part" "$base"
 
