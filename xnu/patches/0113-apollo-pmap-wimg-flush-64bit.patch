@@ -1,0 +1,18 @@
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6881,7 +6881,14 @@
+ pmap_sync_page_attributes_phys(
+ 	ppnum_t pp)
+ {
+-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
++	/*
++	 * SWEET: ptoa(), not pp << PAGE_SHIFT: that shift is done in 32 bits
++	 * (ppnum_t) and drops bit 32 of every address at or above 4 GiB, where
++	 * all of apollo's kernel memory is. flush_dcache() then panics in
++	 * phystokv_range ("illegal PA"). Real iPhones build with
++	 * __ARM_COHERENT_IO__, where flush_dcache() ignores the address.
++	 */
++	flush_dcache((vm_offset_t) ptoa(pp), PAGE_SIZE, TRUE);
+ }
+ 
+ #if CONFIG_COREDUMP

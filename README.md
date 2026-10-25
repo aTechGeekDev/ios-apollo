@@ -200,7 +200,7 @@ The driver lines start with `SWEET ...`, and crash reports start with `CRASH nam
 | Path | What |
 | --- | --- |
 | `shim/` | Bare-metal boot shim (C + asm) packed as an Android boot.img v2 |
-| `xnu/patches/` | The XNU patch series (0001–0112, applied in order by CI) plus staging scripts for libpthread, HFS and BearSSL |
+| `xnu/patches/` | The XNU patch series (0001–0113, applied in order by CI) plus staging scripts for libpthread, HFS and BearSSL |
 | `userland/` | Programs for the phone (`sweet-gpu-test`), built by the `userland` CI workflow; how to put them on the phone is in [`userland/README.md`](userland/README.md) |
 | `.github/workflows/xnu.yml` | `validate` (Ubuntu, seconds), then the kernel `build` (macOS) |
 | `tools/validate-repo.py` | Patch-series and script checks (numbering, hunk headers, replay of series-created files) |
@@ -265,6 +265,7 @@ Not in git: partition backups, live device trees, recovery images, Apple firmwar
 | **0110** | **apollo:** GPU steps 21–22: `CP_MEM_WRITE` into our page; a 1080×2400 frame filled by the 2D engine in three bands, checked, copied to the panel |
 | **0111** | **apollo:** step 22 maps the 10 MB panel framebuffer from the kernel's data range (`ml_io_map_unmappable`) instead of the 8 MiB I/O map pool, and releases it |
 | **0112** | **apollo:** the GPU kept on (`sweetgpukeep=1`): address allocator, mapping, ring submission with fences, a self-test; the `SweetGPU` IOKit service and user client (msm DRM ABI of HackiOS's RedwoodGPU) |
+| **0113** | **apollo:** fix of Apple's `pmap_sync_page_attributes_phys`: the page-to-address shift was done in 32 bits, so a cache-mode change of any page above 4 GiB (all of apollo's kernel memory) panicked in `phystokv_range`; boot 28 hit it when `sweet-gpu-test` made its first write-combined buffer |
 
 ## Key hardware facts
 
