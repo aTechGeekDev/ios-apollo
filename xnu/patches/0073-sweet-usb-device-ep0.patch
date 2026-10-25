@@ -204,7 +204,7 @@
 +	9, 2, 18, 0, 1, 1, 0, 0x80, 250,                /* config: 1 interface, 500 mA */
 +	9, 4, 0, 0, 0, 0xff, 0x00, 0x00, 0,             /* vendor interface, no endpoints */
 +};
-+static const char *const ud_strings[] = { NULL, "ios-sweet", "Sweet iOS (USB bring-up)", "0001" };
++static const char *const ud_strings[] = { NULL, "project-BadApple", "BadApple (USB bring-up)", "0001" };
 +
 +static uint32_t
 +ud_string(unsigned idx, uint8_t *out)

@@ -17,7 +17,7 @@ sweet-drm/sweet_drm_*, the meson comment.
 -if dep_libdrm.found()
 +if host_machine.system() == 'darwin' and with_gallium_freedreno
 +  # No DRM on this system: freedreno's requests go to the kernel's GPU service through a
-+  # stand-in for libdrm (src/sweet-drm, put there by ios-apollo's userland/mesa/build.sh; its
++  # stand-in for libdrm (src/sweet-drm, put there by project-BadApple's userland/mesa/build.sh; its
 +  # one source file is built with freedreno's drm layer, src/freedreno/drm).
 +  dep_libdrm = declare_dependency(
 +    include_directories : include_directories('src/sweet-drm'),

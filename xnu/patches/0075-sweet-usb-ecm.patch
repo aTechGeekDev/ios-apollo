@@ -120,9 +120,9 @@
 +};
 +/* The host side's MAC (ECM iMACAddress); the phone's own is ..:02 */
 +static const char *const ud_strings[] = {
-+	NULL, "ios-sweet", "Sweet iOS (USB Ethernet)", "0001", "02005E77EE01",
++	NULL, "project-BadApple", "BadApple (USB Ethernet)", "0001", "02005E77EE01",
  };
--static const char *const ud_strings[] = { NULL, "ios-sweet", "Sweet iOS (USB bring-up)", "0001" };
+-static const char *const ud_strings[] = { NULL, "project-BadApple", "BadApple (USB bring-up)", "0001" };
 +static const uint8_t ud_phone_mac[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xee, 0x02 };
  
  static uint32_t

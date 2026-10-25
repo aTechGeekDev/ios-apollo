@@ -1,4 +1,4 @@
-# QEMU Emulation & Testing Guide for ios-sweet
+# QEMU emulation and testing
 
 This document explains how to test the patched Apple XNU kernel for the Redmi Note 10 Pro (`sweet`, SM7150) in QEMU virtual machine without touching physical hardware or risking device user data.
 

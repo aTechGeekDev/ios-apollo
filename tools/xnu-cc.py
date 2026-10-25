@@ -9,7 +9,7 @@ FILTER     only compile sources whose path contains one of these strings
            a full path relative to xnu/ also compiles newly added sources
 
 Edit the sources under BUILDTREE/xnu, re-run, and turn the result into
-patches with `git diff` there. Uses the local Apple-fork clang (swiftlang).
+patches with `git diff` there. Uses the local swiftlang (Apple) clang.
 
 Env: XNU_CC_EXTRA   extra flags (e.g. "-DKPERF -DKPC" for config changes)
      XNU_CC_POST    flags appended after the original ones (like a per-object
@@ -20,12 +20,21 @@ Env: XNU_CC_EXTRA   extra flags (e.g. "-DKPERF -DKPC" for config changes)
 import concurrent.futures as cf, os, re, shlex, subprocess, sys
 from collections import Counter
 
-CI_DXB = '/Users/runner/work/ios-sweet/ios-sweet/dxb'
+CI_DXB = '/Users/runner/work/project-BadApple/project-BadApple/dxb'	# main() takes it from the log
 CI_SDK_PLATFORM = re.compile(r'/Applications/Xcode[^ ]*?\.sdk/+System/Library/Frameworks/Kernel\.framework/Versions/A/PrivateHeaders/platform')
 CLANG = os.path.expanduser('~/swift/usr/bin/clang')
 DROP = {'-c', '-g', '-MD', '-MMD'}
 DROP_WITH_ARG = {'-MF', '-MT', '-o', '-arch'}
 COMPONENTS = ('osfmk', 'bsd', 'iokit', 'libkern', 'pexpert', 'security', 'san', 'libsa')
+
+
+def ci_dxb(log):
+    """The runner's dxb checkout as LOG names it (the path follows the repository's name)."""
+    for line in open(log, errors='replace'):
+        m = re.search(r'/Users/runner/work/[^/\s]+/[^/\s]+/dxb(?=/)', line)
+        if m:
+            return m.group(0)
+    return CI_DXB
 
 
 def commands(log):
@@ -120,7 +129,9 @@ def run(item, bt, cdirs):
 
 
 def main():
+    global CI_DXB
     log, bt = sys.argv[1], os.path.abspath(sys.argv[2])
+    CI_DXB = ci_dxb(log)
     per_file = '--per-file' in sys.argv
     filters = [a for a in sys.argv[3:] if a != '--per-file']
     cmds = commands(log)

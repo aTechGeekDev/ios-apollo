@@ -223,7 +223,7 @@ def main():
     ap.add_argument('-v', '--verbose', action='store_true', help='Show detailed per-file output')
     a = ap.parse_args()
 
-    print(bold("=== Running ios-sweet Repository Validation ==="))
+    print(bold("=== Running project-BadApple Repository Validation ==="))
     ok_patches = validate_patches(a.verbose)
     ok_python = validate_python_scripts(a.verbose)
     ok_shell = validate_shell_scripts(a.verbose)
