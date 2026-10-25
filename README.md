@@ -117,7 +117,7 @@ The workflow fetches xnu-8796 via [blacktop/darwin-xnu-build](https://github.com
 
 ### 2. Build the iOS root image
 
-From the iPhone X (iPhone10,3) iOS 16.7.16 (20H392) IPSW, on Linux with `apfs-fuse`, `hfsprogs` and sudo:
+One command downloads the iPhone X (iPhone10,3) iOS 16.7.16 (20H392) IPSW's disk images, builds the root with the changes below plus the programs in `sweet-userland/`, and (after asking) flashes it: `tools/build-ios-root.sh` ([`userland/README.md`](userland/README.md)). By hand, on Linux with `apfs-fuse`, `hfsprogs` and sudo:
 
 ```sh
 tools/mkiosroot.sh OS.dmg SystemOS.dmg AppOS.dmg ios16-root.img 16G
@@ -206,6 +206,7 @@ The driver lines start with `SWEET ...`, and crash reports start with `CRASH nam
 | `tools/validate-repo.py` | Patch-series and script checks (numbering, hunk headers, replay of series-created files) |
 | `tools/mkadt.py` | Apple Device Tree from the board's MMIO layout and the iPhone X identity |
 | `tools/mkpayload.py` | Packs kernel + ADT + boot-args into the shim payload |
+| `tools/build-ios-root.sh` | Downloads the IPSW's disk images, builds the root (`mkiosroot.sh` + `sweet-root-tweaks.py` + programs) and flashes it |
 | `tools/mkiosroot.sh`, `sweet-root-tweaks.py` | HFS+ iOS root from the IPSW images, and the bring-up changes to it |
 | `tools/sweet-log-pull.sh`, `sweet-log.py`, `sweet-usbnet.sh` | Persistent log from recovery; live log over USB Ethernet |
 | `tools/sweet-crash.py` | Symbolicate console crash reports |

@@ -80,7 +80,7 @@ mounts=("$work/root" "${mounts[@]}")
 copy() {
 	echo "copying $1 -> ${2#"$work/root"}"
 	sudo mkdir -p "$2"
-	sudo rsync -aH --numeric-ids "$1/" "$2/"
+	sudo rsync -aH --numeric-ids --info=progress2 "$1/" "$2/"
 }
 copy "$work/os/root" "$work/root"
 copy "$work/sysos/root" "$work/root/private/preboot/Cryptexes/OS"

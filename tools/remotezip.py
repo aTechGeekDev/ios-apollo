@@ -2,7 +2,8 @@
 """List or extract single members of a remote zip (e.g. an IPSW) via HTTP range requests.
 
   remotezip.py URL                      list members
-  remotezip.py URL PATTERN OUTDIR       extract members whose name contains PATTERN
+  remotezip.py URL PATTERN OUTDIR       extract the member named PATTERN, or else
+                                        every member whose name contains it
 
 Members are streamed to disk in chunks (multi-GB DMGs never sit in RAM), a
 partial download resumes from where it stopped, and the zip CRC-32 is
@@ -90,7 +91,10 @@ def extract(url, entry, outdir):
             data = get(url, start + done, start + done + n - 1)
             out.write(inflate.decompress(data) if inflate else data)
             done += n
-            print(f'{name}: {done * 100 // csize}% ({done >> 20} MiB)', flush=True)
+            print(f'{name}: {done * 100 // csize}% ({done >> 20} of {csize >> 20} MiB)',
+                  end='\r' if sys.stdout.isatty() else '\n', flush=True)
+        if sys.stdout.isatty():
+            print()
         if inflate:
             out.write(inflate.flush())
     with open(part, 'rb') as f:
@@ -110,6 +114,7 @@ if __name__ == '__main__':
         for e in entries:
             print(f'{e[3]:>12} {e[0]}')
     else:
-        for e in entries:
-            if sys.argv[2] in e[0]:
-                extract(url, e, sys.argv[3])
+        # An exact name wins: 087-86698-044.dmg alone, not also its .trustcache, .mtree, ...
+        exact = [e for e in entries if e[0] == sys.argv[2]]
+        for e in exact or [e for e in entries if sys.argv[2] in e[0]]:
+            extract(url, e, sys.argv[3])

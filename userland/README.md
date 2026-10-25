@@ -9,6 +9,33 @@ iPhoneOS SDK, ad-hoc signed) into the `sweet-userland` artifact.
 
 ## Putting a program on the phone
 
+### A fresh iOS root with the program (recommended)
+
+On the Linux PC, with the built programs in `sweet-userland/`:
+
+```sh
+tools/build-ios-root.sh
+```
+
+It downloads the three disk images of the iPhone X iOS 16.7.16 IPSW (OS,
+SystemOS, AppOS, about 7.5 GB, into `research/ipsw/`; kept, so a second run
+skips this), builds the 16 GiB HFS+ root (`tools/mkiosroot.sh`), applies the
+repo's changes (`tools/sweet-root-tweaks.py`), adds
+`sweet-userland/sweet-gpu-test` to `/usr/local/bin` with a launchd job that
+runs it at every boot, and makes `research/ios-root/ios16-root.simg`. Then it
+asks: only `yes` flashes that to `userdata` (phone in fastboot, about 7
+minutes). This replaces the whole iOS root on the phone, so anything an
+earlier boot wrote there is gone. Other programs:
+`tools/build-ios-root.sh PROGRAM LABEL [PROGRAM LABEL]...`.
+
+Needs `curl apfs-fuse hfsprogs rsync android-sdk-libsparse-utils fastboot adb`
+(Kali: `sudo apt install` those), sudo, the `hfsplus` kernel module and about
+40 GB free under `research/`. Earlier images and a stale mount are removed
+first, and the PC is kept from sleeping while it runs. If api.ipsw.me does not
+answer, give the IPSW link yourself: `IPSW_URL=https://... tools/build-ios-root.sh`.
+
+### Adding a program to the root already on the phone
+
 With the phone in recovery (`fastboot boot recovery/recovery.img`):
 
 ```sh
@@ -26,5 +53,6 @@ reboot the phone to fastboot and flash those blocks to `userdata`.
 
 Needs `hfsprogs` (`fsck.hfsplus`), the `hfsplus` kernel module and sudo. The
 root is pulled fresh every time, because every boot with `rootrw=1` changes it.
-Root images and the built programs stay out of git (`research/` and
-`sweet-userland/` are ignored).
+
+Root images, the downloaded IPSW parts and the built programs stay out of git
+(`research/` and `sweet-userland/` are ignored).
