@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 # Build a fresh iOS root for the phone from Apple's IPSW and flash it to userdata.
 #
-#   tools/build-ios-root.sh [--reuse] [PROGRAM LABEL]...
+#   tools/build-ios-root.sh [--reuse] [--oslog] [PROGRAM LABEL]...
 #   e.g. tools/build-ios-root.sh sweet-userland/sweet-gpu-test com.sweet.gputest
 #
 # --reuse: skip steps 1-2 and start from the research/ios-root/ios16-root.img
 # an earlier run left (never booted: the phone has its own copy), to bring a
 # changed sweet-root-tweaks.py or new programs to the phone without a rebuild.
+# --oslog: backboardd, SpringBoard and datamigrator also write their os_log to
+# the console log (sweet-root-tweaks.py --oslog; boot with
+# sweetnull=backboardd,SpringBoard,com.apple.datamigrator,...). A run without it
+# takes that out again.
 # With no arguments, sweet-userland/sweet-gpu-test is added if it is there.
 #   1. the three disk images of the iPhone X (iPhone10,3) iOS 16.7.16 (20H392)
 #      IPSW (OS, SystemOS and AppOS, ~7.5 GB), found through its
@@ -35,17 +39,18 @@ img=$out/ios16-root.img
 simg=$out/ios16-root.simg
 mnt=/mnt/iosroot
 reuse=${SWEET_REUSE:-}
+oslog=${SWEET_OSLOG:-}
 
-if [ "${1:-}" = --reuse ]; then
-	reuse=1
-	export SWEET_REUSE=1            # kept across the systemd-inhibit re-run below
+while [ "${1:-}" = --reuse ] || [ "${1:-}" = --oslog ]; do
+	# exported: kept across the systemd-inhibit re-run below
+	if [ "$1" = --reuse ]; then reuse=1; export SWEET_REUSE=1; else oslog=--oslog; export SWEET_OSLOG=--oslog; fi
 	shift
-fi
+done
 if [ $# -eq 0 ] && [ -f "$here/sweet-userland/sweet-gpu-test" ]; then
 	set -- "$here/sweet-userland/sweet-gpu-test" com.sweet.gputest
 fi
 if [ $(($# % 2)) -ne 0 ] || [ "${1:-}" = -h ] || [ "${1:-}" = --help ]; then
-	sed -n '2,27p' "$0"
+	sed -n '2,31p' "$0"
 	exit 1
 fi
 # Run again under systemd-inhibit: no suspend, idle sleep or lid-close sleep until the end.
@@ -154,7 +159,7 @@ sudo fsck.hfsplus -fy "$img" >/dev/null 2>&1 || true
 sudo mkdir -p "$mnt"
 sudo mount -t hfsplus -o loop,force "$img" "$mnt" || die "could not mount $img (is the hfsplus kernel module there? sudo modprobe hfsplus)"
 [ -f "$mnt/System/Library/xpc/launchd.plist" ] || die "$img does not look like an iOS root (no launchd.plist)"
-sudo python3 "$here/tools/sweet-root-tweaks.py" "$mnt"
+sudo python3 "$here/tools/sweet-root-tweaks.py" $oslog "$mnt"
 for ((i = 0; i < ${#programs[@]}; i += 2)); do
 	prog=${programs[i]}
 	label=${programs[i + 1]}

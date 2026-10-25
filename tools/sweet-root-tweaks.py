@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Apply the SWEET bring-up changes to an iOS root made by tools/mkiosroot.sh.
 
-  sudo sweet-root-tweaks.py MOUNTED_ROOT
+  sudo sweet-root-tweaks.py [--oslog] MOUNTED_ROOT
 
 MOUNTED_ROOT is the HFS+ image mounted read-write (Linux: run
 `fsck.hfsplus -fy` on the image, then `mount -t hfsplus -o loop,force`).
@@ -30,6 +30,12 @@ screen (image versions v8-v14 in NOTES.md):
   activation      mobileactivationd data ark seeded; the actual Activated state
                   comes from its Hactivation branch, selected by the /chosen
                   security-status properties in tools/mkadt.py
+
+--oslog (diagnosis; without it the setting is taken out again): backboardd,
+SpringBoard and the datamigrator XPC service run with OS_ACTIVITY_DT_MODE=YES,
+so their os_log messages also go to stderr (/dev/null), which kernel patch
+0048 copies into the console log for the names in boot-arg sweetnull:
+sweetnull=backboardd,SpringBoard,com.apple.datamigrator (p_name, full length).
 """
 import glob, hashlib, os, plistlib, shutil, struct, sys, uuid
 
@@ -102,6 +108,39 @@ def launchd(root):
     print(f'launchd.plist: {renamed} _PanicOnCrash renamed, {len(removed)} CommCenter jobs removed')
 
 
+OSLOG_PROGRAMS = ('/backboardd', '/SpringBoard')
+
+
+def oslog(root, on):
+    """OS_ACTIVITY_DT_MODE=YES (os_log mirrored to stderr) for backboardd, SpringBoard, datamigrator."""
+    def set_env(env_holder):
+        env = env_holder.setdefault('EnvironmentVariables', {})
+        if on:
+            env['OS_ACTIVITY_DT_MODE'] = 'YES'
+        else:
+            env.pop('OS_ACTIVITY_DT_MODE', None)
+            if not env:
+                del env_holder['EnvironmentVariables']
+
+    path = os.path.join(root, 'System/Library/xpc/launchd.plist')
+    st = os.stat(path)
+    plist = load(path)
+    jobs = [j for j in plist['LaunchDaemons'].values()
+            if (j.get('Program') or (j.get('ProgramArguments') or [''])[0]).endswith(OSLOG_PROGRAMS)]
+    for job in jobs:
+        set_env(job)
+    save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+    infos = glob.glob(os.path.join(root, 'System/Library/PrivateFrameworks/DataMigration.framework',
+                                   '**/com.apple.datamigrator.xpc/Info.plist'), recursive=True)
+    for info in infos:
+        st = os.stat(info)
+        data = load(info)
+        set_env(data.setdefault('XPCService', {}))
+        save(info, data, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+    print(f'os_log to stderr {"on" if on else "off"}: {[j.get("Label") for j in jobs]}, '
+          f'{len(infos)} datamigrator Info.plist')
+
+
 def containers(root):
     base = os.path.join(root, 'private/var/containers')
     for sub, uid in (('Bundle', 33), ('Data/System', 0), ('Shared/SystemGroup', 0), ('Temp', 0)):
@@ -154,10 +193,12 @@ def audio(root):
 
 
 def main():
-    if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
+    args = [a for a in sys.argv[1:] if a != '--oslog']
+    if len(args) != 1 or not os.path.isdir(os.path.join(args[0], 'System/Library/xpc')):
         sys.exit(__doc__)
-    root = sys.argv[1]
+    root = args[0]
     launchd(root)
+    oslog(root, '--oslog' in sys.argv[1:])
     containers(root)
     activation(root)
     audio(root)
