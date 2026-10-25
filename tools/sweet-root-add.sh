@@ -15,15 +15,24 @@
 #   4. research/apollo-root-new.simg collects only the changed blocks
 #   5. it ASKS, then reboots the phone to fastboot and flashes those blocks to
 #      userdata. Answer anything but "yes" and nothing is written.
-# Two progress bars: the whole job and the current step.
+# Two progress bars: the whole job and the current step. The PC is kept from
+# sleeping while it runs (a suspend cuts the USB copy from the phone).
 # Needs: adb, fastboot, python3, sudo, fsck.hfsplus (hfsprogs), the hfsplus
 # kernel module, and about 33 GB free under research/.
 set -euo pipefail
 
 if [ $# -ne 2 ]; then
-	sed -n '2,21p' "$0"
+	sed -n '2,22p' "$0"
 	exit 1
 fi
+# Run again under systemd-inhibit: no suspend, idle sleep or lid-close sleep until the end.
+if [ -z "${SWEET_NO_SLEEP:-}" ] && command -v systemd-inhibit >/dev/null &&
+    systemd-inhibit --what=sleep:idle:handle-lid-switch --mode=block true 2>/dev/null; then
+	export SWEET_NO_SLEEP=1
+	exec systemd-inhibit --what=sleep:idle:handle-lid-switch --mode=block \
+		--who=sweet-root-add --why="copying the phone's iOS root" "$0" "$@"
+fi
+[ -n "${SWEET_NO_SLEEP:-}" ] || printf 'note: could not stop the PC from sleeping; keep it awake until this ends\n'
 program=$1
 label=$2
 name=$(basename "$program")
