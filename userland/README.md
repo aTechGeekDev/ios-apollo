@@ -15,8 +15,10 @@ With the phone in recovery (`fastboot boot recovery/recovery.img`):
 tools/sweet-root-add.sh sweet-userland/sweet-gpu-test com.sweet.gputest
 ```
 
-It copies the phone's iOS root (the first 16 GiB of `userdata`, about 12
-minutes, about 33 GB free needed under `research/`), adds the program to
+It deletes what earlier tries left in `research/`, copies the phone's iOS root
+(the first 16 GiB of `userdata`, about 20 minutes, about 33 GB free needed
+under `research/`), shows a progress bar for the whole job and one for the
+current step, adds the program to
 `/usr/local/bin` and a launchd job that runs it at every boot (output in the
 console log that `tools/sweet-log-pull.sh` reads), and builds an image of only
 the changed blocks. It then asks before it writes anything: only `yes` makes it

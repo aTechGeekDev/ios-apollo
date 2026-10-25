@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Write an Android sparse image holding only the blocks where NEW differs from OLD.
 
-  sparsediff.py OLD.img NEW.img OUT.simg [--block 4096]
+  sparsediff.py OLD.img NEW.img OUT.simg [--block 4096] [--progress FILE]
 
 OLD must be exactly what the partition holds now (the image last flashed);
 NEW is the edited copy. Differing blocks become RAW chunks, everything else
 DONT_CARE, so `fastboot flash PART OUT.simg` rewrites only the changes
-instead of the whole image. Both images must be the same size.
+instead of the whole image. Both images must be the same size. With
+--progress, FILE holds "BYTES_COMPARED TOTAL_BYTES", rewritten as it goes
+(tools/sweet-root-add.sh draws its progress bar from it).
 """
 import argparse, os, struct, sys
 
@@ -18,6 +20,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('old'); ap.add_argument('new'); ap.add_argument('out')
     ap.add_argument('--block', type=int, default=4096)
+    ap.add_argument('--progress')
     a = ap.parse_args()
     bs = a.block
     size = os.path.getsize(a.new)
@@ -32,6 +35,15 @@ def main():
         for base in range(0, nblocks, step):
             n = min(step, nblocks - base)
             bo, bn = fo.read(n * bs), fn.read(n * bs)
+            if a.progress and (base // step) % 8 == 0:
+                with open(a.progress, 'w') as f:
+                    f.write(f'{base * bs} {size}\n')
+            if bo == bn:                    # (nearly all of it: one comparison, not n)
+                if runs and not runs[-1][0]:
+                    runs[-1][1] += n
+                else:
+                    runs.append([False, n])
+                continue
             for i in range(n):
                 d = bo[i * bs:(i + 1) * bs] != bn[i * bs:(i + 1) * bs]
                 if runs and runs[-1][0] == d:
@@ -56,6 +68,9 @@ def main():
             else:
                 out.write(struct.pack('<HHII', DONT_CARE, 0, count, 12))
             pos += count
+    if a.progress:
+        with open(a.progress, 'w') as f:
+            f.write(f'{size} {size}\n')
     print(f'{a.out}: {changed} of {nblocks} blocks changed '
           f'({changed * bs >> 20} MiB) in {sum(1 for d, _ in runs if d)} runs')
 
