@@ -1,7 +1,8 @@
 name: userland
 
 # iOS arm64 programs for the phone, built with Xcode's iPhoneOS SDK and
-# ad-hoc signed. Artifact: sweet-userland (see userland/README.md).
+# ad-hoc signed. Artifact: sweet-userland (see userland/README.md):
+#   sweet-gpu-test, sweet-gl-test, lib/libOSMesa.8.dylib, SHA256SUMS
 on:
   workflow_dispatch:
   push:
@@ -13,6 +14,7 @@ on:
 jobs:
   build:
     runs-on: macos-14
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: Build sweet-gpu-test
@@ -25,9 +27,24 @@ jobs:
             -o out/sweet-gpu-test userland/gpu-test/sweet-gpu-test.c
           codesign -s - -f out/sweet-gpu-test
           file out/sweet-gpu-test
-          otool -L out/sweet-gpu-test
-          codesign -dv out/sweet-gpu-test 2>&1
-          (cd out && shasum -a 256 * > SHA256SUMS && cat SHA256SUMS)
+      - name: Build Mesa (libOSMesa.8.dylib, freedreno + softpipe)
+        run: |
+          set -eux
+          brew install bison
+          userland/mesa/build.sh out
+      - name: Build sweet-gl-test
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" \
+            -O2 -Wall -Wextra -Werror -framework IOKit \
+            -o out/sweet-gl-test userland/gl-test/sweet-gl-test.c out/lib/libOSMesa.8.dylib
+          codesign -s - -f out/sweet-gl-test
+          file out/sweet-gl-test
+          otool -L out/sweet-gl-test
+      - name: Checksums
+        run: |
+          cd out && find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 > SHA256SUMS && cat SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: sweet-userland
