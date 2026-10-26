@@ -16,6 +16,24 @@ boot-arg `sweetnull` (patch 0048 copies what those programs write to
 `sweetnull=backboardd,SpringBoard,sweet-gpu-test,sweet-gl-test`. Writing to
 `/dev/console` does not reach that log.
 
+## Updating the libraries without a new root (fast)
+
+`libsweet-gl.dylib`, `libsweet-ca.dylib` and `libOSMesa.8.dylib` go into the
+root padded to 64 MiB, and the root builder records where their blocks lie
+(`research/ios-root/push/`). A new build of any of them is then written straight
+over those blocks from recovery, in about a minute:
+
+```sh
+rm -rf sweet-userland && gh run download RUN_ID -n sweet-userland -D sweet-userland
+fastboot boot recovery/recovery.img && adb wait-for-recovery && tools/sweet-push.sh && adb reboot bootloader
+```
+
+`sweet-push.sh` writes nothing unless the phone holds the root those block maps
+were taken from and the library's 64 MiB there reads back as what was last put
+there; it reads every block back after writing. Only a root built (or
+`--reuse`d) since the push tools exist has the padded libraries; programs and
+anything else still go in with the scripts below.
+
 ## Putting a program on the phone
 
 The root on the phone has done its first-boot setup (that once took hours), so

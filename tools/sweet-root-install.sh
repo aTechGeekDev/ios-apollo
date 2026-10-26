@@ -10,6 +10,13 @@
 # there: sweet-gpu-test (com.sweet.gputest), sweet-gl-test (com.sweet.gltest). Every file in
 # sweet-userland/lib/ (libOSMesa.8.dylib) goes to /usr/local/lib, which is where the programs
 # look for it.
+#
+# The libraries we change often (PUSHED below) go in padded with zeros to 64 MiB, and where their
+# blocks lie on the volume is written to research/ios-root/push/NAME.extents (tools/sweet-extents.py):
+# tools/sweet-push.sh then writes a new build of one straight over those blocks from recovery, with
+# no new root image and no flash of it. 64 MiB is above the sizes at which HFS+ moves a file (its
+# on-the-fly defragmentation, its hot-file clustering), so the blocks stay where they were put; the
+# padding after the end of a Mach-O is never read (as ios-sailfish does with its GL library).
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -26,16 +33,37 @@ if [ $# -eq 0 ]; then
 fi
 [ $(($# % 2)) -eq 0 ] || { echo "sweet-root-install.sh: PROGRAM without LABEL" >&2; exit 1; }
 
+PUSHED="libsweet-gl.dylib libsweet-ca.dylib libOSMesa.8.dylib"
+PAD=$((64 * 1048576))
 mkdir -p "$mnt/usr/local/bin" "$mnt/usr/local/lib"
+work=$(mktemp)
+padded=$(mktemp)
+trap 'rm -f "$work" "$padded"' EXIT
 if [ -d "$here/sweet-userland/lib" ]; then
 	for lib in "$here"/sweet-userland/lib/*; do
 		[ -f "$lib" ] || continue
-		install -m 0755 "$lib" "$mnt/usr/local/lib/${lib##*/}"
-		printf 'added /usr/local/lib/%s (%s bytes)\n' "${lib##*/}" "$(stat -c %s "$lib")"
+		name=${lib##*/} size=$(stat -c %s "$lib")
+		case " $PUSHED " in
+		*" $name "*)
+			[ "$size" -le "$PAD" ] || { echo "sweet-root-install.sh: $name is over 64 MiB" >&2; exit 1; }
+			# written whole (zeros included) so that every block is allocated, then where it lies
+			cat "$lib" > "$padded"
+			head -c $((PAD - size)) /dev/zero >> "$padded"
+			rm -f "$mnt/usr/local/lib/$name"
+			install -m 0755 "$padded" "$mnt/usr/local/lib/$name"
+			mkdir -p "$here/research/ios-root/push"
+			python3 "$here/tools/sweet-extents.py" "$mnt/usr/local/lib/$name" "$here/research/ios-root/push/$name.extents"
+			sha256sum < "$padded" | cut -d' ' -f1 > "$here/research/ios-root/push/$name.onphone"
+			chown -R "${SUDO_UID:-0}:${SUDO_GID:-0}" "$here/research/ios-root/push"   # sweet-push.sh runs as the user
+			printf 'added /usr/local/lib/%s (%s bytes, padded to 64 MiB: tools/sweet-push.sh can replace it)\n' "$name" "$size"
+			;;
+		*)
+			install -m 0755 "$lib" "$mnt/usr/local/lib/$name"
+			printf 'added /usr/local/lib/%s (%s bytes)\n' "$name" "$size"
+			;;
+		esac
 	done
 fi
-work=$(mktemp)
-trap 'rm -f "$work"' EXIT
 while [ $# -gt 0 ]; do
 	prog=$1 label=$2 name=${1##*/}
 	shift 2
