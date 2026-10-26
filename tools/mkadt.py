@@ -6,6 +6,9 @@ address comes from the sweet live FDT. Usage:
   mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--p3] [--touch-fw FW.bin] [--gmu-fw a650_gmu.bin]
             [--sqe-fw a650_sqe.fw] [--zap-mdt a650_zap.mdt] [--zap-seg a650_zap.b02]
 /product says the display is sRGB, not the iPhone X's P3 (--p3 keeps P3): see build().
+--file /usr/local/PATH=LOCAL (as many as wanted) carries a file in /sweet-files; the kernel
+writes it onto the root before launchd starts (xnu 0120, bsd/dev/sweet_files.c): a new build
+of the CoreAnimation bridge or of Mesa without a new root image. Only /usr/local/ paths.
 --touch-fw embeds the NT36675 touch firmware (Xiaomi's
 novatek_nt36675_j3s_fw01.bin, not in git) as /sweet-touch "firmware"; the
 apollo touch driver downloads it into the chip over SPI. --gmu-fw embeds the
@@ -90,7 +93,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_extra=(), p3=False):
+def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_extra=(), p3=False, files=()):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
@@ -266,7 +269,9 @@ def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_
         ('#size-cells', u32(2)),
     ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]) +
        ([node('sweet-touch', [ph(), ('firmware', touch_fw)])] if touch_fw else []) +
-       ([node('sweet-gpu', [ph(), ('gmu-firmware', gmu_fw)] + list(gpu_extra))] if gmu_fw else []))
+       ([node('sweet-gpu', [ph(), ('gmu-firmware', gmu_fw)] + list(gpu_extra))] if gmu_fw else []) +
+       ([node('sweet-files', [ph()] + [(f'file{i}', path.encode() + b'\0' + data)
+                                        for i, (path, data) in enumerate(files)])] if files else []))
 
 
 if __name__ == '__main__':
@@ -293,8 +298,20 @@ if __name__ == '__main__':
         gpu_extra.append(('zap-segment', zap_seg))
     if gpu_extra and not gmu_fw:
         sys.exit('--sqe-fw, --zap-mdt and --zap-seg need --gmu-fw')
+    files = []
+    for i, arg in enumerate(sys.argv):
+        if arg == '--file':
+            dest, _, local = sys.argv[i + 1].partition('=')
+            if not dest.startswith('/usr/local/') or '/../' in dest or not local:
+                sys.exit(f'--file {sys.argv[i + 1]}: give /usr/local/PATH=LOCAL_FILE')
+            files.append((dest, open(local, 'rb').read()))
+            print(f'file for the root: {dest} ({len(files[-1][1])} bytes)', file=sys.stderr)
+    if len(files) > 64:
+        sys.exit('--file: 64 at most')
+    if sum(len(d) for _, d in files) > 48 << 20:
+        sys.exit('--file: more than 48 MiB in all; the boot image would grow too much')
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, touch_fw=touch_fw, gmu_fw=gmu_fw,
-                 gpu_extra=gpu_extra, p3='--p3' in sys.argv)
+                 gpu_extra=gpu_extra, p3='--p3' in sys.argv, files=files)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

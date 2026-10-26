@@ -1,0 +1,121 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1098,6 +1098,12 @@
+ 
+ 	bsd_init_kprintf("bsd_do_post - done");
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* files the boot image carries (/sweet-files), onto the root before launchd (bsd/dev/sweet_files.c) */
++	extern void sweet_files_install(void);
++	sweet_files_install();
++#endif
++
+ 	load_init_program(p);
+ 	lock_trace = 1;
+ }
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_cpufreq.c		standard
+ bsd/dev/sweet_gpu.c			standard
++bsd/dev/sweet_files.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/sweet_files.c
+@@ -0,0 +1,93 @@
++/*
++ * sweet_files.c - files the boot image carries, written onto the root before launchd starts.
++ *
++ * tools/mkadt.py --file /usr/local/lib/NAME=LOCAL puts a file into the device tree as
++ * /sweet-files "fileN" = path, NUL, contents. bsdinit_task() calls sweet_files_install()
++ * right before it loads launchd: the root is mounted (read-write with boot-arg rootrw=1)
++ * and nothing has the files open yet. Each one is written whole (created, or truncated
++ * and written), mode 0755, owner root; the boot after keeps it, with or without it in
++ * the device tree. So a new build of the CoreAnimation bridge or of Mesa goes onto the
++ * phone with a new boot image, and the root and what iOS has written into it (its first
++ * boot, settings) stay as they are.
++ *
++ * Only paths under /usr/local/ are taken. Boot-arg sweetfiles=0: none are written.
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/uio.h>
++#include <sys/proc.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++void sweet_files_install(void);
++
++#define SWEET_FILES_PREFIX      "/usr/local/"
++
++static int
++sweet_file_write(const char *path, const uint8_t *data, size_t size)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int error;
++
++	error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, 0755, 0, &vp, ctx);
++	if (error != 0) {
++		return error;
++	}
++	/* in pieces: vn_rdwr takes an int length */
++	for (size_t done = 0; done < size && error == 0;) {
++		size_t chunk = size - done > (1u << 20) ? (1u << 20) : size - done;
++		int resid = 0;
++
++		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)(data + done), (int)chunk, (off_t)done,
++		    UIO_SYSSPACE, IO_NOAUTH | IO_SYNC, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (error == 0 && resid != 0) {
++			error = EIO;
++		}
++		done += chunk;
++	}
++	vnode_close(vp, FWRITE, ctx);
++	return error;
++}
++
++void
++sweet_files_install(void)
++{
++	uint32_t enabled = 1;
++	DTEntry node;
++
++	(void)PE_parse_boot_argn("sweetfiles", &enabled, sizeof(enabled));
++	if (!enabled || SecureDTLookupEntry(NULL, "/sweet-files", &node) != kSuccess) {
++		return;
++	}
++	for (unsigned i = 0; i < 64; i++) {
++		char name[16];
++		const void *prop = NULL;
++		unsigned int size = 0;
++
++		snprintf(name, sizeof(name), "file%u", i);
++		if (SecureDTGetProperty(node, name, &prop, &size) != kSuccess) {
++			break;
++		}
++		const char *path = prop;
++		size_t len = strnlen(path, size < 1024 ? size : 1024);
++		if (len == 0 || len >= size || len >= 1024 || strncmp(path, SWEET_FILES_PREFIX, strlen(SWEET_FILES_PREFIX)) != 0 ||
++		    strstr(path, "/../") != NULL) {
++			printf("SWEET FILES: %s: not a path under " SWEET_FILES_PREFIX "; not written\n", name);
++			continue;
++		}
++		const uint8_t *data = (const uint8_t *)prop + len + 1;
++		size_t bytes = size - len - 1;
++		int error = sweet_file_write(path, data, bytes);
++		printf("SWEET FILES: %s: %zu bytes %s (error %d)\n", path, bytes, error == 0 ? "written" : "NOT written", error);
++	}
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */

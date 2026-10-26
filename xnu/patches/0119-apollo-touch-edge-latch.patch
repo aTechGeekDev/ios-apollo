@@ -1,0 +1,72 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -193,6 +193,15 @@
+ 
+ #define TLMM_GPIO_CFG(n)     ((uint32_t)(n) * 0x1000u)
+ #define TLMM_GPIO_IN_OUT(n)  (TLMM_GPIO_CFG(n) + 4u)
++/*
++ * The GPIO's interrupt detector (Linux pinctrl-msm.c, sm8250 PINGROUP: intr_cfg 0x8,
++ * intr_status 0xc; enable bit 0, polarity 1, detection 2..3, raw status 4, target 5..7 =
++ * 3 for the application processor). With raw status on and enable off, an edge is
++ * latched in the status register and no interrupt is raised: the touch thread polls it.
++ */
++#define TLMM_GPIO_INTR_CFG(n)    (TLMM_GPIO_CFG(n) + 8u)
++#define TLMM_GPIO_INTR_STATUS(n) (TLMM_GPIO_CFG(n) + 0xcu)
++#define TLMM_INTR_RISING_LATCHED ((3u << 5) | (1u << 4) | (1u << 2) | (1u << 1))
+ 
+ static struct {
+ 	vm_offset_t se;
+@@ -894,21 +903,48 @@
+ 	}
+ 	st.dumped = false;
+ 
+-	printf("SWEET TOUCH: report loop, event buffer %#x\n", st.evbuf);
++	/*
++	 * The chip says "new report" with a short rising pulse on its IRQ line (DT 0x2001).
++	 * Looked at every 10 ms, the line was mostly seen low, so reports were read every
++	 * 60 ms: moves came late and a quick tap (down and up between two reads) was lost
++	 * (apollo boot 40: "sometimes touch doesn't register", input lag). Now the GPIO's
++	 * detector latches every pulse (TLMM_INTR_RISING_LATCHED) and the latch is looked
++	 * at every sweettouchpoll ms (default 4): a report is read for each pulse. Until
++	 * the first pulse is seen the report is read at every look; after that at least
++	 * every 12 looks as well (nothing is lost if the latch stops). Unchanged reports
++	 * make no events (touch_parse_report()).
++	 */
++	unsigned poll_ms = 4, looks = 0, edges = 0, reads = 0;
++	(void)PE_parse_boot_argn("sweettouchpoll", &poll_ms, sizeof(poll_ms));
++	if (poll_ms == 0 || poll_ms > 100)
++		poll_ms = 4;
++	uint32_t icfg = touch_rd(st.tlmm, TLMM_GPIO_INTR_CFG(st.irq));
++	touch_wr(st.tlmm, TLMM_GPIO_INTR_CFG(st.irq), (icfg & ~0xffu) | TLMM_INTR_RISING_LATCHED);
++	touch_wr(st.tlmm, TLMM_GPIO_INTR_STATUS(st.irq), 0);
++	printf("SWEET TOUCH: report loop, event buffer %#x; gpio%u edge latch %#x -> %#x, looked at every %u ms\n",
++	    st.evbuf, st.irq, icfg, touch_rd(st.tlmm, TLMM_GPIO_INTR_CFG(st.irq)), poll_ms);
+ 	for (;;) {
+-		/* IRQ is rising-edge (DT 0x2001): data ready while the line is high. */
+-		if (touch_gpio_get(st.irq) || idle >= 6) {
++		bool edge = (touch_rd(st.tlmm, TLMM_GPIO_INTR_STATUS(st.irq)) & 1u) != 0;
++		if (edge) {
++			/* cleared before the read: a pulse during the read is latched again */
++			touch_wr(st.tlmm, TLMM_GPIO_INTR_STATUS(st.irq), 0);
++			edges++;
++		}
++		if (edge || touch_gpio_get(st.irq) || edges == 0 || idle >= 12) {
+ 			if (nvt_read(st.evbuf, report, sizeof(report)) == 0) {
+ 				touch_parse_report(report, sizeof(report));
+ 				idle = 0;
++				reads++;
+ 			} else {
+ 				idle++;
+ 			}
+ 		} else {
+ 			idle++;
+ 		}
+-		/* 10 ms while healthy; back off to 1 s while transfers keep failing */
+-		touch_wait_ms(st.errors > 10 ? 1000 : 10);
++		if (++looks == 30000u / poll_ms)
++			printf("SWEET TOUCH: in the first 30 s of reports: %u edges latched, %u reads\n", edges, reads);
++		/* every poll_ms while healthy; back off to 1 s while transfers keep failing */
++		touch_wait_ms(st.errors > 10 ? 1000 : poll_ms);
+ 	}
+ stop:
+ 	printf("SWEET TOUCH: stopped after stage %u (sweettouchstage=N for more)\n", st.stage);
