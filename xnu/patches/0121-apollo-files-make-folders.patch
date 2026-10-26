@@ -1,0 +1,97 @@
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -9900,6 +9900,23 @@
+ 	           UIO_USERSPACE);
+ }
+ 
++/*
++ * A directory made by the kernel itself, PATH in kernel memory (bsd/dev/sweet_files.c: the
++ * folders of the files the boot image carries, before launchd starts). Mode as given, owner
++ * root; EEXIST if it is there already.
++ */
++int sweet_kernel_mkdir(const char *path, mode_t mode);
++
++int
++sweet_kernel_mkdir(const char *path, mode_t mode)
++{
++	struct vnode_attr va;
++
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, mode & ACCESSPERMS);
++	return mkdir1at(vfs_context_kernel(), CAST_USER_ADDR_T(path), &va, AT_FDCWD, UIO_SYSSPACE);
++}
++
+ static int
+ rmdirat_internal(vfs_context_t ctx, int fd, user_addr_t dirpath,
+     enum uio_seg segflg, int unlink_flags)
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -10,8 +10,10 @@
+  * phone with a new boot image, and the root and what iOS has written into it (its first
+  * boot, settings) stay as they are.
+  *
+- * Only paths under /usr/local/ (our libraries) and /Library/Wallpaper/ (the stock wallpapers'
+- * layers as PNG: tools/wallpaper-files.py) are taken. Boot-arg sweetfiles=0: none are written.
++ * Only paths under /usr/local/ (our libraries), /Library/Wallpaper/ (the stock wallpapers'
++ * layers as PNG: tools/wallpaper-files.py) and /private/var/preferences/FeatureFlags/ (feature
++ * flag overrides: tools/root-files/) are taken. Folders missing on the way are made (0755,
++ * owner root; vfs_syscalls.c sweet_kernel_mkdir). Boot-arg sweetfiles=0: none are written.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -28,8 +30,9 @@
+ #include <pexpert/device_tree.h>
+ 
+ void sweet_files_install(void);
++int sweet_kernel_mkdir(const char *path, mode_t mode);
+ 
+-static const char *const sweet_files_prefixes[] = { "/usr/local/", "/Library/Wallpaper/" };
++static const char *const sweet_files_prefixes[] = { "/usr/local/", "/Library/Wallpaper/", "/private/var/preferences/FeatureFlags/" };
+ 
+ /* (the kernel has no strstr: a ".." component, looked for by hand) */
+ static bool
+@@ -48,15 +51,42 @@
+ 	return false;
+ }
+ 
++/* The folders PATH's file goes in, those that are not there yet made. */
++static int
++sweet_file_folders(const char *path)
++{
++	char folder[1024];
++	size_t length = strlcpy(folder, path, sizeof(folder));
++
++	for (size_t i = 1; i < length && i < sizeof(folder); i++) {
++		if (folder[i] != '/') {
++			continue;
++		}
++		folder[i] = '\0';
++		int error = sweet_kernel_mkdir(folder, 0755);
++		if (error == 0) {
++			printf("SWEET FILES: %s: folder made\n", folder);
++		} else if (error != EEXIST) {
++			printf("SWEET FILES: %s: folder NOT made (error %d)\n", folder, error);
++			return error;
++		}
++		folder[i] = '/';
++	}
++	return 0;
++}
++
+ static int
+ sweet_file_write(const char *path, const uint8_t *data, size_t size)
+ {
+ 	vfs_context_t ctx = vfs_context_kernel();
+ 	vnode_t vp = NULLVP;
++	int mode = strncmp(path, "/usr/local/", 11) == 0 ? 0755 : 0644;
+ 	int error;
+ 
+-	error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, strncmp(path, "/usr/local/", 11) == 0 ? 0755 : 0644, 0,
+-	    &vp, ctx);
++	error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, mode, 0, &vp, ctx);
++	if (error == ENOENT && sweet_file_folders(path) == 0) {
++		error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, mode, 0, &vp, ctx);
++	}
+ 	if (error != 0) {
+ 		return error;
+ 	}

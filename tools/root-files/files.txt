@@ -1,0 +1,9 @@
+# Files for the phone's root that mkadt.py --files-from carries in the boot image (xnu 0120/0121
+# write them before launchd starts). Paths of the local side are from the repository's top.
+#
+# ExtensionKit feature flag enforce_xpc_cache_code_signing off (ios-sailfish's root tweak): the
+# extension point definitions (/System/Library/xpc/extensions.plist) are trusted only through a
+# detached signature checked against trust caches our kernel does not have, so every app
+# extension (wallpaper posters, widgets) is turned down: PosterBoard starts no poster extension
+# (empty "Add New Wallpaper", plain lock screen), widgets wait forever.
+/private/var/preferences/FeatureFlags/Domain/ExtensionKit.plist=tools/root-files/ExtensionKit.plist

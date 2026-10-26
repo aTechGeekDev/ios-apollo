@@ -3857,7 +3857,7 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 	for (GLsizei i = 0; i < count; i++) {
 		size += lengths != NULL && lengths[i] >= 0 ? (size_t)lengths[i] : strlen(strings[i]);
 	}
-	if ((text = calloc(1, 2 * size + 64 + TEXFN_ROOM)) == NULL) {
+	if ((text = calloc(1, 2 * size + 192 + TEXFN_ROOM)) == NULL) {
 		glShaderSource(shader, count, strings, lengths);
 		return;
 	}
@@ -3865,6 +3865,7 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 		strncat(text, strings[i], lengths != NULL && lengths[i] >= 0 ? (size_t)lengths[i] : strlen(strings[i]));
 	}
 	texfn_insert(text);                     /* (before gl_LastFragData is looked for below: sgl_vcm reads it) */
+	fetch = fragment && strstr(text, "gl_LastFragData") != NULL;
 	/* "#extension" lines must stay ahead of everything that is not the preprocessor's: they move to the top */
 	head = text + size + TEXFN_ROOM;
 	strcpy(head, parts[0]);
@@ -3876,10 +3877,14 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 		line[0] = line[1] = '/';
 		extensions++;
 	}
+	/* a shader that reads what is there only through one of our texture functions (sgl_vcm): CoreAnimation
+	 * did not ask for the extension (boot 42: "cannot be declared as both input and output") */
+	if (fetch && strstr(head, "GL_EXT_shader_framebuffer_fetch") == NULL) {
+		strcat(head, "#extension GL_EXT_shader_framebuffer_fetch : require\n");
+	}
 	parts[0] = head;
 	parts[3] = text;
 	if (fragment) {
-		fetch = strstr(text, "gl_LastFragData") != NULL;
 		parts[2] = fetch ? fragment_fetch : fragment_plain;
 		parts[4] = fetch ? fragment_fetch_end : fragment_plain_end;
 	}

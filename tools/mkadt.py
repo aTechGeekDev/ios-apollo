@@ -9,8 +9,8 @@ address comes from the sweet live FDT. Usage:
 --file /usr/local/PATH=LOCAL (as many as wanted) carries a file in /sweet-files; the kernel
 writes it onto the root before launchd starts (xnu 0120, bsd/dev/sweet_files.c): a new build
 of the CoreAnimation bridge or of Mesa without a new root image. --files-from LIST: the same
-for every "DEST=LOCAL" line of LIST (tools/wallpaper-files.py writes such lists). Only
-/usr/local/ and /Library/Wallpaper/ paths; 64 files and 48 MiB at most.
+for every "DEST=LOCAL" line of LIST (tools/wallpaper-files.py writes such lists;
+tools/root-files/files.txt: settings). Only FILE_PREFIXES paths; 64 files and 48 MiB at most.
 --touch-fw embeds the NT36675 touch firmware (Xiaomi's
 novatek_nt36675_j3s_fw01.bin, not in git) as /sweet-touch "firmware"; the
 apollo touch driver downloads it into the chip over SPI. --gmu-fw embeds the
@@ -68,6 +68,8 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 # an Apple artifact (kept out of git): extract it from the IPSW with
 #   tools/remotezip.py URL DeviceTree.d22ap.im4p DIR
 #   ipsw img4 im4p extract DIR/Firmware/all_flash/DeviceTree.d22ap.im4p -o d22ap.adt
+# the paths the kernel writes (xnu 0120/0121 bsd/dev/sweet_files.c sweet_files_prefixes)
+FILE_PREFIXES = ('/usr/local/', '/Library/Wallpaper/', '/private/var/preferences/FeatureFlags/')
 D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
 
 
@@ -310,9 +312,8 @@ if __name__ == '__main__':
                        for n, line in enumerate(open(sys.argv[i + 1]), 1) if line.strip() and not line.startswith('#')]
     for where, spec in wanted:
         dest, _, local = spec.partition('=')
-        # the kernel takes the same prefixes (sweet_file_allowed)
-        if not dest.startswith(('/usr/local/', '/Library/Wallpaper/')) or '/../' in dest + '/' or not local:
-            sys.exit(f'{where}: {spec}: give /usr/local/PATH=LOCAL_FILE or /Library/Wallpaper/PATH=LOCAL_FILE')
+        if not dest.startswith(FILE_PREFIXES) or '/../' in dest + '/' or not local:
+            sys.exit(f'{where}: {spec}: give DEST=LOCAL_FILE, DEST under ' + ', '.join(FILE_PREFIXES))
         files.append((dest, open(local, 'rb').read()))
         print(f'file for the root: {dest} ({len(files[-1][1])} bytes)', file=sys.stderr)
     if len(files) > 64:
