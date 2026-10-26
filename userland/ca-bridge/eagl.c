@@ -4224,13 +4224,276 @@ display_waits(void)
 
 /*
  * The entries of CoreAnimation's tex_fragment_shaders for the functions above, and its
- * create_shader's per-function uniform switch (a byte table, indexed by the function less 0x11)
- * set to look up the uniform names they use: 0 color_matrix, 0x95 minmax_dir and the others of
- * the blur, 0xde none. Addresses as the cache was built (ios-sailfish's); nothing is written
- * unless the table holds what is expected (colorMatrix4x4Bias at 0x13, empty entries for ours).
+ * create_shader's per-function uniform switch (a byte jump table, indexed by the function less
+ * 0x11) set to look up the uniform names they use (ios-sailfish's fix: there the case that looks
+ * up color_matrix is 0, the one for minmax_dir and the rest of the blur 0x95, none 0xde).
+ * ios-sailfish wrote them at fixed addresses of the iPhone 8's cache; the iPhone X's cache lays
+ * QuartzCore out elsewhere (boot 41: "not the QuartzCore they were written for"), so both are
+ * looked for in QuartzCore as it is loaded:
+ *   the table: the pointer to "colorMatrix4x4Bias(s0)" in QuartzCore's data is its entry 0x13;
+ *   the switch: a "br" fed by a byte jump table (adrp/add or adr of the table, ldrb, adr of
+ *   the first case, add ... lsl #2) whose index is the function less its lowest case (sub;
+ *   0x11 in ios-sailfish's), and whose cases are told apart by the uniform names they load
+ *   (adrp/add or adr of "color_matrix", "minmax_dir"); function 0x13's must be color_matrix's.
+ * Checked against clang 18 / lld output of such a switch (both the adrp/add and adr forms).
+ * Nothing is written unless all of that is found and the entries for ours are empty (no
+ * expression, the switch's default case).
  */
-#define CA_TEX_SHADERS          0x1d5b44a10UL
-#define CA_UNIFORM_CASES        0x18855a1e4UL
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
+#include <mach-o/loader.h>
+
+struct qc_image {
+	const struct mach_header_64 *header;
+	intptr_t slide;
+	const char *strings;            /* the __TEXT segment, where its strings are */
+	unsigned long strings_size;
+	const uint32_t *code;           /* __TEXT,__text */
+	unsigned long code_size;
+	uintptr_t text_start, text_end; /* the __TEXT segment */
+};
+
+static bool
+qc_find(struct qc_image *qc)
+{
+	static const char suffix[] = "/QuartzCore.framework/QuartzCore";
+
+	memset(qc, 0, sizeof(*qc));
+	for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+		const char *name = _dyld_get_image_name(i);
+		size_t length = name != NULL ? strlen(name) : 0;
+
+		if (length >= sizeof(suffix) - 1 && strcmp(name + length - (sizeof(suffix) - 1), suffix) == 0) {
+			qc->header = (const struct mach_header_64 *)_dyld_get_image_header(i);
+			qc->slide = _dyld_get_image_vmaddr_slide(i);
+			break;
+		}
+	}
+	if (qc->header == NULL) {
+		return false;
+	}
+	qc->code = (const uint32_t *)(const void *)getsectiondata(qc->header, "__TEXT", "__text", &qc->code_size);
+	qc->strings = (const char *)getsegmentdata(qc->header, "__TEXT", &qc->strings_size);
+	qc->text_start = (uintptr_t)qc->strings;
+	qc->text_end = (uintptr_t)qc->strings + qc->strings_size;
+	return qc->strings != NULL && qc->code != NULL;
+}
+
+/* Where NAME (a whole string) is in QuartzCore's strings, from AFTER on (NULL: nowhere). */
+static const char *
+qc_string(const struct qc_image *qc, const char *name, const char *after)
+{
+	size_t length = strlen(name) + 1;
+	const char *at = after != NULL ? after + 1 : qc->strings;
+	const char *end = qc->strings + qc->strings_size;
+
+	while (at < end) {
+		const char *hit = memmem(at, (size_t)(end - at), name, length);
+
+		if (hit == NULL) {
+			return NULL;
+		}
+		if (hit == qc->strings || hit[-1] == '\0') {
+			return hit;
+		}
+		at = hit + 1;
+	}
+	return NULL;
+}
+
+static bool
+qc_is_string(const struct qc_image *qc, uintptr_t address, const char *name)
+{
+	size_t length = strlen(name) + 1;
+
+	return address > qc->text_start && address + length <= qc->text_end && memcmp((const char *)address, name, length) == 0 &&
+	       ((const char *)address)[-1] == '\0';
+}
+
+/* tex_fragment_shaders: the pointer to "colorMatrix4x4Bias(s0)" in QuartzCore's data is entry 0x13. */
+static const char **
+qc_texture_table(const struct qc_image *qc)
+{
+	const struct load_command *command = (const struct load_command *)(qc->header + 1);
+
+	for (const char *expression = qc_string(qc, "colorMatrix4x4Bias(s0)", NULL); expression != NULL;
+	    expression = qc_string(qc, "colorMatrix4x4Bias(s0)", expression)) {
+		command = (const struct load_command *)(qc->header + 1);
+		for (uint32_t c = 0; c < qc->header->ncmds; c++, command = (const void *)((const uint8_t *)command + command->cmdsize)) {
+			const struct segment_command_64 *segment = (const void *)command;
+
+			if (command->cmd != LC_SEGMENT_64 || strncmp(segment->segname, "__TEXT", 16) == 0 ||
+			    strncmp(segment->segname, "__LINKEDIT", 16) == 0 || !(segment->initprot & VM_PROT_READ)) {
+				continue;
+			}
+			const uintptr_t *word = (const uintptr_t *)(segment->vmaddr + (uintptr_t)qc->slide);
+			size_t words = segment->vmsize / sizeof(uintptr_t);
+
+			for (size_t w = 0x13; w + (0x2d - 0x13) < words; w++) {
+				if (word[w] != (uintptr_t)expression) {
+					continue;
+				}
+				/* the entries around it: none, or QuartzCore's strings */
+				const char **table = (const char **)&word[w - 0x13];
+				bool strings = true;
+
+				for (unsigned e = 0; e <= 0x2d && strings; e++) {
+					strings = table[e] == NULL || ((uintptr_t)table[e] >= qc->text_start && (uintptr_t)table[e] < qc->text_end);
+				}
+				if (strings) {
+					return table;
+				}
+			}
+		}
+	}
+	return NULL;
+}
+
+static int64_t
+arm64_imm21(uint32_t insn)
+{
+	int64_t imm = (int64_t)(((insn >> 29) & 3u) | (((insn >> 5) & 0x7ffffu) << 2));
+
+	return imm >= (1 << 20) ? imm - (1 << 21) : imm;
+}
+
+/* The first of NAMES that the code at AT (up to 32 instructions) puts the address of into a register. */
+static int
+qc_names_loaded(const struct qc_image *qc, const uint32_t *at, const char *const *names, int count)
+{
+	uintptr_t value[32] = { 0 };
+	bool known[32] = { false };
+	const uint32_t *end = qc->code + qc->code_size / 4;
+
+	for (unsigned i = 0; i < 32 && at + i < end; i++) {
+		uint32_t insn = at[i];
+		unsigned rd = insn & 31u, rn = (insn >> 5) & 31u;
+		uintptr_t pc = (uintptr_t)(at + i);
+		bool wrote = false;
+
+		if ((insn & 0x9f000000u) == 0x90000000u) {             /* adrp */
+			value[rd] = (pc & ~(uintptr_t)0xfff) + (uintptr_t)(arm64_imm21(insn) * 4096);
+			known[rd] = wrote = true;
+		} else if ((insn & 0x9f000000u) == 0x10000000u) {      /* adr */
+			value[rd] = pc + (uintptr_t)arm64_imm21(insn);
+			known[rd] = wrote = true;
+		} else if ((insn & 0xff000000u) == 0x91000000u && known[rn]) {  /* add xd, xn, #imm */
+			value[rd] = value[rn] + (((insn >> 10) & 0xfffu) << ((insn >> 22) & 1u ? 12 : 0));
+			known[rd] = wrote = true;
+		} else if (rd != 31) {
+			known[rd] = false;
+		}
+		if (wrote) {
+			for (int n = 0; n < count; n++) {
+				if (qc_is_string(qc, value[rd], names[n])) {
+					return n;
+				}
+			}
+		}
+		if ((insn & 0xfc000000u) == 0x14000000u || (insn & 0xfffffc1fu) == 0xd65f0000u) {
+			break;                                          /* b, ret: the case is over */
+		}
+	}
+	return -1;
+}
+
+/* create_shader's uniform switch: CASES (indexed by the function) and the case values for color_matrix, minmax_dir and none. */
+static bool
+qc_uniform_switch(const struct qc_image *qc, uint8_t **cases, uint8_t *matrix, uint8_t *blur, uint8_t *none)
+{
+	static const char *const names[] = { "color_matrix", "minmax_dir" };
+	const uint32_t *code = qc->code;
+	size_t count = qc->code_size / 4;
+	unsigned candidates = 0;
+
+	for (size_t i = 1; i < count; i++) {
+		if ((code[i] & 0xfffffc1fu) != 0xd61f0000u) {          /* br xT */
+			continue;
+		}
+		unsigned target = (code[i] >> 5) & 31u, base_reg = 32, entry_reg = 32, table_reg = 32, index_reg = 32;
+		unsigned bias = 0, last = 0;
+		uintptr_t base = 0, table = 0;
+		size_t at_ldrb = 0;
+
+		/* back from the br: add xT, xB, xE, lsl #2 (or uxtw #2); ldrb wE, [xJ, xI]; adr xB; the table into xJ;
+		 * cmp wI, #last; sub wI, wF, #bias */
+		for (size_t k = i; k-- > 0 && k + 32 > i;) {
+			uint32_t w = code[k];
+			uintptr_t pc = (uintptr_t)&code[k];
+			unsigned rd = w & 31u, rn = (w >> 5) & 31u, rm = (w >> 16) & 31u;
+
+			if (base_reg == 32) {
+				if (((w & 0xffe0fc00u) == 0x8b000800u || (w & 0xffe01c00u) == 0x8b200800u) && rd == target) {
+					base_reg = rn;
+					entry_reg = rm;
+				}
+			} else if (at_ldrb == 0) {
+				if ((w & 0xffe00c00u) == 0x38600800u && rd == entry_reg) {
+					table_reg = rn;
+					index_reg = rm;
+					at_ldrb = k;
+				} else if ((w & 0x9f000000u) == 0x10000000u && rd == base_reg && base == 0) {
+					base = pc + (uintptr_t)arm64_imm21(w);
+				}
+			} else if ((w & 0x9f000000u) == 0x10000000u && rd == base_reg && base == 0) {
+				base = pc + (uintptr_t)arm64_imm21(w);
+			} else if ((w & 0x9f000000u) == 0x10000000u && rd == table_reg && table == 0) {
+				table = pc + (uintptr_t)arm64_imm21(w);
+			} else if ((w & 0xff000000u) == 0x91000000u && rd == table_reg && rn == table_reg && table == 0) {
+				for (size_t a = k; a-- > 0 && a + 8 > k;) {   /* add xJ, xJ, #lo after adrp xJ */
+					if ((code[a] & 0x9f000000u) == 0x90000000u && (code[a] & 31u) == table_reg) {
+						table = ((uintptr_t)&code[a] & ~(uintptr_t)0xfff) + (uintptr_t)(arm64_imm21(code[a]) * 4096) +
+						    (((w >> 10) & 0xfffu) << ((w >> 22) & 1u ? 12 : 0));
+						break;
+					}
+				}
+			} else if ((w & 0x7fc0001fu) == 0x7100001fu && rn == index_reg && last == 0) {
+				last = (w >> 10) & 0xfffu;              /* cmp wI, #last */
+			} else if ((w & 0x7fc00000u) == 0x51000000u && rd == index_reg && bias == 0) {
+				bias = (w >> 10) & 0xfffu;              /* sub wI, wF, #bias */
+			}
+		}
+		if (last == 0) {
+			last = 0x2d - bias;                     /* no cmp seen: as many as ours need */
+		}
+		if (at_ldrb == 0 || base == 0 || bias == 0 || bias > 0x13 || last < 0x2d - bias || table < qc->text_start ||
+		    table + last >= qc->text_end) {
+			continue;
+		}
+		/* the cases: which one first loads which uniform name; the default is the commonest */
+		const uint8_t *bytes = (const uint8_t *)table;
+		int case_of[2] = { -1, -1 };
+		unsigned seen[256] = { 0 }, common = 0;
+
+		for (unsigned k = 0; k <= last; k++) {
+			seen[bytes[k]]++;
+		}
+		for (unsigned v = 0; v < 256; v++) {
+			if (seen[v] > seen[common]) {
+				common = v;
+			}
+			int n = seen[v] != 0 ? qc_names_loaded(qc, (const uint32_t *)(base + 4u * v), names, 2) : -1;
+
+			if (n >= 0 && case_of[n] < 0) {
+				case_of[n] = (int)v;
+			}
+		}
+		candidates++;
+		say("sweet-gl: texture functions: a switch on the function less %#x (%u cases) at %#lx: color_matrix case %d, "
+		    "minmax_dir case %d, default %#x, function 0x13 %#x\n", bias, last + 1,
+		    (unsigned long)(table - (uintptr_t)qc->slide), case_of[0], case_of[1], common, bytes[0x13 - bias]);
+		if (case_of[0] < 0 || case_of[1] < 0 || bytes[0x13 - bias] != case_of[0]) {
+			continue;
+		}
+		*cases = (uint8_t *)(table - bias);
+		*matrix = (uint8_t)case_of[0];
+		*blur = (uint8_t)case_of[1];
+		*none = (uint8_t)common;
+		return true;
+	}
+	say("sweet-gl: texture functions: no uniform switch found (%u candidates)\n", candidates);
+	return false;
+}
 
 static bool
 write_constant(void *at, const void *value, size_t length, vm_prot_t back)
@@ -4249,40 +4512,47 @@ write_constant(void *at, const void *value, size_t length, vm_prot_t back)
 static void
 install_texture_functions(void)
 {
+	enum { MATRIX, BLUR, NONE };
 	static const struct {
 		uint8_t function;
 		const char *expression;
-		uint8_t uniforms;
-	} ours[] = { { 0x2d, "sgl_vcm(s0)", 0 }, { 0x14, "sgl_cm4(s0)", 0 }, { 0x26, "sgl_nop()", 0xde },
-		     { 0x27, "sgl_vblur(s1)", 0x95 } };
-	size_t length = 0;
-	const uint8_t *cache = _dyld_get_shared_cache_range(&length);
-	uintptr_t slide;
+		int uniforms;
+	} ours[] = { { 0x2d, "sgl_vcm(s0)", MATRIX }, { 0x14, "sgl_cm4(s0)", MATRIX }, { 0x26, "sgl_nop()", NONE },
+		     { 0x27, "sgl_vblur(s1)", BLUR } };
+	struct qc_image qc;
 	const char **table;
-	uint8_t *cases;
+	uint8_t *cases = NULL, values[3];
 
-	if (!texfns_on || cache == NULL) {
+	if (!texfns_on) {
 		return;
 	}
-	slide = (uintptr_t)cache - CACHE_BASE;
-	table = (const char **)(CA_TEX_SHADERS + slide);
-	cases = (uint8_t *)(CA_UNIFORM_CASES - 0x11 + slide);
-	if (table[0x13] == NULL || strcmp(table[0x13], "colorMatrix4x4Bias(s0)") != 0 || cases[0x13] != 0) {
-		say("sweet-gl: texture functions: not the QuartzCore they were written for; left alone\n");
+	if (!qc_find(&qc)) {
+		say("sweet-gl: texture functions: QuartzCore not found; left alone\n");
+		return;
+	}
+	table = qc_texture_table(&qc);
+	if (table == NULL) {
+		say("sweet-gl: texture functions: no tex_fragment_shaders (\"colorMatrix4x4Bias(s0)\" at 0x13) in QuartzCore; left alone\n");
+		return;
+	}
+	say("sweet-gl: texture functions: tex_fragment_shaders at %#lx\n", (unsigned long)((uintptr_t)table - (uintptr_t)qc.slide));
+	if (!qc_uniform_switch(&qc, &cases, &values[MATRIX], &values[BLUR], &values[NONE])) {
+		say("sweet-gl: texture functions: left alone\n");
 		return;
 	}
 	for (size_t i = 0; i < sizeof(ours) / sizeof(ours[0]); i++) {
-		uint8_t function = ours[i].function, uniforms = ours[i].uniforms;
+		uint8_t function = ours[i].function, uniforms = values[ours[i].uniforms];
 		bool good;
 
-		if (table[function] != NULL || cases[function] != 0xde) {
+		if (table[function] != NULL || cases[function] != values[NONE]) {
 			say("sweet-gl: texture function %#x: not as expected (%p, %#x); left alone\n", function,
 			    (const void *)table[function], cases[function]);
 			continue;
 		}
 		good = write_constant(&table[function], &ours[i].expression, sizeof(char *), VM_PROT_READ) &&
-		    (uniforms == 0xde || write_constant(&cases[function], &uniforms, 1, VM_PROT_READ | VM_PROT_EXECUTE));
-		say("sweet-gl: texture function %#x = %s: %s\n", function, ours[i].expression, good ? "ours" : "COULD NOT BE WRITTEN");
+		    (uniforms == values[NONE] || write_constant(&cases[function], &uniforms, 1, VM_PROT_READ | VM_PROT_EXECUTE));
+		say("sweet-gl: texture function %#x = %s (uniform case %#x): %s\n", function, ours[i].expression, uniforms,
+		    good ? "ours" : "COULD NOT BE WRITTEN");
 	}
 }
 
