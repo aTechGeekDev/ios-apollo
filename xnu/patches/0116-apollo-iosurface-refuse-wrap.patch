@@ -1,0 +1,28 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -12,6 +12,7 @@
+  *   sel 4   lookup by id: scalar [id], struct out = lock result
+  *   sel 34  lookup by mach port: scalar [port name], struct out = lock result
+  *   sel 35  create mach port: scalars [id, options], scalar out [port name]
++ *   sel 6/7 wrap client image / client memory: refused (kIOReturnUnsupported)
+  *   traps   0/1 use count +/- (id, category), 2 lock / 3 unlock
+  *           (id, options, &seed), 4/5 release (id)
+  *
+@@ -772,6 +773,17 @@
+ 		sweet_surf_log_once("sel", selector);
+ 		return kIOReturnSuccess;
+ 	}
++	case 6:         /* wrap a client's image (CoreAnimation's GPU renderer: its bitmaps, no copy) */
++	case 7:         /* wrap a client's memory */
++		/*
++		 * Refused: the framework then answers NULL and CoreAnimation uploads the
++		 * image instead. Accepted like the others below, the caller got a surface
++		 * of zeros with no memory, and backboardd died reading through it (apollo
++		 * boots 35-37, far 0x30, as soon as the CoreAnimation bridge drew; the
++		 * same as ios-sailfish's 0152).
++		 */
++		sweet_surf_log_once("sel", selector);
++		return kIOReturnUnsupported;
+ 	default:
+ 		/* Values, notifications, ownership, timestamps...: accept and ignore. */
+ 		for (uint32_t i = 0; i < args->scalarOutputCount; i++) {
