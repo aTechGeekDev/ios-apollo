@@ -1,0 +1,16 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -201,6 +201,13 @@
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
++	/*
++	 * present() puts no surface on the panel while the GPU is still drawing into it
++	 * (sweet_gpu_surface_ready(), 0114). Said here, the CoreAnimation bridge leaves the
++	 * waiting to us and backboardd goes on to its next frame instead of glFinish()ing
++	 * every one (libsweet-gl display_waits(); boot-arg glwait=1 makes it wait anyway).
++	 */
++	setProperty("SweetWaitsForGPU", true);
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);

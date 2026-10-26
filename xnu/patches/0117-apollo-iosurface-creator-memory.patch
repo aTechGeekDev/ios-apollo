@@ -1,0 +1,112 @@
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -39,6 +39,8 @@
+ 	IOOptionBits              mapCache;     /* cache mode for user mappings */
+ 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
+ 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
++	bool                      clientMemory; /* the creator's own pages (IOSurfaceAddress), prepared */
++	bool                      readOnly;     /* ...prepared for reading only: mapped read-only */
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -13,6 +13,10 @@
+  *   sel 34  lookup by mach port: scalar [port name], struct out = lock result
+  *   sel 35  create mach port: scalars [id, options], scalar out [port name]
+  *   sel 6/7 wrap client image / client memory: refused (kIOReturnUnsupported)
++ *   IOSurfaceAddress in the create properties: the surface is the creator's
++ *           own memory (CoreAnimation makes surfaces around its image bitmaps
++ *           this way), wired while the surface lives; base = page-aligned
++ *           mapping + offset
+  *   traps   0/1 use count +/- (id, category), 2 lock / 3 unlock
+  *           (id, options, &seed), 4/5 release (id)
+  *
+@@ -85,6 +89,9 @@
+ 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+ 	}
+ 	OSSafeReleaseNULL(kernelMap);
++	if (clientMemory && memory != NULL) {
++		memory->complete();
++	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
+ 	OSObject::free();
+@@ -99,7 +106,8 @@
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(kIOMapWriteCombineCache);
++		/* the surface's own mode: write-combining for the panel, cached for a creator's pages */
++		kernelMap = memory->map(mapCache | (readOnly ? kIOMapReadOnly : 0));
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+@@ -528,7 +536,8 @@
+ 	s->retain();
+ 	ref->surface = s;
+ 	ref->count = 1;
+-	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
++	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache |
++	    (s->readOnly ? kIOMapReadOnly : 0));
+ 	ref->state = s->state->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
+ 	if (ref->data == NULL || ref->state == NULL) {
+ 		ref->release();
+@@ -685,7 +694,44 @@
+ 	}
+ 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+ 	ret = sweet_surface_layout(s, props);
+-	if (ret == kIOReturnSuccess) {
++	OSNumber *address = OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress"));
++	if (ret == kIOReturnSuccess && address != NULL) {
++		/*
++		 * The creator's own memory (CoreAnimation's image bitmaps: home screen
++		 * icons, symbols, colour tables): whole pages from the one holding the
++		 * address. Given new zeroed memory instead, every such picture was
++		 * empty (apollo boot 39: no icons, no back chevron). As ios-sailfish's
++		 * 0157/0158: often the pages are read-only (decoded or file-backed),
++		 * and then they are wired for reading and mapped read-only.
++		 */
++		uint64_t addr = address->unsigned64BitValue(), start = trunc_page_64(addr);
++		uint64_t len = round_page_64((addr - start) + (uint64_t)s->bytesPerRow *
++		    sweet_div_up(s->height, s->elementHeight));
++		IOReturn rw = kIOReturnBadArgument, ro = kIOReturnBadArgument;
++		IOMemoryDescriptor *md = s->planeCount == 0 && addr != 0 && len <= SWEET_SURFACE_MAX_ALLOC ?
++		    IOMemoryDescriptor::withAddressRange(start, len, kIODirectionInOut, fTask) : NULL;
++		if (md != NULL && (rw = md->prepare()) != kIOReturnSuccess) {
++			OSSafeReleaseNULL(md);
++			md = IOMemoryDescriptor::withAddressRange(start, len, kIODirectionOut, fTask);
++			if (md != NULL && (ro = md->prepare()) != kIOReturnSuccess) {
++				OSSafeReleaseNULL(md);
++			}
++			s->readOnly = md != NULL;
++		}
++		if (md == NULL) {
++			IOLog("SWEET SURF: creator memory 0x%llx+0x%llx: prepare %#x, read-only %#x\n", addr, len, rw, ro);
++			ret = kIOReturnVMError;
++		} else {
++			s->memory = md;
++			s->clientMemory = true;
++			s->mapCache = kIOMapDefaultCache;
++			s->offset = (uint32_t)(addr - start);
++			s->allocSize = (uint32_t)len;
++			if (!sweet_surface_publish(s)) {
++				ret = kIOReturnNoResources;
++			}
++		}
++	} else if (ret == kIOReturnSuccess) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -516,7 +516,8 @@
+ 		} else {
+ 			b->surface = s;
+ 			/* pushed out of the cache only where the kernel's and the programs' mappings are cached */
+-			b->kernel = OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL ? (void *)s->kernelAddress() : NULL;
++			b->kernel = OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL || s->clientMemory ?
++			    (void *)s->kernelAddress() : NULL;
+ 		}
+ 	}
+ 	IOLockUnlock(gGPULock);
