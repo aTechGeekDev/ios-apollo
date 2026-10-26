@@ -52,10 +52,17 @@ if [ -d "$here/sweet-userland/lib" ]; then
 			rm -f "$mnt/usr/local/lib/$name"
 			install -m 0755 "$padded" "$mnt/usr/local/lib/$name"
 			mkdir -p "$here/research/ios-root/push"
-			python3 "$here/tools/sweet-extents.py" "$mnt/usr/local/lib/$name" "$here/research/ios-root/push/$name.extents"
-			sha256sum < "$padded" | cut -d' ' -f1 > "$here/research/ios-root/push/$name.onphone"
+			rm -f "$here/research/ios-root/push/$name.extents" "$here/research/ios-root/push/$name.onphone"
+			if python3 "$here/tools/sweet-extents.py" "$mnt/usr/local/lib/$name" "$here/research/ios-root/push/$name.extents"; then
+				sha256sum < "$padded" | cut -d' ' -f1 > "$here/research/ios-root/push/$name.onphone"
+				printf 'added /usr/local/lib/%s (%s bytes, padded to 64 MiB: tools/sweet-push.sh can replace it)\n' "$name" "$size"
+			else
+				# the root is fine without the map; only sweet-push.sh cannot replace this library
+				rm -f "$here/research/ios-root/push/$name.extents"
+				printf 'added /usr/local/lib/%s (%s bytes, padded) -- WARNING: its block map failed, sweet-push.sh cannot replace it\n' \
+				    "$name" "$size"
+			fi
 			chown -R "${SUDO_UID:-0}:${SUDO_GID:-0}" "$here/research/ios-root/push"   # sweet-push.sh runs as the user
-			printf 'added /usr/local/lib/%s (%s bytes, padded to 64 MiB: tools/sweet-push.sh can replace it)\n' "$name" "$size"
 			;;
 		*)
 			install -m 0755 "$lib" "$mnt/usr/local/lib/$name"
