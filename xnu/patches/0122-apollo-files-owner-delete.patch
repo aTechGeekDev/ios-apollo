@@ -1,0 +1,194 @@
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -1,19 +1,20 @@
+ /*
+  * sweet_files.c - files the boot image carries, written onto the root before launchd starts.
+  *
+- * tools/mkadt.py --file /usr/local/lib/NAME=LOCAL puts a file into the device tree as
+- * /sweet-files "fileN" = path, NUL, contents. bsdinit_task() calls sweet_files_install()
+- * right before it loads launchd: the root is mounted (read-write with boot-arg rootrw=1)
+- * and nothing has the files open yet. Each one is written whole (created, or truncated
+- * and written), mode 0755 (0644 outside /usr/local/), owner root; the boot after keeps it, with or without it in
+- * the device tree. So a new build of the CoreAnimation bridge or of Mesa goes onto the
+- * phone with a new boot image, and the root and what iOS has written into it (its first
+- * boot, settings) stay as they are.
++ * tools/mkadt.py --file DEST=LOCAL / --files-from LIST put them into the device tree node
++ * /sweet-files: "fileN" = path, NUL, contents; "ownerN" (if there) = uid, gid, mode (three
++ * 32-bit words) for fileN; "deleteN" = a path to remove. bsdinit_task() calls
++ * sweet_files_install() right before it loads launchd: the root is mounted (read-write with
++ * boot-arg rootrw=1) and nothing has the files open yet. The removals go first; then each
++ * file is written whole (created, or truncated and written), owner and mode as ownerN says,
++ * else root and 0755 under /usr/local/, 0644 elsewhere; folders missing on the way are made
++ * with the file's owner, mode 0755 (vfs_syscalls.c sweet_kernel_mkdir). The boot after keeps
++ * it all, with or without it in the device tree. So a new build of the CoreAnimation bridge,
++ * Mesa, a setting or a wallpaper goes onto the phone with a new boot image, and the root and
++ * what iOS has written into it (its first boot, settings) stay as they are.
+  *
+- * Only paths under /usr/local/ (our libraries), /Library/Wallpaper/ (the stock wallpapers'
+- * layers as PNG: tools/wallpaper-files.py) and /private/var/preferences/FeatureFlags/ (feature
+- * flag overrides: tools/root-files/) are taken. Folders missing on the way are made (0755,
+- * owner root; vfs_syscalls.c sweet_kernel_mkdir). Boot-arg sweetfiles=0: none are written.
++ * Any absolute path without a ".." component is taken (mkadt.py keeps the list of where
++ * files may go). Boot-arg sweetfiles=0: nothing is written or removed.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -23,6 +24,7 @@
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <sys/fcntl.h>
++#include <sys/stat.h>
+ #include <sys/vnode.h>
+ #include <sys/uio.h>
+ #include <sys/proc.h>
+@@ -31,29 +33,55 @@
+ 
+ void sweet_files_install(void);
+ int sweet_kernel_mkdir(const char *path, mode_t mode);
++int unlink1(vfs_context_t ctx, vnode_t start_dvp, user_addr_t path_arg, enum uio_seg segflg, int unlink_flags);
+ 
+-static const char *const sweet_files_prefixes[] = { "/usr/local/", "/Library/Wallpaper/", "/private/var/preferences/FeatureFlags/" };
++struct sweet_owner {
++	uint32_t uid, gid, mode;
++};
+ 
+-/* (the kernel has no strstr: a ".." component, looked for by hand) */
++/* An absolute path with no ".." component (the kernel has no strstr: looked for by hand). */
+ static bool
+ sweet_file_allowed(const char *path)
+ {
++	if (path[0] != '/') {
++		return false;
++	}
+ 	for (const char *p = path; *p != '\0'; p++) {
+ 		if (p[0] == '/' && p[1] == '.' && p[2] == '.' && (p[3] == '/' || p[3] == '\0')) {
+ 			return false;
+ 		}
+ 	}
+-	for (size_t i = 0; i < sizeof(sweet_files_prefixes) / sizeof(sweet_files_prefixes[0]); i++) {
+-		if (strncmp(path, sweet_files_prefixes[i], strlen(sweet_files_prefixes[i])) == 0) {
+-			return true;
++	return true;
++}
++
++static int
++sweet_file_own(const char *path, vnode_t vp, const struct sweet_owner *owner)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	struct vnode_attr va;
++	bool looked_up = false;
++	int error;
++
++	if (vp == NULLVP) {
++		if ((error = vnode_lookup(path, 0, &vp, ctx)) != 0) {
++			return error;
+ 		}
++		looked_up = true;
++	}
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_uid, owner->uid);
++	VATTR_SET(&va, va_gid, owner->gid);
++	VATTR_SET(&va, va_mode, owner->mode & ALLPERMS);
++	error = vnode_setattr(vp, &va, ctx);
++	if (looked_up) {
++		vnode_put(vp);
+ 	}
+-	return false;
++	return error;
+ }
+ 
+-/* The folders PATH's file goes in, those that are not there yet made. */
++/* The folders PATH's file goes in, those that are not there yet made (OWNER's, 0755). */
+ static int
+-sweet_file_folders(const char *path)
++sweet_file_folders(const char *path, const struct sweet_owner *owner)
+ {
+ 	char folder[1024];
+ 	size_t length = strlcpy(folder, path, sizeof(folder));
+@@ -65,7 +93,10 @@
+ 		folder[i] = '\0';
+ 		int error = sweet_kernel_mkdir(folder, 0755);
+ 		if (error == 0) {
+-			printf("SWEET FILES: %s: folder made\n", folder);
++			struct sweet_owner as = { owner->uid, owner->gid, 0755 };
++			int owned = sweet_file_own(folder, NULLVP, &as);
++
++			printf("SWEET FILES: %s: folder made (owner %u:%u, error %d)\n", folder, as.uid, as.gid, owned);
+ 		} else if (error != EEXIST) {
+ 			printf("SWEET FILES: %s: folder NOT made (error %d)\n", folder, error);
+ 			return error;
+@@ -76,15 +107,15 @@
+ }
+ 
+ static int
+-sweet_file_write(const char *path, const uint8_t *data, size_t size)
++sweet_file_write(const char *path, const uint8_t *data, size_t size, const struct sweet_owner *owner)
+ {
+ 	vfs_context_t ctx = vfs_context_kernel();
+ 	vnode_t vp = NULLVP;
+-	int mode = strncmp(path, "/usr/local/", 11) == 0 ? 0755 : 0644;
++	int mode = (int)(owner->mode & ALLPERMS);
+ 	int error;
+ 
+ 	error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, mode, 0, &vp, ctx);
+-	if (error == ENOENT && sweet_file_folders(path) == 0) {
++	if (error == ENOENT && sweet_file_folders(path, owner) == 0) {
+ 		error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, mode, 0, &vp, ctx);
+ 	}
+ 	if (error != 0) {
+@@ -102,6 +133,10 @@
+ 		}
+ 		done += chunk;
+ 	}
++	/* (an existing file keeps its owner and mode through O_TRUNC: set them) */
++	if (error == 0) {
++		error = sweet_file_own(path, vp, owner);
++	}
+ 	vnode_close(vp, FWRITE, ctx);
+ 	return error;
+ }
+@@ -121,6 +156,25 @@
+ 		const void *prop = NULL;
+ 		unsigned int size = 0;
+ 
++		snprintf(name, sizeof(name), "delete%u", i);
++		if (SecureDTGetProperty(node, name, &prop, &size) != kSuccess) {
++			break;
++		}
++		const char *path = prop;
++		size_t len = strnlen(path, size < 1024 ? size : 1024);
++		if (len == 0 || len >= size || len >= 1024 || !sweet_file_allowed(path)) {
++			printf("SWEET FILES: %s: not a path that may be removed; left\n", name);
++			continue;
++		}
++		int error = unlink1(vfs_context_kernel(), NULLVP, (user_addr_t)(uintptr_t)path, UIO_SYSSPACE, 0);
++		printf("SWEET FILES: %s: %s (error %d)\n", path, error == 0 ? "removed" : error == ENOENT ? "not there" : "NOT removed",
++		    error);
++	}
++	for (unsigned i = 0; i < 64; i++) {
++		char name[16];
++		const void *prop = NULL, *own = NULL;
++		unsigned int size = 0, own_size = 0;
++
+ 		snprintf(name, sizeof(name), "file%u", i);
+ 		if (SecureDTGetProperty(node, name, &prop, &size) != kSuccess) {
+ 			break;
+@@ -131,10 +185,16 @@
+ 			printf("SWEET FILES: %s: not a path that may be written; not written\n", name);
+ 			continue;
+ 		}
++		struct sweet_owner owner = { 0, 0, strncmp(path, "/usr/local/", 11) == 0 ? 0755 : 0644 };
++		snprintf(name, sizeof(name), "owner%u", i);
++		if (SecureDTGetProperty(node, name, &own, &own_size) == kSuccess && own_size == sizeof(owner)) {
++			memcpy(&owner, own, sizeof(owner));
++		}
+ 		const uint8_t *data = (const uint8_t *)prop + len + 1;
+ 		size_t bytes = size - len - 1;
+-		int error = sweet_file_write(path, data, bytes);
+-		printf("SWEET FILES: %s: %zu bytes %s (error %d)\n", path, bytes, error == 0 ? "written" : "NOT written", error);
++		int error = sweet_file_write(path, data, bytes, &owner);
++		printf("SWEET FILES: %s: %zu bytes %s, %u:%u %o (error %d)\n", path, bytes, error == 0 ? "written" : "NOT written",
++		    owner.uid, owner.gid, owner.mode & ALLPERMS, error);
+ 	}
+ }
+ 

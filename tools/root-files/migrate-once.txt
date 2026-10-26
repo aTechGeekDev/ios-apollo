@@ -1,0 +1,15 @@
+# ONE boot only: iOS's data migration runs again at the next boot (mkadt.py --files-from
+# tools/root-files/migrate-once.txt; leave this list out of every boot image after that one).
+#
+# Why: the app extensions (wallpaper posters, widgets) are registered by DataMigration, which
+# this root skips (sweet-root-tweaks.py writes LastSystemVersion), and at the first boot the
+# ExtensionKit flag (files.txt) was not there yet, so they were turned down (ios-sailfish:
+# without the migration LaunchServices had 1 of 524 appex). This puts the root in the state
+# ios-sailfish boots with: no LastSystemVersion, and the /private/var/datamigrator/migrate
+# sentinel (mobile's, as there). The phone stays at the Apple logo while it runs (the first
+# boot of this root took hours); afterwards datamigrator records LastSystemVersion itself.
+# Undo (if it never ends): tools/root-files/migrate-undo.txt.
+/private/var/mobile/Library/Preferences/ByHost/com.apple.migration.A9683613-3704-53F2-95D0-98A8FB574E78.plist=tools/root-files/migration-again-host.plist 501:501:0600
+/private/var/mobile/Library/Preferences/ByHost/com.apple.migration.a9683613-3704-53f2-95d0-98a8fb574e78.plist=tools/root-files/migration-again-host.plist 501:501:0600
+/private/var/mobile/Library/Preferences/com.apple.migration.plist=tools/root-files/migration-again.plist 501:501:0600
+/private/var/datamigrator/migrate=/dev/null 501:501:0644

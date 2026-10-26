@@ -1,0 +1,6 @@
+# Undo migrate-once.txt: the root skips iOS's data migration again (LastSystemVersion 20H392
+# as sweet-root-tweaks.py writes it, no sentinel). For a migration that never ends.
+-/private/var/datamigrator/migrate
+/private/var/mobile/Library/Preferences/ByHost/com.apple.migration.A9683613-3704-53F2-95D0-98A8FB574E78.plist=tools/root-files/migration-done-host.plist 501:501:0600
+/private/var/mobile/Library/Preferences/ByHost/com.apple.migration.a9683613-3704-53f2-95d0-98a8fb574e78.plist=tools/root-files/migration-done-host.plist 501:501:0600
+/private/var/mobile/Library/Preferences/com.apple.migration.plist=tools/root-files/migration-done.plist 501:501:0600
