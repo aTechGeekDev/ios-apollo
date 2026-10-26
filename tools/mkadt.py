@@ -4,7 +4,7 @@
 Only what the early boot path actually reads (see NOTES.md); every MMIO
 address comes from the sweet live FDT. Usage:
   mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--p3] [--touch-fw FW.bin] [--gmu-fw a650_gmu.bin]
-            [--sqe-fw a650_sqe.fw] [--zap-mdt a650_zap.mdt] [--zap-seg a650_zap.b02]
+            [--sqe-fw a650_sqe.fw] [--zap-mdt a650_zap.mdt] [--zap-seg a650_zap.b02] [--wifi-fw amss.bin]
 /product says the display is sRGB, not the iPhone X's P3 (--p3 keeps P3): see build().
 --file /usr/local/PATH=LOCAL (as many as wanted) carries a file in /sweet-files; the kernel
 writes it onto the root before launchd starts (xnu 0120-0122, bsd/dev/sweet_files.c): a new
@@ -23,7 +23,9 @@ Adreno 650 GMU firmware (from the phone's /vendor/firmware, not in git) as
 the 3D core's microcode as "sqe-firmware" (sweetgpu=18 and up). --zap-mdt and
 --zap-seg add the GPU zap shader's metadata (a650_zap.mdt) and its loadable
 segment (a650_zap.b02) as "zap-metadata" / "zap-segment"; TrustZone unlocks
-the 3D core from secure mode with them (sweetgpu=20 and up).
+the 3D core from secure mode with them (sweetgpu=20 and up). --wifi-fw embeds the
+QCA6390 Wi-Fi firmware (the phone's amss20.bin / amss.bin, tools/pull-wifi-fw.sh, not in git)
+as /sweet-wifi "amss" for sweet_wifi.c (sweetwifi=4 and up, xnu 0126).
 """
 import hashlib, os, re, struct, sys
 
@@ -102,7 +104,7 @@ def node(name, props=(), children=()):
 
 
 def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_extra=(), p3=False, files=(),
-          deletes=(), lists=()):
+          deletes=(), lists=(), wifi_fw=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
@@ -279,6 +281,7 @@ def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_
     ], [chosen, defaults, cpus, arm_io, fbcon, buttons, pram] + product + ([] if qemu else [ufs]) +
        ([node('sweet-touch', [ph(), ('firmware', touch_fw)])] if touch_fw else []) +
        ([node('sweet-gpu', [ph(), ('gmu-firmware', gmu_fw)] + list(gpu_extra))] if gmu_fw else []) +
+       ([node('sweet-wifi', [ph(), ('amss', wifi_fw)])] if wifi_fw else []) +
        ([node('sweet-files', [ph()] + [(f'list{i}', path.encode() + b'\0') for i, path in enumerate(lists)]
                               + [(f'delete{i}', path.encode() + b'\0') for i, path in enumerate(deletes)]
                               + [(f'file{i}', path.encode() + b'\0' + data) for i, (path, data, _) in enumerate(files)]
@@ -311,6 +314,12 @@ if __name__ == '__main__':
         gpu_extra.append(('zap-segment', zap_seg))
     if gpu_extra and not gmu_fw:
         sys.exit('--sqe-fw, --zap-mdt and --zap-seg need --gmu-fw')
+    wifi_fw = None
+    if '--wifi-fw' in sys.argv:
+        wifi_fw = open(sys.argv[sys.argv.index('--wifi-fw') + 1], 'rb').read()
+        print(f'Wi-Fi firmware: {len(wifi_fw)} bytes', file=sys.stderr)
+        if not 512 * 1024 <= len(wifi_fw) <= 16 << 20:
+            sys.exit('--wifi-fw: the QCA6390 firmware (amss) is between 512 KiB and 16 MiB')
     files, deletes, lists = [], [], []          # (path, data, (uid, gid, mode) or None); paths; paths
     wanted = []                                 # (where it came from, "DEST=LOCAL [UID:GID:MODE]" or "-DEST")
     for i, arg in enumerate(sys.argv):
@@ -353,7 +362,7 @@ if __name__ == '__main__':
     if files:
         print(f'files for the root: {len(files)}, {sum(len(d) for _, d, _ in files) / 1048576:.1f} MiB', file=sys.stderr)
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, touch_fw=touch_fw, gmu_fw=gmu_fw,
-                 gpu_extra=gpu_extra, p3='--p3' in sys.argv, files=files, deletes=deletes, lists=lists)
+                 gpu_extra=gpu_extra, p3='--p3' in sys.argv, files=files, deletes=deletes, lists=lists, wifi_fw=wifi_fw)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

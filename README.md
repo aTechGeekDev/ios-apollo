@@ -106,6 +106,7 @@ adb reboot bootloader
 | `sweetnull=A,B,...` | Copy what these programs print into the kernel log |
 | `sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd` | Load the CoreAnimation bridge (GPU drawing) into the window server |
 | `sweetgl=0` | Keep CoreAnimation's software renderer |
+| `sweetwifi=N` | Wi-Fi bring-up steps 1..7 (QCA6390: power, PCIe link, SMMU, firmware boot, QRTR); needs `mkadt.py --wifi-fw` from step 4 |
 
 The other boot-args are described in their drivers' sources in `xnu/patches/` and in `NOTES.md`.
 
@@ -114,7 +115,7 @@ The other boot-args are described in their drivers' sources in `xnu/patches/` an
 | Path | What |
 | --- | --- |
 | `shim/` | Boot shim, packed as an Android boot image |
-| `xnu/patches/` | The kernel patches (0001–0125), applied in order by CI |
+| `xnu/patches/` | The kernel patches (0001–0126), applied in order by CI |
 | `userland/` | Programs and libraries for the phone: GPU tests, Mesa, the CoreAnimation bridge |
 | `tools/` | Device tree builder, payload packer, iOS root builder, log and crash tools |
 | `NOTES.md` | Engineering log and current handoff |

@@ -1,0 +1,2527 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,9 @@
+ bsd/dev/sweet_cpufreq.c		standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_files.c			standard
++bsd/dev/sweet_pcie.c			standard
++bsd/dev/sweet_mhi.c			standard
++bsd/dev/sweet_wifi.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -2,6 +2,13 @@
+  * SWEET PM6150L L11C bring-up; see report.md for DT and source evidence.
+  * Sole XNU apps-DRV owner, called from thread context with deep idle disabled.
+  * No sleep/wake programming, SPMI writes, GIC handler, or timeout recovery.
++ *
++ * apollo (SM8250): cmd-db is the kona DT's reserved-memory@80860000 (read
++ * by sweet_gpu.c since boot 17), not the sweet IMEM locator. The Wi-Fi rails
++ * (sweet_rpmh_wifi_power, for sweet_wifi.c) follow the Mi 10 port of
++ * github.com/JopangJovan/hackios-xnu-kernel-umi (umi_rpmh.c, APSL 2.0): its
++ * firmware leaves AMC_EN set on an idle empty ACTIVE TCS and repeats some
++ * VRM entries across cmd-db slave headers, and SMPS rails keep their mode.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -12,12 +19,14 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++int sweet_rpmh_wifi_power(void);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+ #define RH_TCS_PA       0x18220d00u
+ #define RH_TCS_SIZE     0x3000u
+-#define RH_DICT_PA      0x0c3f000cu
++#define RH_DB_PA        0x80860000u  /* kona reserved-memory cmd_db */
++#define RH_DB_SIZE      0x20000u
+ #define RH_DRV          2u
+ #define RH_ACTIVE_N     2u       /* DT order: ACTIVE 2, SLEEP 3, WAKE 3 */
+ #define RH_NORMAL_N     8u       /* hidden CONTROL TCS is not in this bank */
+@@ -46,7 +55,7 @@
+ #define RH_VRM          4u
+ #define RH_TIMEOUT_US   100000u
+ 
+-static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
++static vm_offset_t rh_rsc, rh_tcs, rh_db;
+ static uint32_t rh_db_size;
+ static unsigned rh_ncpt;
+ static unsigned rh_lock;
+@@ -106,10 +115,7 @@
+ 	if (!rh_tcs) {
+ 		rh_tcs = ml_io_map(RH_TCS_PA, RH_TCS_SIZE);
+ 	}
+-	if (!rh_dict) {
+-		rh_dict = ml_io_map(RH_DICT_PA, 8);
+-	}
+-	if (!rh_rsc || !rh_tcs || !rh_dict) {
++	if (!rh_rsc || !rh_tcs) {
+ 		printf("SWEET RPMH: RSC/locator mapping failed\n");
+ 		return ENOMEM;
+ 	}
+@@ -129,9 +135,9 @@
+ 		return ENODEV;
+ 	}
+ 	if (!rh_db) {
+-		uint32_t pa = rh_read(rh_dict, 0);
+-		uint32_t size = rh_read(rh_dict, 4);
+-		printf("SWEET RPMH: cmd-db locator=%#x pa=%#x size=%#x\n", RH_DICT_PA, pa, size);
++		uint32_t pa = RH_DB_PA;
++		uint32_t size = RH_DB_SIZE;
++		printf("SWEET RPMH: cmd-db pa=%#x size=%#x\n", pa, size);
+ 		/* Firmware supplies the reserved RAM address; never scan physical RAM. */
+ 		if (pa < 0x80000000u || (pa & 3u) || (size & 3u) ||
+ 		    size < RH_DB_HEADER || size > RH_DB_MAX ||
+@@ -191,6 +197,11 @@
+ 				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
+ 				return EINVAL;
+ 			}
++			/* Repeated across slave headers: harmless only for the same register. */
++			if (matches && *address != addr) {
++				printf("SWEET RPMH: conflicting addresses for %s: %#x / %#x\n", res, *address, addr);
++				return EINVAL;
++			}
+ 			*address = addr;
+ 			++matches;
+ 			printf("SWEET RPMH: %s addr=%#x slave=%u aux-version=%#x priority=%#x:%#x\n",
+@@ -198,7 +209,7 @@
+ 			    rh_read(rh_db, e + 8), rh_read(rh_db, e + 12));
+ 		}
+ 	}
+-	if (matches != 1) {
++	if (matches == 0) {
+ 		printf("SWEET RPMH: %s lookup matches=%u; refusing\n", res, matches);
+ 		return ENODEV;
+ 	}
+@@ -209,17 +220,18 @@
+ rh_free(unsigned t)
+ {
+ 	uint32_t b = t * RH_TCS_STRIDE;
+-	/* Idle alone is insufficient: a sleep/wake payload can be armed and idle. */
++	/* Idle alone is insufficient: a sleep/wake payload can be armed and idle.
++	 * The boot chain may leave AMC_EN set on an empty idle ACTIVE slot. */
+ 	return rh_read(rh_tcs, b + RH_STATUS) != 0 &&
+ 	    rh_read(rh_tcs, b + RH_STATUS) != 0xffffffffu &&
+-	    rh_read(rh_tcs, b + RH_CONTROL) == 0 &&
++	    (rh_read(rh_tcs, b + RH_CONTROL) & ~RH_AMC_EN) == 0 &&
+ 	    rh_read(rh_tcs, b + RH_ENABLE) == 0 &&
+ 	    rh_read(rh_tcs, b + RH_WAIT) == 0 &&
+ 	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
+ }
+ 
+ static int
+-rh_send(uint32_t address, unsigned mv)
++rh_send(uint32_t address, unsigned mv, bool ldo_mode)
+ {
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+@@ -234,7 +246,7 @@
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+ 			if ((enabled & (1u << c)) &&
+ 			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
++				printf("SWEET RPMH: conflicting inherited VRM request in TCS%u\n", t);
+ 				return EBUSY;
+ 			}
+ 		}
+@@ -249,6 +261,7 @@
+ 	unsigned t = (unsigned)chosen;
+ 	uint32_t b = t * RH_TCS_STRIDE, bit = 1u << t;
+ 	uint32_t irq_en = rh_read(rh_tcs, RH_IRQ_EN);
++	uint32_t inherited_control = rh_read(rh_tcs, b + RH_CONTROL);
+ 	if (irq_en == 0xffffffffu || !rh_free(t)) {
+ 		return EBUSY;
+ 	}
+@@ -266,11 +279,13 @@
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+-	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, 1};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
+-	for (unsigned c = 0; c < 3; ++c) {
++	/* A PMIC5 LDO gets HPM (raw 7) before enable; SMPS rails keep their mode. */
++	const uint32_t offsets[3] = {0, ldo_mode ? 8u : 4u, 4};
++	const uint32_t values[3] = {mv, ldo_mode ? 7u : 1u, 1};
++	const unsigned commands = ldo_mode ? 3 : 2;
++	const uint32_t command_mask = (1u << commands) - 1;
++	printf("SWEET RPMH: TCS%u ACTIVE %u mV%s enable=1 irq-enable=%#x\n", t, mv, ldo_mode ? " mode=7" : "", irq_en);
++	for (unsigned c = 0; c < commands; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+ 		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
+@@ -278,7 +293,7 @@
+ 			return EIO;
+ 		}
+ 	}
+-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
++	if (!rh_sync(b + RH_WAIT, command_mask) || !rh_sync(b + RH_ENABLE, command_mask) ||
+ 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+ 		return EIO;
+ 	}
+@@ -289,7 +304,7 @@
+ 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+ 		idle = rh_read(rh_tcs, b + RH_STATUS);
+ 		bool complete = true;
+-		for (unsigned c = 0; c < 3; ++c) {
++		for (unsigned c = 0; c < commands; ++c) {
+ 			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+ 			complete &= status[c] != 0xffffffffu &&
+ 			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+@@ -310,7 +325,7 @@
+ 		return ETIMEDOUT;
+ 	}
+ 	/* Proven completion: clear trigger before mode, then free only our commands. */
+-	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, 0) ||
++	if (!rh_sync(b + RH_CONTROL, RH_AMC_EN) || !rh_sync(b + RH_CONTROL, inherited_control) ||
+ 	    !rh_sync(b + RH_ENABLE, 0) || !rh_sync(b + RH_WAIT, 0)) {
+ 		return EIO;
+ 	}
+@@ -320,7 +335,7 @@
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: ACTIVE vote complete (rail voltage requires hardware verification)\n");
+ 	return 0;
+ }
+ 
+@@ -346,7 +361,7 @@
+ 		error = rh_lookup(res, &address);
+ 	}
+ 	if (!error) {
+-		error = rh_send(address, mv);
++		error = rh_send(address, mv, true);
+ 	}
+ out:
+ 	if (error) {
+@@ -354,5 +369,48 @@
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
++}
++
++/*
++ * apollo's QCA6390 and PCIe0 supplies (kona.dtsi wlan + pcie0, with
++ * apollo-sm8250.dtsi's &wlan override: vdd-wlan-dig on PM8150 S6, like AON,
++ * instead of kona's PM8009 S2 = smpf2). ACTIVE votes, held until reset; no
++ * sleep/wake votes, nothing switched off (the rails are shared).
++ */
++int
++sweet_rpmh_wifi_power(void)
++{
++	static const struct { const char *resource; unsigned mv; } rails[] = {
++		{ "smpa4", 1800 },      /* PM8150 S4: WLAN IO */
++		{ "smpa6", 950 },       /* PM8150 S6: WLAN AON and, on apollo, digital */
++		{ "smpa5", 1900 },      /* PM8150 S5: WLAN RFA1 */
++		{ "smpc8", 1350 },      /* PM8150A S8: WLAN RFA2 */
++		{ "ldoa9", 1200 },      /* PM8150 L9: PCIe vreg-1p8, DT asks 1.2 V */
++		{ "ldoa5", 880 },       /* PM8150 L5: PCIe vreg-0p9 */
++	};
++	uint32_t addresses[sizeof(rails) / sizeof(rails[0])];
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	/* Every resource is found before the first vote is sent. */
++	for (unsigned i = 0; !error && i < sizeof(rails) / sizeof(rails[0]); ++i) {
++		error = rh_lookup(rails[i].resource, &addresses[i]);
++	}
++	for (unsigned i = 0; !error && i < sizeof(rails) / sizeof(rails[0]); ++i) {
++		printf("SWEET RPMH: Wi-Fi/PCIe %s at least %u mV\n", rails[i].resource, rails[i].mv);
++		error = rh_send(addresses[i], rails[i].mv, false);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: Wi-Fi rails failed errno=%d\n", error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@
+ extern void sweet_usb_probe(void);
+ extern void sweet_cpufreq_init(void);
+ extern void sweet_gpu_init(void);
++extern void sweet_wifi_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -666,6 +667,8 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	/* QCA6390 Wi-Fi bring-up; does nothing without boot-arg sweetwifi=N (sweet_wifi.c). */
++	sweet_wifi_init();
+ 	return 0;
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/sweet_pcie.h
+@@ -0,0 +1,33 @@
++/* PCIe0 endpoint enumeration (sweet_pcie.c, from the Mi 10 port's umi_pcie.h).
++ * The platform owns mappings and RPMh votes. */
++#ifndef _SWEET_PCIE_H_
++#define _SWEET_PCIE_H_
++#include <stdbool.h>
++#include <stdint.h>
++
++struct sweet_pcie_io {
++	void *context;
++	uint32_t (*read32)(void *, uint32_t physical_address);
++	void (*write32)(void *, uint32_t physical_address, uint32_t value);
++	int (*power_on)(void *); /* Board-specific rail votes; no endpoint DMA. */
++	void (*delay_us)(void *, unsigned);
++	void (*report)(void *, const char *, uint32_t);
++};
++struct sweet_pcie {
++	const struct sweet_pcie_io *io;
++	bool failed, enumerated, dma_enabled;
++	uint32_t msi_cap;
++};
++/* Explicit diagnostic only, on a zero-initialized host. Bus mastering stays
++ * disabled. No SMMU, MSI or MHI context is installed by this component.
++ */
++int sweet_pcie_enumerate(struct sweet_pcie *, const struct sweet_pcie_io *);
++/* Requires an owned, verified SMMU context for stream 0x1c01. No caller
++ * may enable bus mastering before that protection is installed. */
++int sweet_pcie_enable_dma(struct sweet_pcie *);
++int sweet_pcie_prepare_radio(struct sweet_pcie *);
++int sweet_pcie_setup_mhi_msi(struct sweet_pcie *, uint64_t address, uint32_t data);
++/* Hold endpoint in reset before returning to loader. Rail/clock votes remain
++ * until hardware reset; shared supplies are never disabled here. */
++void sweet_pcie_quiesce(struct sweet_pcie *);
++#endif
+--- /dev/null
++++ b/bsd/dev/sweet_pcie_phy.h
+@@ -0,0 +1,103 @@
++/* PCIe0 QMP PHY v4.4.14, kona-pcie.dtsi pcie0 qcom,phy-sequence (UMI's and
++ * apollo's are the same 99 entries). Offset, value, delay in us. */
++static const struct { uint32_t offset, value, delay_us; } sweet_pcie_phy[] = {
++	{ 0x840, 0x03, 0 },
++	{ 0x094, 0x08, 0 },
++	{ 0x154, 0x34, 0 },
++	{ 0x16c, 0x08, 0 },
++	{ 0x058, 0x0f, 0 },
++	{ 0x0a4, 0x42, 0 },
++	{ 0x110, 0x24, 0 },
++	{ 0x11c, 0x03, 0 },
++	{ 0x118, 0xb4, 0 },
++	{ 0x10c, 0x02, 0 },
++	{ 0x1bc, 0x11, 0 },
++	{ 0x0bc, 0x82, 0 },
++	{ 0x0d4, 0x03, 0 },
++	{ 0x0d0, 0x55, 0 },
++	{ 0x0cc, 0x55, 0 },
++	{ 0x0b0, 0x1a, 0 },
++	{ 0x0ac, 0x0a, 0 },
++	{ 0x0c4, 0x68, 0 },
++	{ 0x0e0, 0x02, 0 },
++	{ 0x0dc, 0xaa, 0 },
++	{ 0x0d8, 0xab, 0 },
++	{ 0x0b8, 0x34, 0 },
++	{ 0x0b4, 0x14, 0 },
++	{ 0x158, 0x01, 0 },
++	{ 0x074, 0x06, 0 },
++	{ 0x07c, 0x16, 0 },
++	{ 0x084, 0x36, 0 },
++	{ 0x078, 0x06, 0 },
++	{ 0x080, 0x16, 0 },
++	{ 0x088, 0x36, 0 },
++	{ 0x1b0, 0x1e, 0 },
++	{ 0x1ac, 0xca, 0 },
++	{ 0x1b8, 0x18, 0 },
++	{ 0x1b4, 0xa2, 0 },
++	{ 0x050, 0x07, 0 },
++	{ 0x010, 0x01, 0 },
++	{ 0x01c, 0x31, 0 },
++	{ 0x020, 0x01, 0 },
++	{ 0x024, 0xde, 0 },
++	{ 0x028, 0x07, 0 },
++	{ 0x030, 0x4c, 0 },
++	{ 0x034, 0x06, 0 },
++	{ 0x29c, 0x12, 0 },
++	{ 0x284, 0x35, 0 },
++	{ 0x23c, 0x11, 0 },
++	{ 0x51c, 0x03, 0 },
++	{ 0x518, 0x1c, 0 },
++	{ 0x524, 0x1e, 0 },
++	{ 0x4e8, 0x00, 0 },
++	{ 0x4ec, 0x0e, 0 },
++	{ 0x4f0, 0x4a, 0 },
++	{ 0x4f4, 0x0f, 0 },
++	{ 0x5b4, 0x04, 0 },
++	{ 0x434, 0x7f, 0 },
++	{ 0x444, 0x70, 0 },
++	{ 0x510, 0x17, 0 },
++	{ 0x4d4, 0x04, 0 },
++	{ 0x4d8, 0x07, 0 },
++	{ 0x598, 0xd4, 0 },
++	{ 0x59c, 0x54, 0 },
++	{ 0x5a0, 0xdb, 0 },
++	{ 0x5a4, 0x3b, 0 },
++	{ 0x5a8, 0x31, 0 },
++	{ 0x584, 0x24, 0 },
++	{ 0x588, 0xe4, 0 },
++	{ 0x58c, 0xec, 0 },
++	{ 0x590, 0x3b, 0 },
++	{ 0x594, 0x36, 0 },
++	{ 0x570, 0x3f, 0 },
++	{ 0x574, 0x3f, 0 },
++	{ 0x578, 0xff, 0 },
++	{ 0x57c, 0x7f, 0 },
++	{ 0x580, 0x14, 0 },
++	{ 0x4fc, 0x00, 0 },
++	{ 0x4f8, 0xc0, 0 },
++	{ 0x460, 0x30, 0 },
++	{ 0x464, 0x00, 0 },
++	{ 0x5bc, 0x0c, 0 },
++	{ 0x4dc, 0x1b, 0 },
++	{ 0x408, 0x0c, 0 },
++	{ 0x414, 0x03, 0 },
++	{ 0x5b8, 0x30, 0 },
++	{ 0x9a4, 0x01, 0 },
++	{ 0xc90, 0x00, 0 },
++	{ 0xc40, 0x01, 0 },
++	{ 0xc48, 0x01, 0 },
++	{ 0xc50, 0x00, 0 },
++	{ 0xcb4, 0x33, 0 },
++	{ 0xcbc, 0x00, 0 },
++	{ 0xce0, 0x58, 0 },
++	{ 0xca4, 0x0f, 0 },
++	{ 0x048, 0x90, 0 },
++	{ 0xc1c, 0xc1, 0 },
++	{ 0x988, 0x77, 0 },
++	{ 0x998, 0x0b, 0 },
++	{ 0x8dc, 0x0d, 0 },
++	{ 0x9ec, 0x12, 0 },
++	{ 0x800, 0x00, 0 },
++	{ 0x844, 0x03, 0 },
++};
+--- /dev/null
++++ b/bsd/dev/sweet_pcie.c
+@@ -0,0 +1,369 @@
++/* PCIe0 bootstrap for the QCA6390 (apollo, SM8250), from the Xiaomi Mi 10
++ * port of github.com/JopangJovan/hackios-xnu-kernel-umi devices/xiaomi-mi-10 (umi_pcie.c, APSL 2.0).
++ * Register values and PHY data are from the merged UMI stock DT and Kona
++ * register definitions; apollo's kona-pcie.dtsi pcie0 PHY sequence, PERST /
++ * CLKREQ / WAKE pins (79/80/81) and wlan-en (20) are the same. This
++ * diagnostic stops with QCA6390 memory decoding enabled and bus mastering
++ * disabled. Comments saying "UMI" describe the Mi 10 where it was measured.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include "sweet_pcie.h"
++#include <sys/errno.h>
++#include "sweet_pcie_phy.h"
++
++#define GCC  0x00100000u
++#define GPIO 0x0f900000u /* Kona NORTH tile: TLMM base + 0x900000. */
++#define PARF 0x01c00000u
++#define PHY  0x01c06000u
++#define DBI  0x60000000u
++#define ATU  0x60001000u
++#define CONF 0x60100000u
++#define BAR  0x60300000u
++#define BIT(n) (1u << (n))
++#define TRY(expr) do { error = (expr); if (error) goto fail; } while (0)
++
++static uint32_t rd(struct sweet_pcie *p, uint32_t addr)
++{
++	return p->io->read32(p->io->context, addr);
++}
++static void wr(struct sweet_pcie *p, uint32_t addr, uint32_t value)
++{
++	p->io->write32(p->io->context, addr, value);
++}
++static void pause_us(struct sweet_pcie *p, unsigned us)
++{
++	p->io->delay_us(p->io->context, us);
++}
++static void report(struct sweet_pcie *p, const char *name, uint32_t value)
++{
++	if (p->io->report) p->io->report(p->io->context, name, value);
++}
++static int update(struct sweet_pcie *p, uint32_t addr, uint32_t clear, uint32_t set)
++{
++	uint32_t value = rd(p, addr);
++	if (value == UINT32_MAX) return EIO;
++	wr(p, addr, (value & ~clear) | set);
++	return 0;
++}
++static int wait_bits(struct sweet_pcie *p, uint32_t addr, uint32_t mask,
++    uint32_t wanted, unsigned timeout_us)
++{
++	uint32_t value = 0;
++	for (unsigned us = 0; us < timeout_us; us += 10) {
++		value = rd(p, addr);
++		if (value == UINT32_MAX) return EIO;
++		if ((value & mask) == wanted) return 0;
++		pause_us(p, 10);
++	}
++	report(p, "poll timeout address", addr);
++	report(p, "poll timeout value", value);
++	return ETIMEDOUT;
++}
++static int gpio_output(struct sweet_pcie *p, unsigned pin, bool high, uint32_t config)
++{
++	/* Set output latch before output-enable/mux to avoid a reset glitch. */
++	int error = update(p, GPIO + pin * 0x1000 + 4, BIT(1), high ? BIT(1) : 0);
++	if (error) return error;
++	return update(p, GPIO + pin * 0x1000, 0x3ff, config | BIT(9));
++}
++static int source_xo(struct sweet_pcie *p, uint32_t cmd)
++{
++	/* 19.2 MHz XO, divide by 1. This is the stock Gen1/Gen2 refgen rate. */
++	int error = update(p, cmd + 4, 0x371f, 1);
++	if (error) return error;
++	error = update(p, cmd, 0, 1);
++	return error ? error : wait_bits(p, cmd, 1, 0, 10000);
++}
++static int branch(struct sweet_pcie *p, uint32_t offset)
++{
++	int error = update(p, GCC + offset, 0, 1);
++	return error ? error : wait_bits(p, GCC + offset, BIT(31), 0, 10000);
++}
++static int clocks(struct sweet_pcie *p)
++{
++	int error;
++	/* GDSC status is checked before accessing the PCIe controller/PHY. */
++	TRY(update(p, GCC + 0x6b004, 7, 0));
++	pause_us(p, 1);
++	TRY(wait_bits(p, GCC + 0x6b004, BIT(31), BIT(31), 10000));
++	TRY(source_xo(p, GCC + 0x6b038));
++	TRY(source_xo(p, GCC + 0x6f014));
++	TRY(branch(p, 0x8c004)); /* QCA6390 reference clock/LDO. */
++	TRY(branch(p, 0x6f02c));
++	TRY(branch(p, 0x9000c));
++	TRY(branch(p, 0x8d058));
++	/* The AXI and PIPE clocks must not retain memory/peripheral state. */
++	TRY(update(p, GCC + 0x6b01c, 0x6000, 0));
++	/* Force diagnostic AHB/SLV clocks on. In HWCG mode the halt bit can
++	 * assert merely because the bus is idle, so it is not a readiness test. */
++	TRY(update(p, GCC + 0x6b014, 0x6002, 0));
++	TRY(update(p, GCC + 0x6b024, BIT(1), 0));
++	TRY(update(p, GCC + 0x6b02c, 0x6000, 0));
++	TRY(update(p, GCC + 0x52008, 0, 0x2f)); /* All PCIe0 votes except PIPE. */
++	static const uint32_t gates[] = {0x6b010, 0x6b014, 0x6b01c, 0x6b024, 0x6b028};
++	for (unsigned i = 0; i < sizeof(gates) / sizeof(gates[0]); i++)
++		TRY(wait_bits(p, GCC + gates[i], BIT(31), 0, 10000));
++	static const uint32_t resets[] = {0x6b000, 0x6c01c};
++	for (unsigned i = 0; i < sizeof(resets) / sizeof(resets[0]); i++) {
++		TRY(update(p, GCC + resets[i], 0, 1));
++		pause_us(p, 1000);
++		TRY(update(p, GCC + resets[i], 1, 0));
++	}
++	return 0;
++fail:
++	return error;
++}
++static int outbound(struct sweet_pcie *p, unsigned index, uint32_t type,
++    uint32_t start, uint32_t end, uint32_t target)
++{
++	uint32_t a = ATU + index * 0x200;
++	wr(p, a + 4, 0);
++	wr(p, a, type);
++	wr(p, a + 8, start);
++	wr(p, a + 12, 0);
++	wr(p, a + 16, end);
++	wr(p, a + 20, target);
++	wr(p, a + 24, 0);
++	wr(p, a + 4, BIT(31));
++	return wait_bits(p, a + 4, BIT(31), BIT(31), 1000);
++}
++
++void sweet_pcie_quiesce(struct sweet_pcie *p)
++{
++	if (!p || !p->io) return;
++	if (p->msi_cap) {
++		uint32_t cap = rd(p, CONF + p->msi_cap);
++		if (cap != UINT32_MAX) wr(p, CONF + p->msi_cap, cap & ~BIT(16));
++		p->msi_cap = 0;
++	}
++	/* Stop protected firmware DMA before asserting reset. Enumeration alone
++	 * never enables bus mastering. Shared power/clock votes remain held. */
++	if (p->dma_enabled) {
++		uint32_t command = rd(p, CONF + 4);
++		if (command != UINT32_MAX) wr(p, CONF + 4, (command & 0xffff) & ~4u);
++		wr(p, DBI + 4, 2);
++		p->dma_enabled = false;
++	}
++	(void)gpio_output(p, 79, false, 1);
++	pause_us(p, 1000); /* PERST propagation before the SMMU can be restored. */
++	(void)gpio_output(p, 20, false, 3 | (7u << 6));
++	p->enumerated = false;
++}
++
++int sweet_pcie_enumerate(struct sweet_pcie *p, const struct sweet_pcie_io *io)
++{
++	if (!p || !io || !io->read32 || !io->write32 || !io->power_on || !io->delay_us)
++		return EINVAL;
++	if (p->io) return EBUSY;
++	p->io = io;
++	int error;
++	TRY(gpio_output(p, 79, false, 1));
++	pause_us(p, 1000);
++	TRY(io->power_on(io->context));
++	/* UMI stock pinctrl: CLKREQ mux1/pull-up; WAKE input/pull-up. */
++	TRY(update(p, GPIO + 80 * 0x1000, 0x3ff, 7));
++	TRY(update(p, GPIO + 81 * 0x1000, 0x3ff, 3));
++	TRY(gpio_output(p, 20, true, 3 | (7u << 6)));
++	pause_us(p, 1000);
++	TRY(clocks(p));
++	report(p, "power and clocks ready", rd(p, GCC + 0x6b004));
++	wr(p, PARF + 0x1000, 4); /* Root complex. */
++	TRY(update(p, PARF + 0x40, 1, 0));
++	wr(p, PARF + 0x350, 0);
++	wr(p, PARF, 0x365e);
++	TRY(update(p, PARF + 0x174, 0, BIT(4)));
++	wr(p, PARF + 0x22c, 0); /* No unhandled PCIe interrupts during enumeration. */
++	wr(p, PARF + 0x358, 0x04000000);
++	TRY(update(p, PARF + 0x1a8, 0, BIT(31)));
++	for (unsigned i = 0; i < sizeof(sweet_pcie_phy) / sizeof(sweet_pcie_phy[0]); i++) {
++		wr(p, PHY + sweet_pcie_phy[i].offset, sweet_pcie_phy[i].value);
++		if (sweet_pcie_phy[i].delay_us) pause_us(p, sweet_pcie_phy[i].delay_us);
++	}
++	pause_us(p, 1000);
++	TRY(update(p, GCC + 0x52008, 0, BIT(4))); /* PIPE: vendor skips halt polling. */
++	TRY(wait_bits(p, PHY + 0x814, BIT(6), 0, 100000));
++	report(p, "PHY ready", rd(p, PHY + 0x814));
++	pause_us(p, 10000); /* UMI DT ep-latency=10 ms. */
++	TRY(gpio_output(p, 79, true, 1));
++	pause_us(p, 1000);
++	TRY(update(p, DBI + 0x80c, 0x1f00, 0x100));
++	wr(p, DBI + 0x8a8, 0x20);
++	TRY(update(p, DBI + 0x890, BIT(0), 0));
++	TRY(update(p, DBI + 0x8bc, 0, BIT(0)));
++	wr(p, DBI + 0x154, 0x55555555);
++	TRY(update(p, DBI + 0x8bc, BIT(0), 0));
++	TRY(update(p, DBI + 0xa0, 0xf, 2)); /* Gen2 x1: stock UMI link rate. */
++	/* Write only the control half of the PCIe capability (upper half is W1C). */
++	uint32_t control = rd(p, DBI + 0x78);
++	if (control == UINT32_MAX) { error = EIO; goto fail; }
++	wr(p, DBI + 0x78, (control & 0xffff) & ~0x7000u);
++	TRY(update(p, PARF + 0x1b0, 0, BIT(8)));
++	TRY(wait_bits(p, DBI + 0xf28, BIT(10), BIT(10), 100000));
++	TRY(wait_bits(p, DBI + 0x80, BIT(29), BIT(29), 100000));
++	report(p, "link status", rd(p, DBI + 0x80));
++	wr(p, DBI + 0x18, 0x00010100); /* Primary 0, secondary/subordinate 1. */
++	wr(p, DBI + 0x20, 0x60306030); /* 1 MiB non-prefetchable bridge window. */
++	wr(p, DBI + 0xb40, 0x14); /* AUX 19.2 MHz. */
++	TRY(outbound(p, 0, 4, CONF, CONF + 0xfff, 0x01000000)); /* CFG0, 01:00.0 */
++	uint32_t id = 0;
++	for (unsigned i = 0; i < 1000; i++) {
++		id = rd(p, CONF);
++		if (id == 0x110117cb) break;
++		pause_us(p, 1000);
++	}
++	report(p, "endpoint PCI ID", id);
++	if (id != 0x110117cb) { error = ENODEV; goto fail; }
++	uint32_t command = rd(p, CONF + 4), bar = rd(p, CONF + 0x10);
++	if (command == UINT32_MAX || bar == UINT32_MAX || (bar & 1) ||
++	    ((bar >> 1) & 3) == 1 || ((bar >> 1) & 3) == 3) {
++		error = EIO; goto fail;
++	}
++	/* QCA6390's known 1 MiB BAR; never enable DMA before installing its SMMU. */
++	wr(p, CONF + 4, ((command & 0xffff) & ~7u) | BIT(10));
++	if (rd(p, CONF + 4) & 4) { error = EIO; goto fail; }
++	/* The SID table can contain uninitialized values after reset.
++	 * Initialize this owned, single-endpoint controller like the stock driver,
++	 * after checking QCA6390 identity and disabling endpoint bus mastering. */
++	for (unsigned i = 0; i < 256; i++) {
++		wr(p, PARF + 0x2000 + 4 * i, 0);
++		if (rd(p, PARF + 0x2000 + 4 * i) != 0) { error = EIO; goto fail; }
++	}
++	report(p, "BDF-to-SID table initialized, DMA disabled", 256);
++	wr(p, CONF + 0x10, BAR | (bar & 15));
++	if ((bar & 6) == 4) wr(p, CONF + 0x14, 0);
++	TRY(outbound(p, 1, 0, BAR, BAR + 0xfffff, BAR));
++	wr(p, DBI + 4, 2); /* Root bridge memory decode only. */
++	wr(p, CONF + 4, ((command & 0xffff) & ~7u) | 2 | BIT(10));
++	report(p, "endpoint command", rd(p, CONF + 4));
++	report(p, "endpoint BAR0", rd(p, CONF + 0x10));
++	if ((rd(p, CONF + 4) & 7) != 2 || (rd(p, CONF + 0x10) & ~15u) != BAR) {
++		error = EIO; goto fail;
++	}
++	uint32_t version = rd(p, BAR + 8);
++	report(p, "MHI version (DMA disabled)", version);
++	if (version != 0x01000000) {
++		report(p, "MHI register length", rd(p, BAR));
++		report(p, "MHI control", rd(p, BAR + 0x38));
++		report(p, "MHICFG", rd(p, BAR + 0x10));
++		report(p, "channel doorbells", rd(p, BAR + 0x18));
++		report(p, "event doorbells", rd(p, BAR + 0x20));
++		report(p, "BHI offset", rd(p, BAR + 0x28));
++		report(p, "BHIE offset", rd(p, BAR + 0x2c));
++		if (rd(p, BAR + 0x28) == 0x100) {
++			report(p, "BHI major version", rd(p, BAR + 0x104));
++			report(p, "BHI execution environment", rd(p, BAR + 0x128));
++		}
++	}
++	/* Captured on real UMI PBL: MHIVER has a placeholder, BHI is readable. */
++	bool cold_pbl = version == 0xdeadbeef && rd(p, BAR) == 0x100 &&
++	    rd(p, BAR + 0x18) == 0x300 && rd(p, BAR + 0x20) == 0x700 &&
++	    rd(p, BAR + 0x28) == 0x100 && rd(p, BAR + 0x2c) == 0x224 &&
++	    rd(p, BAR + 0x104) == 1 && rd(p, BAR + 0x128) == 0;
++	if (version != 0x01000000 && !cold_pbl) { error = ENODEV; goto fail; }
++	if (cold_pbl) report(p, "QCA6390 cold PBL signature validated", 1);
++	p->enumerated = true;
++	return 0;
++fail:
++	p->failed = true;
++	report(p, "enumeration failed errno", (uint32_t)error);
++	sweet_pcie_quiesce(p);
++	return error;
++}
++
++int sweet_pcie_enable_dma(struct sweet_pcie *p)
++{
++	if (!p || !p->io || !p->enumerated || p->failed) return ENODEV;
++	if (p->dma_enabled) return EALREADY;
++	/* Kona hashes the two BDF bytes (bus 1, devfn 0) using CRC-8/0x07.
++	 * SID table contains the low byte; PCIe0 supplies the wired 0x1c00 base. */
++	uint8_t hash = 0;
++	const uint8_t bdf[] = {1, 0};
++	for (unsigned i = 0; i < sizeof(bdf); i++) {
++		hash ^= bdf[i];
++		for (unsigned b = 0; b < 8; b++) hash = (hash << 1) ^ ((hash & 0x80) ? 7 : 0);
++	}
++	uint32_t route = PARF + 0x2000 + 4 * hash;
++	uint32_t old = rd(p, route), wanted = 0x01000100;
++	report(p, "BDF-to-SID route address", route);
++	report(p, "BDF-to-SID previous route", old);
++	if (old != 0 && old != wanted) return EBUSY;
++	wr(p, route, wanted);
++	if (rd(p, route) != wanted) return EIO;
++	uint32_t command = rd(p, CONF + 4);
++	if (command == UINT32_MAX || (command & 7) != 2) return EIO;
++	/* SM8250 defaults to BDF-to-SID bypass. A table alone does not route
++	 * requests through the owned context; explicitly enable translation. */
++	report(p, "BDF-to-SID configuration before", rd(p, PARF + 0x2c00));
++	int error = update(p, PARF + 0x2c00, 1, 0);
++	if (error || (rd(p, PARF + 0x2c00) & 1)) return EIO;
++	report(p, "BDF-to-SID configuration after", rd(p, PARF + 0x2c00));
++	wr(p, DBI + 4, 6); /* Allow protected endpoint transactions upstream. */
++	wr(p, CONF + 4, (command & 0xffff) | 4);
++	p->dma_enabled = true; /* Quiesce must clear it even if readback fails. */
++	if ((rd(p, CONF + 4) & 7) != 6) return EIO;
++	report(p, "protected DMA stream", 0x1c01);
++	return 0;
++}
++
++int sweet_pcie_prepare_radio(struct sweet_pcie *p)
++{
++	if (!p || !p->io || !p->enumerated || p->failed) return ENODEV;
++	if (p->dma_enabled) return EBUSY;
++	/* UMI DT sets qcom,set-wlaon-pwr-ctrl. CNSS clears SHUTDOWN_EN and
++	 * VDD4BLOW_SW_EN in WLAON_QFPROM_PWR_CTRL before the first MHI request.
++	 * This disables those bits; it never enables fuse programming. */
++	uint32_t saved_window = rd(p, BAR + 0x310c);
++	if (saved_window == UINT32_MAX || saved_window == 0xdeadbeef) return EIO;
++	wr(p, BAR + 0x310c, 0x4000003f); /* Internal 0x01f80000 window. */
++	int error = EIO;
++	if ((rd(p, BAR + 0x310c) & 0x4000003f) == 0x4000003f) {
++		uint32_t power = rd(p, BAR + 0x8031c);
++		report(p, "WLAON power control before", power);
++		if (power != UINT32_MAX && power != 0xdeadbeef) {
++			wr(p, BAR + 0x8031c, power & ~5u);
++			uint32_t now = rd(p, BAR + 0x8031c);
++			report(p, "WLAON power control after", now);
++			if (now == (power & ~5u)) error = 0;
++		}
++	}
++	wr(p, BAR + 0x310c, saved_window);
++	return error;
++}
++
++int sweet_pcie_setup_mhi_msi(struct sweet_pcie *p, uint64_t address, uint32_t data)
++{
++	if (!p || !p->io || !p->enumerated || p->failed) return ENODEV;
++	if (p->dma_enabled || p->msi_cap) return EBUSY;
++	if ((address & 3) || data > 0xffff || (data & 31)) return EINVAL;
++	uint32_t cap = rd(p, CONF + 0x34) & 0xff;
++	uint64_t seen = 0;
++	for (unsigned i = 0; i < 48 && cap; i++) {
++		if (cap < 0x40 || cap > 0xfc || (cap & 3) || (seen & (1ull << (cap / 4)))) return EINVAL;
++		seen |= 1ull << (cap / 4);
++		uint32_t header = rd(p, CONF + cap);
++		if (header == UINT32_MAX) return EIO;
++		if ((header & 0xff) == 5) {
++			uint32_t control = header >> 16;
++			bool wide = (control & 0x80) != 0;
++			if (((control >> 1) & 7) < 5 || !(control & 0x100)) return ENOTSUP;
++			if (!wide && address > UINT32_MAX) return ERANGE;
++			uint32_t msg = cap + (wide ? 12 : 8), mask = msg + 4;
++			if (mask > 0xfc) return EINVAL;
++			wr(p, CONF + cap, header & ~BIT(16));
++			wr(p, CONF + mask, UINT32_MAX);
++			wr(p, CONF + cap + 4, (uint32_t)address);
++			if (wide) wr(p, CONF + cap + 8, (uint32_t)(address >> 32));
++			wr(p, CONF + msg, data);
++			wr(p, CONF + mask, 0xfffffff8); /* UMI MHI owns vectors 0, 1 and 2. */
++			wr(p, CONF + cap, (header & ~(0x71u << 16)) | (0x51u << 16));
++			p->msi_cap = cap;
++			if (!(rd(p, CONF + cap) & BIT(16))) return EIO;
++			report(p, "MHI MSI address low", (uint32_t)address);
++			report(p, "MHI MSI data", data);
++			return 0;
++		}
++		cap = (header >> 8) & 0xff;
++	}
++	return ENODEV;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/sweet_mhi.h
+@@ -0,0 +1,71 @@
++/* QCA6390 MHI boot transport (sweet_mhi.c, from the Mi 10 port's umi_mhi.h).
++ * The PCIe owner supplies MMIO and coherent DMA.
++ * The caller must serialize calls and keep the endpoint powered throughout each call.
++ */
++#ifndef _SWEET_MHI_H_
++#define _SWEET_MHI_H_
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++struct sweet_mhi_dma {
++	void *bytes;
++	uint64_t address;                 /* SMMU IOVA, never a CPU physical address */
++	size_t size;
++};
++
++struct sweet_mhi_io {
++	void *context;
++	uint32_t bar_size;
++	uint32_t (*read32)(void *, uint32_t);
++	void (*write32)(void *, uint32_t, uint32_t);
++	/* Page-aligned coherent allocations, owned until endpoint shutdown/reset.
++	 * Failure returns an errno; partial allocations remain owned by the platform.
++	 */
++	int (*allocate)(void *, size_t, struct sweet_mhi_dma *);
++	void (*sync_for_device)(void *, const struct sweet_mhi_dma *);
++	void (*delay_us)(void *, unsigned);
++	void (*report)(void *, const char *, uint32_t);
++	void (*qrtr_packet)(void *, const void *, size_t);
++};
++
++struct sweet_mhi {
++	const struct sweet_mhi_io *io;
++	uint32_t bhi, bhie, channel_db, event_db, sequence;
++	uint64_t event_consumer[3], event_wp[3], command_wp, ipcr_rx_wp, ipcr_tx_wp;
++	unsigned ipcr_tx_slot;
++	uint16_t ipcr_wait_transaction;
++	bool poisoned, sbl_sent, contexts_ready, amss_sent, ipcr_started;
++	bool ipcr_tx_pending, ipcr_tx_done, ipcr_waiting_response, ipcr_response_done;
++	/* Retain these even on timeout: the endpoint may still be using them. */
++	struct sweet_mhi_dma sbl, image, vectors;
++	struct sweet_mhi_dma channels, events, commands, command_ring, event_ring[3];
++	struct sweet_mhi_dma ipcr_tx_ring, ipcr_tx_buffers, ipcr_rx_ring, ipcr_rx_buffers;
++};
++
++/* A zero-initialized host, an enumerated endpoint, and a mapped BAR are required.
++ * Probe reads registers only. All functions return zero or a positive errno.
++ */
++int sweet_mhi_probe(struct sweet_mhi *, const struct sweet_mhi_io *);
++int sweet_mhi_execution_environment(const struct sweet_mhi *, uint32_t *);
++/* BHI sends the first 512 KiB while in PBL. Before BHIE, the PCIe owner must
++ * service READY, install MHI contexts/event rings and request M0.
++ * BHIE sends the complete firmware image, including the first segment.
++ */
++int sweet_mhi_download_sbl(struct sweet_mhi *, const void *, size_t);
++/* Install the three event rings used by UMI's stock MHI configuration and
++ * enter M0. Call only once, after SBL has put MHI into READY.
++ */
++int sweet_mhi_prepare_ready(struct sweet_mhi *);
++int sweet_mhi_download_amss(struct sweet_mhi *, const void *, size_t);
++int sweet_mhi_wait_mission(struct sweet_mhi *);
++/* Start the stock UMI QRTR/IPCR channels (20/21) and post bounded receive
++ * buffers. Polling is for bring-up only; production needs MSI event handling.
++ */
++int sweet_mhi_start_ipcr(struct sweet_mhi *);
++int sweet_mhi_poll_ipcr(struct sweet_mhi *, unsigned timeout_ms, unsigned *received);
++int sweet_mhi_send_qrtr_hello(struct sweet_mhi *);
++int sweet_mhi_send_qrtr_packet(struct sweet_mhi *, const void *, size_t,
++	unsigned timeout_ms, uint16_t expected_transaction);
++
++#endif
+--- /dev/null
++++ b/bsd/dev/sweet_mhi.c
+@@ -0,0 +1,791 @@
++/* QCA6390's BHI/BHIE firmware transfer, with UMI's bounded DMA aperture,
++ * from the Xiaomi Mi 10 port of github.com/JopangJovan/hackios-xnu-kernel-umi devices/xiaomi-mi-10
++ * (umi_mhi.c, APSL 2.0); apollo has the same radio and kona MHI setup.
++ * Register layout was checked against the running UMI Android MHI controller.
++ * This is a transport component: it does not turn on rails, initialize PCIe,
++ * select an ath11k chip or expose a network interface by itself.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include "sweet_mhi.h"
++#include <sys/errno.h>
++#include <libkern/libkern.h>
++
++#define SEGMENT_SIZE (512u * 1024u)
++#define IMAGE_LIMIT (16u * 1024u * 1024u)
++#define DMA_START 0xa0000000ull
++#define DMA_END   0xb0000000ull
++#define POLLS 20000u
++#define MHI_CHANNELS 128u
++#define IPCR_TX_CHANNEL 20u
++#define IPCR_RX_CHANNEL 21u
++#define IPCR_EVENT_RING 1u
++#define IPCR_RING_ELEMENTS 32u
++#define IPCR_RX_BUFFERS (IPCR_RING_ELEMENTS - 1u)
++#define IPCR_BUFFER_SIZE 8192u
++#define QRTR_HELLO_SIZE 52u
++#define MHI_COMMAND_POLLS 5000u
++
++static void
++dma_write_barrier(void)
++{
++#if defined(__aarch64__)
++	__asm__ volatile("dmb oshst" ::: "memory");
++#else
++	/* Host software model; the kernel target always uses the outer-shareable barrier. */
++	__atomic_thread_fence(__ATOMIC_RELEASE);
++#endif
++}
++
++static void
++dma_read_barrier(void)
++{
++#if defined(__aarch64__)
++	__asm__ volatile("dmb oshld" ::: "memory");
++#else
++	__atomic_thread_fence(__ATOMIC_ACQUIRE);
++#endif
++}
++
++static bool
++span(uint32_t base, uint32_t length, uint32_t limit)
++{
++	return !(base & 3) && base <= limit && length <= limit - base;
++}
++
++static uint32_t
++read_reg(const struct sweet_mhi *host, uint32_t offset)
++{
++	return host->io->read32(host->io->context, offset);
++}
++
++static void
++write_reg(struct sweet_mhi *host, uint32_t offset, uint32_t value)
++{
++	host->io->write32(host->io->context, offset, value);
++}
++
++static void
++write_address(struct sweet_mhi *host, uint32_t offset, uint64_t address)
++{
++	/* No doorbell is rung until both halves and the size have been written. */
++	write_reg(host, offset + 4, (uint32_t)(address >> 32));
++	write_reg(host, offset, (uint32_t)address);
++}
++
++static uint64_t
++words_address(const uint32_t *words, unsigned index)
++{
++	return words[index] | (uint64_t)words[index + 1] << 32;
++}
++
++static void
++words_set_address(uint32_t *words, unsigned index, uint64_t address)
++{
++	words[index] = (uint32_t)address;
++	words[index + 1] = (uint32_t)(address >> 32);
++}
++
++static uint64_t
++ring_next(uint64_t base, size_t length, uint64_t pointer)
++{
++	pointer += 16;
++	return pointer == base + length ? base : pointer;
++}
++
++static bool
++ring_pointer_valid(uint64_t base, size_t length, uint64_t pointer)
++{
++	return pointer >= base && pointer < base + length && !((pointer - base) & 15);
++}
++
++static void
++report(struct sweet_mhi *host, const char *stage, uint32_t value)
++{
++	if (host->io->report) host->io->report(host->io->context, stage, value);
++}
++
++int
++sweet_mhi_probe(struct sweet_mhi *host, const struct sweet_mhi_io *io)
++{
++	if (!host || !io || !io->read32 || !io->write32 || !io->allocate ||
++	    !io->sync_for_device || !io->delay_us || io->bar_size < 4096) return EINVAL;
++	if (host->io) return EBUSY;
++	uint32_t version = io->read32(io->context, 8);
++	uint32_t length = io->read32(io->context, 0);
++	if (length < 0xa8 || length > io->bar_size) return ENODEV;
++	uint32_t bhi = io->read32(io->context, 0x28);
++	uint32_t bhie = io->read32(io->context, 0x2c);
++	uint32_t channels = io->read32(io->context, 0x18);
++	uint32_t events = io->read32(io->context, 0x20);
++	/* Check every aperture before a caller can issue any firmware transfer. */
++	if (bhi < length || bhie < length || channels < length || events < length ||
++	    !span(bhi, 0x34, io->bar_size) || !span(bhie, 0x7c, io->bar_size) ||
++	    !span(channels, 128 * 8, io->bar_size) || !span(events, 3 * 8, io->bar_size)) return EINVAL;
++	if (io->read32(io->context, bhi + 4) != 1) return ENODEV;
++	/* Real UMI PBL leaves MHIVER at the reserved-register sentinel. Its
++	 * complete BHI layout is readable before the mission-mode version appears. */
++	bool cold_pbl = version == 0xdeadbeef && length == 0x100 &&
++	    bhi == 0x100 && bhie == 0x224 && channels == 0x300 && events == 0x700 &&
++	    io->read32(io->context, bhi + 0x28) == 0;
++	if (version != 0x01000000 && !cold_pbl) return ENODEV;
++	host->io = io;
++	host->bhi = bhi;
++	host->bhie = bhie;
++	host->channel_db = channels;
++	host->event_db = events;
++	host->sequence = 1;
++	report(host, "MHI version", version);
++	return 0;
++}
++
++int
++sweet_mhi_execution_environment(const struct sweet_mhi *host, uint32_t *environment)
++{
++	if (!host || !host->io || !environment) return EINVAL;
++	uint32_t ee = read_reg(host, host->bhi + 0x28);
++	if (ee > 7) return EIO;
++	*environment = ee;
++	return 0;
++}
++
++static int
++allocate(struct sweet_mhi *host, size_t size, struct sweet_mhi_dma *dma)
++{
++	int error = host->io->allocate(host->io->context, size, dma);
++	if (error) return error;
++	if (!dma->bytes || ((uintptr_t)dma->bytes & 7) || dma->size < size || (dma->address & 4095) ||
++	    dma->address < DMA_START || dma->address >= DMA_END ||
++	    dma->size > DMA_END - dma->address) return EINVAL;
++	return 0;
++}
++
++static int
++wait_transfer(struct sweet_mhi *host, uint32_t status_offset, uint32_t sequence, bool check_sequence)
++{
++	uint32_t status = 0;
++	for (unsigned i = 0; i < POLLS; i++) {
++		status = read_reg(host, status_offset);
++		if (status == UINT32_MAX || (status >> 30) == 3) break;
++		if ((status >> 30) == 2 && (!check_sequence || (status & 0x3fffffff) == sequence)) {
++			report(host, "firmware transfer complete", status);
++			return 0;
++		}
++		host->io->delay_us(host->io->context, 1000);
++	}
++	host->poisoned = true;
++	report(host, "firmware transfer failed; DMA retained until endpoint reset", status);
++	return status == UINT32_MAX || (status >> 30) == 3 ? EIO : ETIMEDOUT;
++}
++
++/* MHI context fields are 4-byte aligned, including the 64-bit ring pointers.
++ * Explicit words avoid unaligned 64-bit accesses through an uncached mapping.
++ */
++static void
++context_address(uint32_t *context, unsigned word, uint64_t value)
++{
++	context[word] = (uint32_t)value;
++	context[word + 1] = (uint32_t)(value >> 32);
++}
++
++static void
++setup_stock_channel_contexts(struct sweet_mhi *host)
++{
++	/* Match Linux mhi_init_ctxt(): publish the static UMI channel metadata
++	 * before the controller enters M0 and starts AMSS. Dynamic ring addresses
++	 * and ENABLED state are filled when the IPCR client starts after mission.
++	 */
++	static const struct { unsigned channel, direction; } stock_channels[] = {
++		{ 0, 1 }, { 1, 2 }, { 4, 1 }, { 5, 2 },
++		{ IPCR_TX_CHANNEL, 1 }, { IPCR_RX_CHANNEL, 2 },
++	};
++	for (unsigned i = 0; i < sizeof(stock_channels) / sizeof(stock_channels[0]); i++) {
++		uint32_t *context = (uint32_t *)host->channels.bytes +
++		    stock_channels[i].channel * 11;
++		context[0] = 2u << 8; /* disabled, stock burst mode 2, pollcfg 0 */
++		context[1] = stock_channels[i].direction;
++		context[2] = IPCR_EVENT_RING;
++	}
++}
++
++int
++sweet_mhi_prepare_ready(struct sweet_mhi *host)
++{
++	if (!host || !host->io) return EINVAL;
++	if (host->poisoned) return EIO;
++	if (host->channels.bytes || host->contexts_ready) return EALREADY;
++	if (!host->sbl_sent) return EBUSY;
++	/* BHI completion can precede both the SBL EE and READY/reset transition. */
++	uint32_t status = 0, control = 0, ee = 0;
++	bool ready = false;
++	int error;
++	for (unsigned i = 0; i < POLLS; i++) {
++		status = read_reg(host, 0x48);
++		control = read_reg(host, 0x38);
++		error = sweet_mhi_execution_environment(host, &ee);
++		if (error || status == UINT32_MAX || control == UINT32_MAX || (status & 4)) {
++			host->poisoned = true;
++			return EIO;
++		}
++		if ((ee == 0 || ee == 1) && (status & 1) && !(control & 2) &&
++		    ((status >> 8) & 0xff) == 1) {
++			ready = true;
++			break;
++		}
++		host->io->delay_us(host->io->context, 1000);
++	}
++	if (!ready) {
++		host->poisoned = true;
++		report(host, "READY timeout; SBL DMA retained until endpoint reset", status);
++		return ETIMEDOUT;
++	}
++	uint32_t config = read_reg(host, 0x10);
++	if (config == UINT32_MAX) { host->poisoned = true; return EIO; }
++	struct sweet_mhi_dma *tables[] = { &host->channels, &host->events, &host->commands,
++	    &host->command_ring, &host->event_ring[0], &host->event_ring[1], &host->event_ring[2] };
++	const size_t sizes[] = { 128 * 44, 3 * 44, 44, 128 * 16, 32 * 16, 256 * 16, 32 * 16 };
++	for (unsigned i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
++		error = allocate(host, sizes[i], tables[i]);
++		if (error) return error;
++		memset(tables[i]->bytes, 0, tables[i]->size);
++	}
++	setup_stock_channel_contexts(host);
++	const unsigned elements[] = { 32, 256, 32 }, vectors[] = { 1, 2, 0 };
++	for (unsigned i = 0; i < 3; i++) {
++		uint32_t *context = (uint32_t *)host->events.bytes + i * 11;
++		uint64_t base = host->event_ring[i].address;
++		uint64_t length = elements[i] * 16;
++		context[0] = i == 2 ? 1u << 16 : 0; /* stock interrupt moderation */
++		context[1] = 1;                   /* valid software event ring */
++		context[2] = vectors[i];
++		context_address(context, 3, base);
++		context_address(context, 5, length);
++		context_address(context, 7, base);
++		context_address(context, 9, base + length - 16);
++	}
++	uint32_t *command = host->commands.bytes;
++	context_address(command, 3, host->command_ring.address);
++	context_address(command, 5, 128 * 16);
++	context_address(command, 7, host->command_ring.address);
++	context_address(command, 9, host->command_ring.address);
++	for (unsigned i = 0; i < sizeof(tables) / sizeof(tables[0]); i++)
++		host->io->sync_for_device(host->io->context, tables[i]);
++	for (unsigned i = 0; i < 3; i++) {
++		host->event_consumer[i] = host->event_ring[i].address;
++		host->event_wp[i] = host->event_ring[i].address +
++		    sizes[4 + i] - 16;
++	}
++	host->command_wp = host->command_ring.address;
++	write_address(host, 0x58, host->channels.address);
++	write_address(host, 0x60, host->events.address);
++	write_address(host, 0x68, host->commands.address);
++	write_address(host, 0x80, DMA_START);
++	write_address(host, 0x88, DMA_END);
++	write_address(host, 0x98, DMA_START);
++	write_address(host, 0xa0, DMA_END);
++	write_reg(host, 0x10, (config & 0xffff) | (3u << 16));
++	dma_write_barrier();
++	/* Publish free event entries while READY, before requesting M0. */
++	for (unsigned e = 0; e < 3; e++)
++		write_address(host, host->event_db + e * 8,
++		    host->event_ring[e].address + elements[e] * 16 - 16);
++	write_reg(host, 0x38, (control & ~0xff00u) | 0x200); /* request M0 */
++	for (unsigned i = 0; i < POLLS; i++) {
++		status = read_reg(host, 0x48);
++		if (status == UINT32_MAX || (status & 4)) break;
++		if (((status >> 8) & 0xff) == 2) {
++			/* The stock host initializes the device-wake doorbell to zero and
++			 * only asserts it to leave M2. We are already in M0, so keep it clear. */
++			host->contexts_ready = true;
++			report(host, "MHI contexts installed; M0", status);
++			return 0;
++		}
++		host->io->delay_us(host->io->context, 1000);
++	}
++	host->poisoned = true;
++	report(host, "M0 failed; DMA retained until endpoint reset", status);
++	return status == UINT32_MAX || (status & 4) ? EIO : ETIMEDOUT;
++}
++
++static int
++check_download(struct sweet_mhi *host, const void *image, size_t size, uint32_t wanted_ee)
++{
++	if (!host || !host->io || !image || !size || size > IMAGE_LIMIT) return EINVAL;
++	if (host->poisoned) return EIO;
++	uint32_t ee;
++	int error = sweet_mhi_execution_environment(host, &ee);
++	if (error) return error;
++	if (ee == 2 || ee == 4) return EALREADY;
++	return ee == wanted_ee ? 0 : EBUSY;
++}
++
++int
++sweet_mhi_download_sbl(struct sweet_mhi *host, const void *image, size_t size)
++{
++	int error = check_download(host, image, size, 0); /* PBL */
++	if (error) return error;
++	if (host->sbl.bytes || host->sbl_sent) return EALREADY;
++	size_t length = size < SEGMENT_SIZE ? size : SEGMENT_SIZE;
++	error = allocate(host, length, &host->sbl);
++	if (error) return error;
++	memcpy(host->sbl.bytes, image, length);
++	host->io->sync_for_device(host->io->context, &host->sbl);
++	uint32_t sequence = host->sequence++;
++	write_reg(host, host->bhi + 0x20, 0); /* polling, vector zero */
++	write_reg(host, host->bhi + 0x2c, 0); /* discard previous completion */
++	write_address(host, host->bhi + 8, host->sbl.address);
++	write_reg(host, host->bhi + 0x10, (uint32_t)length);
++	dma_write_barrier();
++	write_reg(host, host->bhi + 0x18, sequence);
++	error = wait_transfer(host, host->bhi + 0x2c, sequence, false);
++	if (!error) host->sbl_sent = true;
++	return error;
++}
++
++int
++sweet_mhi_download_amss(struct sweet_mhi *host, const void *image, size_t size)
++{
++	int error = check_download(host, image, size, 1); /* SBL */
++	if (error) return error;
++	if (!host->sbl_sent || !host->contexts_ready) return EBUSY;
++	/* SBL firmware download needs the host's READY/context/M0 setup first. */
++	if (((read_reg(host, 0x48) >> 8) & 0xff) != 2) return EBUSY;
++	if (host->image.bytes || host->vectors.bytes || host->amss_sent) return EALREADY;
++	/* The full image is segmented, not just the bytes after the initial SBL. */
++	uint32_t count = (uint32_t)((size + SEGMENT_SIZE - 1) / SEGMENT_SIZE);
++	error = allocate(host, size, &host->image);
++	if (error) return error;
++	error = allocate(host, count * 16u, &host->vectors);
++	if (error) return error;
++	memcpy(host->image.bytes, image, size);
++	uint64_t *vectors = host->vectors.bytes;
++	for (uint32_t i = 0; i < count; i++) {
++		size_t offset = (size_t)i * SEGMENT_SIZE;
++		size_t length = size - offset;
++		if (length > SEGMENT_SIZE) length = SEGMENT_SIZE;
++		/* ARM64 UMI is little endian, as are the MHI vector entries. */
++		vectors[2 * i] = host->image.address + offset;
++		vectors[2 * i + 1] = length;
++	}
++	host->io->sync_for_device(host->io->context, &host->image);
++	host->io->sync_for_device(host->io->context, &host->vectors);
++	uint32_t sequence = host->sequence++;
++	write_address(host, host->bhie + 0x2c, host->vectors.address);
++	write_reg(host, host->bhie + 0x34, count * 16u);
++	dma_write_barrier();
++	write_reg(host, host->bhie + 0x3c, sequence);
++	error = wait_transfer(host, host->bhie + 0x44, sequence, true);
++	if (!error) host->amss_sent = true;
++	return error;
++}
++
++int
++sweet_mhi_wait_mission(struct sweet_mhi *host)
++{
++	if (!host || !host->io) return EINVAL;
++	if (host->poisoned) return EIO;
++	if (!host->amss_sent) return EBUSY;
++	uint32_t ee = 0;
++	for (unsigned i = 0; i < POLLS; i++) {
++		int error = sweet_mhi_execution_environment(host, &ee);
++		if (error || (ee != 1 && ee != 2 && ee != 4)) {
++			host->poisoned = true;
++			return EIO;
++		}
++		if (ee == 2 || ee == 4) {
++			report(host, "firmware mission environment", ee);
++			return 0;
++		}
++		host->io->delay_us(host->io->context, 1000);
++	}
++	host->poisoned = true;
++	report(host, "mission environment timeout; DMA retained until endpoint reset", ee);
++	return ETIMEDOUT;
++}
++
++/* Recycle event entries in the same format as the Linux MHI host. Device RP
++ * lives in each event context; host WP is advanced after consuming entries.
++ */
++static int
++service_event_ring(struct sweet_mhi *host, unsigned ring, uint64_t command,
++	int *command_cc, unsigned *received)
++{
++	if (ring >= 3 || !host->event_ring[ring].bytes) return EINVAL;
++	static const size_t ring_lengths[] = { 32u * 16u, 256u * 16u, 32u * 16u };
++	uint32_t *context = (uint32_t *)host->events.bytes + ring * 11;
++	uint64_t base = host->event_ring[ring].address;
++	size_t length = ring_lengths[ring];
++	uint64_t producer = words_address(context, 7);
++	if (!ring_pointer_valid(base, length, producer)) return EIO;
++	unsigned processed = 0;
++	while (host->event_consumer[ring] != producer && processed < length / 16) {
++		uint64_t current = host->event_consumer[ring];
++		size_t offset = (size_t)(current - base);
++		volatile uint32_t *event = (volatile uint32_t *)
++		    ((volatile uint8_t *)host->event_ring[ring].bytes + offset);
++		dma_read_barrier();
++		uint64_t pointer = event[0] | (uint64_t)event[1] << 32;
++		uint32_t dword0 = event[2], dword1 = event[3];
++		unsigned type = (dword1 >> 16) & 0xff;
++		unsigned code = dword0 >> 24;
++		if (ring == 0 && type == 0x21 && pointer == command && command_cc)
++			*command_cc = (int)code;
++		if (type == 0x20 || type == 0x21 || type == 0x40 ||
++		    (type != 0x22 && ring == 0)) {
++			report(host, "MHI control event type/code", (type << 24) | code);
++			report(host, "MHI control event data", dword1);
++		}
++		if (ring == IPCR_EVENT_RING && type == 0x22 &&
++		    ((dword1 >> 24) & 0xff) == IPCR_TX_CHANNEL) {
++			if (!host->ipcr_tx_pending || pointer !=
++			    host->ipcr_tx_ring.address + (uint64_t)host->ipcr_tx_slot * 16u) {
++				report(host, "IPCR TX completion descriptor mismatch", (uint32_t)pointer);
++				return EIO;
++			}
++			report(host, "IPCR TX completion code/bytes", (code << 24) | (dword0 & 0xffff));
++			host->ipcr_tx_pending = false;
++			host->ipcr_tx_done = code == 2; /* transfer EOT, unlike command CC_SUCCESS=1 */
++			if (code != 2) return EIO;
++		}
++		if (ring == IPCR_EVENT_RING && type == 0x22 &&
++		    ((dword1 >> 24) & 0xff) == IPCR_RX_CHANNEL) {
++			uint32_t length_done = dword0 & 0xffff;
++			if (pointer < host->ipcr_rx_ring.address ||
++			    pointer >= host->ipcr_rx_ring.address + host->ipcr_rx_ring.size ||
++			    ((pointer - host->ipcr_rx_ring.address) & 15)) {
++				report(host, "IPCR RX completion descriptor out of range",
++				    (uint32_t)pointer);
++				return EIO;
++			}
++			unsigned tre_slot = (unsigned)((pointer - host->ipcr_rx_ring.address) / 16);
++			const volatile uint32_t *completed_tre = (const volatile uint32_t *)
++			    ((const volatile uint8_t *)host->ipcr_rx_ring.bytes + tre_slot * 16u);
++			dma_read_barrier();
++			uint64_t buffer = completed_tre[0] |
++			    (uint64_t)completed_tre[1] << 32;
++			if (buffer < host->ipcr_rx_buffers.address ||
++			    buffer >= host->ipcr_rx_buffers.address + host->ipcr_rx_buffers.size ||
++			    ((buffer - host->ipcr_rx_buffers.address) % IPCR_BUFFER_SIZE) ||
++			    length_done > IPCR_BUFFER_SIZE) return EIO;
++			unsigned slot = (unsigned)((buffer - host->ipcr_rx_buffers.address) /
++			    IPCR_BUFFER_SIZE);
++			const volatile uint8_t *packet_bytes =
++			    (const volatile uint8_t *)host->ipcr_rx_buffers.bytes +
++			    (size_t)slot * IPCR_BUFFER_SIZE;
++			if (host->ipcr_waiting_response && length_done >= 35 &&
++			    packet_bytes[0] == 1 && packet_bytes[4] == 1 &&
++			    packet_bytes[32] == 2 &&
++			    ((uint16_t)packet_bytes[33] | (uint16_t)packet_bytes[34] << 8) ==
++			    host->ipcr_wait_transaction)
++				host->ipcr_response_done = true;
++			if (host->io->qrtr_packet)
++				host->io->qrtr_packet(host->io->context,
++				    (const void *)(uintptr_t)packet_bytes, length_done);
++			if (received) ++*received;
++			report(host, "IPCR RX completion code/bytes", (code << 24) | length_done);
++			/* Repost the completed payload buffer at the producer end of the RX ring. */
++			uint64_t next = host->ipcr_rx_wp;
++			size_t rx_offset = (size_t)(next - host->ipcr_rx_ring.address);
++			volatile uint32_t *tre = (volatile uint32_t *)
++			    ((volatile uint8_t *)host->ipcr_rx_ring.bytes + rx_offset);
++			tre[0] = (uint32_t)buffer;
++			tre[1] = (uint32_t)(buffer >> 32);
++			tre[2] = IPCR_BUFFER_SIZE;
++			tre[3] = (2u << 16) | (1u << 9); /* transfer, interrupt on EOT */
++			host->ipcr_rx_wp = ring_next(host->ipcr_rx_ring.address,
++			    IPCR_RING_ELEMENTS * 16u, next);
++			uint32_t *channel = (uint32_t *)host->channels.bytes + IPCR_RX_CHANNEL * 11;
++			words_set_address(channel, 9, host->ipcr_rx_wp);
++			host->io->sync_for_device(host->io->context, &host->ipcr_rx_ring);
++			write_address(host, host->channel_db + IPCR_RX_CHANNEL * 8,
++			    host->ipcr_rx_wp);
++		}
++		host->event_consumer[ring] = ring_next(base, length, current);
++		host->event_wp[ring] = ring_next(base, length, host->event_wp[ring]);
++		processed++;
++	}
++	if (processed == length / 16 && host->event_consumer[ring] != producer)
++		return ELOOP;
++	if (processed) {
++		words_set_address(context, 9, host->event_wp[ring]);
++		host->io->sync_for_device(host->io->context, &host->events);
++		write_address(host, host->event_db + ring * 8, host->event_wp[ring]);
++	}
++	return 0;
++}
++
++static int
++send_nop(struct sweet_mhi *host)
++{
++	uint64_t base = host->command_ring.address;
++	size_t length = 128u * 16u;
++	uint64_t command = host->command_wp;
++	if (!ring_pointer_valid(base, length, command)) return EINVAL;
++	volatile uint32_t *tre = (volatile uint32_t *)
++	    ((volatile uint8_t *)host->command_ring.bytes + (size_t)(command - base));
++	tre[0] = tre[1] = tre[2] = 0;
++	tre[3] = 1u << 16; /* MHI_CMD_NOP */
++	uint64_t next = ring_next(base, length, command);
++	uint32_t *context = host->commands.bytes;
++	words_set_address(context, 9, next);
++	host->io->sync_for_device(host->io->context, &host->command_ring);
++	host->io->sync_for_device(host->io->context, &host->commands);
++	dma_write_barrier();
++	write_address(host, 0x70, next);
++	int completion = -1;
++	for (unsigned i = 0; i < MHI_COMMAND_POLLS; i++) {
++		for (unsigned ring = 0; ring < 3; ring++) {
++			int error = service_event_ring(host, ring, command, &completion, NULL);
++			if (error) { host->poisoned = true; return error; }
++		}
++		if (completion >= 0) {
++			host->command_wp = next;
++			report(host, "MHI NOP completion code", completion);
++			if (completion == 1) return 0;
++			host->poisoned = true;
++			return EIO;
++		}
++		host->io->delay_us(host->io->context, 1000);
++	}
++	report(host, "MHI NOP timed out", read_reg(host, 0x48));
++	host->poisoned = true;
++	return ETIMEDOUT;
++}
++
++static int
++start_channel(struct sweet_mhi *host, unsigned channel)
++{
++	uint64_t base = host->command_ring.address;
++	size_t length = 128u * 16u;
++	uint64_t command = host->command_wp;
++	if (!ring_pointer_valid(base, length, command)) return EINVAL;
++	volatile uint32_t *tre = (volatile uint32_t *)
++	    ((volatile uint8_t *)host->command_ring.bytes + (size_t)(command - base));
++	tre[0] = tre[1] = tre[2] = 0;
++	tre[3] = (channel << 24) | (18u << 16); /* START_CHAN */
++	uint64_t next = ring_next(base, length, command);
++	uint32_t *context = host->commands.bytes;
++	words_set_address(context, 9, next);
++	host->io->sync_for_device(host->io->context, &host->command_ring);
++	host->io->sync_for_device(host->io->context, &host->commands);
++	dma_write_barrier();
++	report(host, "MHI status before channel start", read_reg(host, 0x48));
++	report(host, "MHI control before channel start", read_reg(host, 0x38));
++	report(host, "MHI EE before channel start", read_reg(host, host->bhi + 0x28));
++	report(host, "MHI command ring base low", (uint32_t)base);
++	report(host, "MHI command ring new WP low", (uint32_t)next);
++	write_address(host, 0x70, next);
++	int completion = -1;
++	for (unsigned i = 0; i < MHI_COMMAND_POLLS; i++) {
++		for (unsigned ring = 0; ring < 3; ring++) {
++			int error = service_event_ring(host, ring, command, &completion, NULL);
++			if (error) { host->poisoned = true; return error; }
++		}
++		if (completion >= 0) {
++			host->command_wp = next;
++			if (completion == 1) {
++				report(host, "MHI channel started", channel);
++				return 0;
++			}
++			report(host, "MHI channel start completion code", (channel << 16) | completion);
++			host->poisoned = true;
++			return EIO;
++		}
++		host->io->delay_us(host->io->context, 1000);
++	}
++	host->poisoned = true;
++	report(host, "MHI channel start timed out", channel);
++	uint32_t *command_context = host->commands.bytes;
++	uint32_t *channel_context = (uint32_t *)host->channels.bytes + channel * 11;
++	uint32_t *control_event = host->events.bytes;
++	report(host, "MHI status after channel timeout", read_reg(host, 0x48));
++	report(host, "MHI control after channel timeout", read_reg(host, 0x38));
++	report(host, "MHI command RP low", command_context[7]);
++	report(host, "MHI command WP low", command_context[9]);
++	report(host, "MHI channel state/type/ring", (channel_context[0] & 0xffff) |
++	    (channel_context[1] << 16));
++	report(host, "MHI channel WP low", channel_context[9]);
++	report(host, "MHI control event RP low", control_event[7]);
++	uint64_t event_base = host->event_ring[0].address;
++	uint64_t event_current = host->event_consumer[0];
++	if (event_current >= event_base && event_current < event_base + 32u * 16u) {
++		volatile uint32_t *pending = (volatile uint32_t *)
++		    ((volatile uint8_t *)host->event_ring[0].bytes +
++		    (size_t)(event_current - event_base));
++		dma_read_barrier();
++		report(host, "MHI pending command event pointer low", pending[0]);
++		report(host, "MHI pending command event dword0", pending[2]);
++		report(host, "MHI pending command event dword1", pending[3]);
++	}
++	return ETIMEDOUT;
++}
++
++static void
++setup_ipcr_channel(struct sweet_mhi *host, unsigned channel, unsigned direction,
++	const struct sweet_mhi_dma *ring, uint64_t write_pointer)
++{
++	uint32_t *context = (uint32_t *)host->channels.bytes + channel * 11;
++	memset(context, 0, 11 * sizeof(*context));
++	context[0] = 1u | (2u << 8); /* ENABLED, burst mode disabled */
++	context[1] = direction;
++	context[2] = IPCR_EVENT_RING;
++	words_set_address(context, 3, ring->address);
++	words_set_address(context, 5, IPCR_RING_ELEMENTS * 16u);
++	words_set_address(context, 7, ring->address);
++	words_set_address(context, 9, write_pointer);
++}
++
++int
++sweet_mhi_start_ipcr(struct sweet_mhi *host)
++{
++	if (!host || !host->io) return EINVAL;
++	if (host->poisoned) return EIO;
++	if (!host->contexts_ready || !host->amss_sent) return EBUSY;
++	if (host->ipcr_started || host->ipcr_tx_ring.bytes || host->ipcr_tx_buffers.bytes ||
++	    host->ipcr_rx_ring.bytes || host->ipcr_rx_buffers.bytes) return EALREADY;
++	uint32_t ee;
++	int error = sweet_mhi_execution_environment(host, &ee);
++	if (error || (ee != 2 && ee != 4)) return error ? error : EBUSY;
++	error = allocate(host, IPCR_RING_ELEMENTS * 16u, &host->ipcr_tx_ring);
++	if (!error) error = allocate(host, IPCR_RING_ELEMENTS * IPCR_BUFFER_SIZE,
++	    &host->ipcr_tx_buffers);
++	if (!error) error = allocate(host, IPCR_RING_ELEMENTS * 16u, &host->ipcr_rx_ring);
++	if (!error) error = allocate(host, IPCR_RX_BUFFERS * IPCR_BUFFER_SIZE,
++	    &host->ipcr_rx_buffers);
++	if (error) return error;
++	memset(host->ipcr_tx_ring.bytes, 0, host->ipcr_tx_ring.size);
++	memset(host->ipcr_tx_buffers.bytes, 0, host->ipcr_tx_buffers.size);
++	memset(host->ipcr_rx_ring.bytes, 0, host->ipcr_rx_ring.size);
++	memset(host->ipcr_rx_buffers.bytes, 0, host->ipcr_rx_buffers.size);
++	setup_ipcr_channel(host, IPCR_TX_CHANNEL, 1, &host->ipcr_tx_ring,
++	    host->ipcr_tx_ring.address);
++	host->ipcr_tx_wp = host->ipcr_tx_ring.address;
++	host->ipcr_rx_wp = host->ipcr_rx_ring.address;
++	setup_ipcr_channel(host, IPCR_RX_CHANNEL, 2, &host->ipcr_rx_ring,
++	    host->ipcr_rx_wp);
++	host->io->sync_for_device(host->io->context, &host->ipcr_tx_ring);
++	host->io->sync_for_device(host->io->context, &host->ipcr_tx_buffers);
++	host->io->sync_for_device(host->io->context, &host->ipcr_rx_ring);
++	host->io->sync_for_device(host->io->context, &host->ipcr_rx_buffers);
++	host->io->sync_for_device(host->io->context, &host->channels);
++	dma_write_barrier();
++	/* Retire M0 and EE notifications before the channel client starts, as the
++	 * stock MHI control-event worker does before it creates the IPCR device.
++	 */
++	for (unsigned ring = 0; ring < 3; ring++) {
++		error = service_event_ring(host, ring, UINT64_MAX, NULL, NULL);
++		if (error) { host->poisoned = true; return error; }
++	}
++	error = send_nop(host);
++	if (error) return error;
++	/* Match the stock driver: start UL first, then DL, and queue DL buffers
++	 * after START completion so the device sees an empty channel initially.
++	 */
++	error = start_channel(host, IPCR_TX_CHANNEL);
++	if (!error) error = start_channel(host, IPCR_RX_CHANNEL);
++	if (error) { host->poisoned = true; return error; }
++	for (unsigned i = 0; i < IPCR_RX_BUFFERS; i++) {
++		uint32_t *tre = (uint32_t *)host->ipcr_rx_ring.bytes + i * 4;
++		uint64_t buffer = host->ipcr_rx_buffers.address + (uint64_t)i * IPCR_BUFFER_SIZE;
++		tre[0] = (uint32_t)buffer;
++		tre[1] = (uint32_t)(buffer >> 32);
++		tre[2] = IPCR_BUFFER_SIZE;
++		tre[3] = (2u << 16) | (1u << 9); /* transfer, interrupt on EOT */
++	}
++	host->ipcr_rx_wp = host->ipcr_rx_ring.address + IPCR_RX_BUFFERS * 16u;
++	uint32_t *rx_context = (uint32_t *)host->channels.bytes + IPCR_RX_CHANNEL * 11;
++	words_set_address(rx_context, 9, host->ipcr_rx_wp);
++	host->io->sync_for_device(host->io->context, &host->ipcr_rx_ring);
++	host->io->sync_for_device(host->io->context, &host->channels);
++	dma_write_barrier();
++	write_address(host, host->channel_db + IPCR_RX_CHANNEL * 8,
++	    host->ipcr_rx_wp);
++	host->ipcr_started = true;
++	return 0;
++}
++
++int
++sweet_mhi_poll_ipcr(struct sweet_mhi *host, unsigned timeout_ms, unsigned *received)
++{
++	if (!host || !host->io || !received) return EINVAL;
++	if (host->poisoned) return EIO;
++	if (!host->ipcr_started) return EBUSY;
++	if (!timeout_ms || timeout_ms > 10000) return EINVAL;
++	*received = 0;
++	for (unsigned i = 0; i < timeout_ms; i++) {
++		for (unsigned ring = 0; ring < 3; ring++) {
++			int error = service_event_ring(host, ring, UINT64_MAX, NULL, received);
++			if (error) { host->poisoned = true; return error; }
++		}
++		host->io->delay_us(host->io->context, 1000);
++	}
++	if (*received) report(host, "IPCR receive events", *received);
++	return 0;
++}
++
++int
++sweet_mhi_send_qrtr_packet(struct sweet_mhi *host, const void *packet,
++	size_t length, unsigned timeout_ms, uint16_t expected_transaction)
++{
++	if (!host || !host->io) return EINVAL;
++	if (host->poisoned) return EIO;
++	if (!host->ipcr_started) return EBUSY;
++	if (host->ipcr_tx_pending || !packet || !length ||
++	    length > IPCR_BUFFER_SIZE || !timeout_ms || timeout_ms > 15000) return EINVAL;
++	uint64_t ring_base = host->ipcr_tx_ring.address;
++	uint64_t command = host->ipcr_tx_wp;
++	if (!ring_pointer_valid(ring_base, IPCR_RING_ELEMENTS * 16u, command)) return EINVAL;
++	unsigned slot = (unsigned)((command - ring_base) / 16u);
++	uint64_t buffer_address = host->ipcr_tx_buffers.address +
++	    (uint64_t)slot * IPCR_BUFFER_SIZE;
++	memcpy((uint8_t *)host->ipcr_tx_buffers.bytes +
++	    (size_t)slot * IPCR_BUFFER_SIZE, packet, length);
++	volatile uint32_t *tre = (volatile uint32_t *)
++	    ((volatile uint8_t *)host->ipcr_tx_ring.bytes + (size_t)(command - ring_base));
++	tre[0] = (uint32_t)buffer_address;
++	tre[1] = (uint32_t)(buffer_address >> 32);
++	tre[2] = (uint32_t)length;
++	tre[3] = (2u << 16) | (1u << 9); /* transfer, interrupt on EOT */
++	uint64_t next = ring_next(ring_base, IPCR_RING_ELEMENTS * 16u, command);
++	uint32_t *context = (uint32_t *)host->channels.bytes + IPCR_TX_CHANNEL * 11;
++	words_set_address(context, 9, next);
++	host->ipcr_tx_slot = slot;
++	host->ipcr_tx_wp = next;
++	host->ipcr_tx_pending = true;
++	host->ipcr_tx_done = false;
++	host->ipcr_waiting_response = expected_transaction != UINT16_MAX;
++	host->ipcr_wait_transaction = expected_transaction;
++	host->ipcr_response_done = !host->ipcr_waiting_response;
++	host->io->sync_for_device(host->io->context, &host->ipcr_tx_buffers);
++	host->io->sync_for_device(host->io->context, &host->ipcr_tx_ring);
++	host->io->sync_for_device(host->io->context, &host->channels);
++	dma_write_barrier();
++	write_address(host, host->channel_db + IPCR_TX_CHANNEL * 8u, next);
++	unsigned received = 0;
++	for (unsigned i = 0; i < timeout_ms; i++) {
++		for (unsigned ring = 0; ring < 3; ring++) {
++			int error = service_event_ring(host, ring, UINT64_MAX, NULL, &received);
++			if (error) { host->poisoned = true; return error; }
++		}
++		if (host->ipcr_tx_done && host->ipcr_response_done) {
++			host->ipcr_waiting_response = false;
++			report(host, "QRTR packet transmitted", (uint32_t)buffer_address);
++			return 0;
++		}
++		host->io->delay_us(host->io->context, 1000);
++	}
++	host->poisoned = true;
++	report(host, "QRTR packet timeout; status", read_reg(host, 0x48));
++	return ETIMEDOUT;
++}
++
++int
++sweet_mhi_send_qrtr_hello(struct sweet_mhi *host)
++{
++	uint32_t hello[13] = {
++		1u, 2u, 1u, 0xfffffffeu, 0u, 20u, 0xffffffffu, 0xfffffffeu,
++		2u, 0u, 0u, 0u, 0u,
++	};
++	return sweet_mhi_send_qrtr_packet(host, hello, QRTR_HELLO_SIZE, 5000,
++	    UINT16_MAX);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- /dev/null
++++ b/bsd/dev/sweet_wifi.c
+@@ -0,0 +1,872 @@
++/*
++ * Wi-Fi of apollo (QCA6390 on PCIe0), phase 1: power, link, firmware boot.
++ * Nothing runs unless boot-arg sweetwifi=N asks for steps 1..N. The steps
++ * run in a thread of their own, sweetwifidelay seconds (default 5) after the
++ * root is mounted, and leave the radio held in reset afterwards.
++ *
++ * Ported from the Xiaomi Mi 10 (umi: the same SM8250 and QCA6390) bring-up
++ * of github.com/JopangJovan/hackios-xnu-kernel-umi, devices/xiaomi-mi-10
++ * (umi_wifi.c, umi_pcie.c, umi_mhi.c, umi_rpmh.c), with the apps SMMU
++ * context of HackiOS (github.com/oosexgang/hackios-xnu-kernel,
++ * bsd/dev/hakios.wifi.c); APSL 2.0. Apollo's kona DT has the same PCIe0
++ * (identical PHY sequence; PERST GPIO 79, CLKREQ 80, WAKE 81), wlan-en
++ * GPIO 20, MSI 0x17a10040 = SPI 768.. and SMMU stream 0x1c01. Its one
++ * difference is the radio's digital rail: PM8150 S6, not PM8009 S2
++ * (apollo-sm8250.dtsi &wlan), see sweet_rpmh_wifi_power().
++ *
++ *   1  read   GCC PCIe0 clocks/resets and the radio's pins (TLMM north)
++ *   2  write  rails (RPMh), wlan-en, PCIe0 clocks, PHY and link; reads the
++ *             QCA6390's ID (17cb:1101), BAR and MHI registers and which
++ *             apps SMMU match registers exist; bus mastering stays off
++ *   3  write  a free apps SMMU context for stream 0x1c01 with empty tables,
++ *             read back (the hypervisor decides), put back as found
++ *   4  write  that context with our tables, WLAON power control, MSI, bus
++ *             mastering; BHI download of the firmware's first 512 KiB
++ *             (/sweet-wifi "amss" in the ADT: mkadt.py --wifi-fw amss.bin)
++ *   5  write  MHI contexts and event rings, M0
++ *   6  write  BHIe download of the whole firmware; mission mode
++ *   7  talk   QRTR on MHI channels 20/21: hello, then sweetwifipoll ms
++ *             (default 5000) of what the firmware announces (the WLAN
++ *             firmware service is 0x45)
++ * Afterwards PERST and wlan-en go low and the SMMU is put back as found.
++ * The rails stay voted (shared with Bluetooth and the PCIe/UFS PHYs).
++ * No interrupt is taken: MHI's rings are polled.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <mach/vm_param.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++#include "sweet_pcie.h"
++#include "sweet_mhi.h"
++
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++extern uint64_t kvtophys(vm_offset_t);
++extern kern_return_t thread_terminate(thread_t);
++extern int hz;
++extern int sweet_rpmh_wifi_power(void);
++void sweet_wifi_init(void);
++
++static uint32_t wifi_steps, wifi_delay = 5, wifi_poll_ms = 5000;
++
++static uint32_t
++wifi_rd(vm_offset_t va)
++{
++	uint32_t v = *(volatile uint32_t *)va;
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wifi_wr(vm_offset_t va, uint32_t value)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)va = value;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/* ---- registers ----------------------------------------------------------------------- */
++
++/* Mapped once in kernel_map (not the 8 MiB io_submap) and never unmapped. */
++static struct {
++	uint32_t pa, size;
++	vm_offset_t va;
++} wifi_regions[] = {
++	{ 0x00100000u, 0xa0000u, 0 },   /* GCC, including the PCIe TBU clock */
++	{ 0x0f900000u, 0x80000u, 0 },   /* TLMM north tile: GPIO 20, 79-81, 124 */
++	{ 0x01c00000u, 0x3000u, 0 },    /* PCIe0 PARF */
++	{ 0x01c06000u, 0x1000u, 0 },    /* PCIe0 QMP PHY */
++	{ 0x60000000u, 0x1000u, 0 },    /* DBI + ELBI */
++	{ 0x60001000u, 0x1000u, 0 },    /* unrolled outbound iATU */
++	{ 0x60100000u, 0x1000u, 0 },    /* endpoint configuration (CFG0 window) */
++	{ 0x60300000u, 0x100000u, 0 },  /* QCA6390 BAR */
++};
++#define WIFI_BAR        0x60300000u
++
++static bool
++wifi_map_regions(void)
++{
++	for (unsigned i = 0; i < sizeof(wifi_regions) / sizeof(wifi_regions[0]); i++) {
++		if (wifi_regions[i].va) {
++			continue;
++		}
++		wifi_regions[i].va = ml_io_map_unmappable(wifi_regions[i].pa, wifi_regions[i].size, VM_WIMG_IO);
++		if (!wifi_regions[i].va) {
++			printf("SWEET WIFI: cannot map %#x (+%#x)\n", wifi_regions[i].pa, wifi_regions[i].size);
++			return false;
++		}
++	}
++	return true;
++}
++
++static vm_offset_t
++wifi_reg(uint32_t pa)
++{
++	if (pa & 3) {
++		return 0;
++	}
++	for (unsigned i = 0; i < sizeof(wifi_regions) / sizeof(wifi_regions[0]); i++) {
++		uint32_t offset = pa - wifi_regions[i].pa;
++		if (wifi_regions[i].va && offset <= wifi_regions[i].size - 4) {
++			return wifi_regions[i].va + offset;
++		}
++	}
++	printf("SWEET WIFI: unmapped register %#x\n", pa);
++	return 0;
++}
++
++static uint32_t
++pcie_read(void *context, uint32_t pa)
++{
++	(void)context;
++	vm_offset_t va = wifi_reg(pa);
++	return va ? wifi_rd(va) : UINT32_MAX;
++}
++
++static void
++pcie_write(void *context, uint32_t pa, uint32_t value)
++{
++	(void)context;
++	vm_offset_t va = wifi_reg(pa);
++	if (va) {
++		wifi_wr(va, value);
++	}
++}
++
++static int
++pcie_power(void *context)
++{
++	(void)context;
++	return sweet_rpmh_wifi_power();
++}
++
++static void
++pcie_delay(void *context, unsigned us)
++{
++	(void)context;
++	delay((int)us);
++}
++
++static void
++pcie_report(void *context, const char *stage, uint32_t value)
++{
++	(void)context;
++	printf("SWEET WIFI: %s = %#x\n", stage, value);
++}
++
++/* Step 1: always-readable GCC and TLMM only; nothing behind PCIe0. */
++static void
++wifi_survey(void)
++{
++	static const struct { const char *name; uint32_t offset; } clocks[] = {
++		{ "pcie0_bcr", 0x6b000 }, { "pcie0_gdsc", 0x6b004 },
++		{ "pcie0_clock_votes", 0x52008 }, { "pcie0_slv_q2a", 0x6b010 },
++		{ "pcie0_slv_axi", 0x6b014 }, { "pcie0_mstr_axi", 0x6b01c },
++		{ "pcie0_cfg_ahb", 0x6b024 }, { "pcie0_aux", 0x6b028 },
++		{ "pcie0_pipe", 0x6b02c }, { "pcie0_aux_cmd", 0x6b038 },
++		{ "pcie0_aux_cfg", 0x6b03c }, { "pcie0_phy_bcr", 0x6c01c },
++		{ "pcie0_phy_refgen", 0x6f02c }, { "pcie0_clkref", 0x8c004 },
++	};
++	static const struct { const char *name; uint32_t pin; } pins[] = {
++		{ "wlan_en", 20 }, { "bt_en", 21 }, { "pcie0_perst", 79 },
++		{ "pcie0_clkreq", 80 }, { "pcie0_wake", 81 }, { "wlan_sw_ctrl", 124 },
++	};
++	printf("SWEET WIFI: step 1: QCA6390 on PCIe0; read-only GCC/TLMM survey\n");
++	for (unsigned i = 0; i < sizeof(clocks) / sizeof(clocks[0]); i++) {
++		printf("SWEET WIFI: GCC %s (%#x) = %#x\n", clocks[i].name, 0x00100000u + clocks[i].offset,
++		    pcie_read(NULL, 0x00100000u + clocks[i].offset));
++	}
++	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
++		printf("SWEET WIFI: GPIO%u %s cfg=%#x io=%#x\n", pins[i].pin, pins[i].name,
++		    pcie_read(NULL, 0x0f900000u + pins[i].pin * 0x1000u),
++		    pcie_read(NULL, 0x0f900000u + pins[i].pin * 0x1000u + 4));
++	}
++}
++
++/* ---- the radio's view of memory: a context of the apps SMMU ------------------------ */
++
++/*
++ * The boot chain sets nothing up for stream 0x1c01 (PCIe0 base 0x1c00 +
++ * BDF-to-SID offset 1, kona DT iommu-map), and a stream nobody matches
++ * faults. Before the radio may master the bus it gets the first free stream
++ * match register and the lowest context no match register uses, with our
++ * page tables: IOVA 0xa0000000..0xb0000000 (the MHI aperture), 4 KiB pages,
++ * non-cacheable. Every register written is put back when the steps end.
++ */
++#define SMMU_PA                 0x15000000u
++#define SMMU_SIZE               0x100000u
++#define SMMU_SCR0               0x000
++#define SMMU_IDR0               0x020
++#define SMMU_IDR1               0x024
++#define SMMU_SGFSR              0x048
++#define SMMU_SGFSYNR0           0x050
++#define SMMU_SGFSYNR1           0x054
++#define SMMU_SMR(n)             (0x800u + 4u * (n))
++#define SMMU_S2CR(n)            (0xc00u + 4u * (n))
++#define SMMU_CBAR(n)            (4u * (n))              /* second page */
++#define SMMU_CBA2R(n)           (0x800u + 4u * (n))     /* second page */
++#define SMMU_CBAR_STAGE_1       (1u << 16 | 3u << 8 | 0xfu << 12)
++#define SMMU_CB_SCTLR           0x00
++#define SMMU_CB_TCR2            0x10
++#define SMMU_CB_TTBR0           0x20
++#define SMMU_CB_TTBR1           0x28
++#define SMMU_CB_TCR             0x30
++#define SMMU_CB_MAIR0           0x38
++#define SMMU_CB_MAIR1           0x3c
++#define SMMU_CB_FSR             0x58
++#define SMMU_CB_FAR             0x60
++#define SMMU_CB_FSYNR0          0x68
++#define SMMU_CB_TLBIASID        0x610
++#define SMMU_CB_TLBSYNC         0x7f0
++#define SMMU_CB_TLBSTATUS       0x7f4
++#define SMMU_SCTLR_ON           (1u << 0 | 1u << 1 | 1u << 2 | 1u << 5 | 1u << 8 | 1u << 12)
++#define SMMU_TCR_39_BITS        (25u | 1u << 8 | 1u << 10 | 3u << 12 | 1u << 23)
++#define SMMU_TCR2               (1u | 1u << 4 | 7u << 15)       /* 36-bit PA, 16-bit ASID */
++#define SMMU_MAIR0              0xf404ff44u     /* 0 non-cacheable, 1 cached, 2 device */
++#define SMMU_FSR_ALL            0xc00001feu
++#define RADIO_STREAM            0x1c01u
++#define RADIO_IOVA              0xa0000000ull
++#define RADIO_IOVA_SIZE         0x10000000ull
++#define RADIO_TABLES            130u            /* root, one level 2, 128 level 3: the whole 256 MiB */
++#define RADIO_PTE               (3ull | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11)
++#define RADIO_PTE_DEVICE        (RADIO_PTE | 2ull << 2 | 1ull << 53 | 1ull << 54)
++#define PTE_ADDRESS             0x0000fffffffff000ull
++/* PCIe0's MSI controller (kona-pcie.dtsi pcie0_msi): the GIC-600's message
++ * SPI register; writing N raises INTID N. Vectors 0.. = SPI 768.. = INTID 800.. */
++#define RADIO_MSI_REGISTER      0x17a10040ull
++#define RADIO_MSI_DATA          (768u + 32u)
++
++static const uint32_t smmu_saved_offsets[] = {
++	SMMU_CB_SCTLR, SMMU_CB_TCR2, SMMU_CB_TTBR0, SMMU_CB_TTBR0 + 4, SMMU_CB_TTBR1,
++	SMMU_CB_TTBR1 + 4, SMMU_CB_TCR, SMMU_CB_MAIR0, SMMU_CB_MAIR1,
++};
++#define SMMU_SAVED      (sizeof(smmu_saved_offsets) / sizeof(smmu_saved_offsets[0]))
++
++static struct {
++	vm_offset_t base;
++	bool found, installed;
++	uint32_t page, pages, match, context;
++	uint32_t old_smr, old_s2cr, cbar, cba2r, saved[SMMU_SAVED];
++	vm_offset_t tables;
++	uint32_t table_count;
++	uint64_t next;                  /* first IOVA offset not handed out */
++} rs;
++
++static vm_offset_t
++smmu_second(uint32_t offset)
++{
++	return rs.base + rs.page + offset;
++}
++
++static vm_offset_t
++smmu_ctx(uint32_t offset)
++{
++	return rs.base + (rs.pages + rs.context) * rs.page + offset;
++}
++
++static uint64_t *
++smmu_table(uint32_t n)
++{
++	return (uint64_t *)(rs.tables + 4096u * n);
++}
++
++static vm_offset_t
++smmu_table_va(uint32_t n)
++{
++	return rs.tables + 4096u * n;
++}
++
++static uint64_t *
++smmu_next_table(uint64_t *entry)
++{
++	if (*entry & 1) {
++		for (uint32_t i = 0; i < rs.table_count; i++) {
++			if (kvtophys(smmu_table_va(i)) == (*entry & PTE_ADDRESS)) {
++				return smmu_table(i);
++			}
++		}
++		return NULL;
++	}
++	if (rs.table_count == RADIO_TABLES) {
++		return NULL;
++	}
++	uint64_t *table = smmu_table(rs.table_count++);
++	*entry = kvtophys(smmu_table_va(rs.table_count - 1)) | 3;
++	return table;
++}
++
++/* One page: `pa` behind IOVA `at`. The tables are pushed to memory by smmu_flush(). */
++static bool
++smmu_set(uint64_t at, uint64_t pa, uint64_t attributes)
++{
++	if (rs.tables == 0) {
++		if (kmem_alloc(kernel_map, &rs.tables, round_page(4096u * RADIO_TABLES), KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("SWEET WIFI: no memory for the SMMU tables\n");
++			return false;
++		}
++		rs.table_count = 1;
++	}
++	if (attributes == 0) {
++		return true;            /* the tables only */
++	}
++	uint64_t *level2 = smmu_next_table(&smmu_table(0)[at >> 30 & 0x1ff]);
++	uint64_t *level3 = level2 == NULL ? NULL : smmu_next_table(&level2[at >> 21 & 0x1ff]);
++	if (level3 == NULL) {
++		printf("SWEET WIFI: no page table left for IOVA %#llx\n", at);
++		return false;
++	}
++	level3[at >> 12 & 0x1ff] = pa | attributes;
++	return true;
++}
++
++/* The SMMU walks the tables in memory, not in this core's cache. */
++static void
++smmu_flush(void)
++{
++	for (vm_offset_t line = rs.tables; line < rs.tables + 4096u * RADIO_TABLES; line += 64) {
++		__asm__ volatile ("dc civac, %0" : : "r" (line));
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++smmu_tlb_sync(void)
++{
++	if (!rs.installed) {
++		return true;
++	}
++	wifi_wr(smmu_ctx(SMMU_CB_TLBIASID), rs.context);
++	wifi_wr(smmu_ctx(SMMU_CB_TLBSYNC), 1);
++	for (unsigned us = 0; us < 100000; us++) {
++		uint32_t status = wifi_rd(smmu_ctx(SMMU_CB_TLBSTATUS));
++		if (status == UINT32_MAX) {
++			return false;
++		}
++		if (!(status & 1)) {
++			return true;
++		}
++		delay(1);
++	}
++	printf("SWEET WIFI: SMMU TLB sync timeout\n");
++	return false;
++}
++
++/* Step 2: read-only. Which match registers exist and whether any already covers the radio. */
++static void
++smmu_survey(void)
++{
++	if (!rs.base) {
++		rs.base = ml_io_map_unmappable(SMMU_PA, SMMU_SIZE, VM_WIMG_IO);
++	}
++	if (!rs.base) {
++		printf("SWEET WIFI: cannot map the apps SMMU\n");
++		return;
++	}
++	uint32_t scr0 = wifi_rd(rs.base + SMMU_SCR0), idr0 = wifi_rd(rs.base + SMMU_IDR0), idr1 = wifi_rd(rs.base + SMMU_IDR1);
++	unsigned matches = idr0 & 0xff, valid = 0, covering = 0;
++	for (unsigned n = 0; n < matches && SMMU_SMR(n) < 0xc00; n++) {
++		uint32_t smr = wifi_rd(rs.base + SMMU_SMR(n)), s2cr = wifi_rd(rs.base + SMMU_S2CR(n));
++		if (!(smr >> 31)) {
++			continue;
++		}
++		valid++;
++		if ((((smr & 0x7fff) ^ RADIO_STREAM) & ~((smr >> 16) & 0x7fff)) == 0) {
++			covering++;
++			printf("SWEET WIFI: SMMU SMR%u=%#x S2CR=%#x already covers stream %#x\n", n, smr, s2cr, RADIO_STREAM);
++		}
++	}
++	printf("SWEET WIFI: apps SMMU scr0=%#x idr0=%#x idr1=%#x: %u of %u match registers valid, %u cover %#x, %u contexts\n",
++	    scr0, idr0, idr1, valid, matches, covering, RADIO_STREAM, idr1 & 0xff);
++}
++
++/* A free match register and the lowest unused, switched-off context. Reads only. */
++static bool
++smmu_find(void)
++{
++	bool used[256] = { false };
++	uint32_t scr0 = wifi_rd(rs.base + SMMU_SCR0), idr0 = wifi_rd(rs.base + SMMU_IDR0), idr1 = wifi_rd(rs.base + SMMU_IDR1);
++	uint32_t matches = idr0 & 0xff, contexts = idr1 & 0xff;
++	if (scr0 == UINT32_MAX || idr0 == UINT32_MAX || idr1 == UINT32_MAX) {
++		return false;
++	}
++	if (scr0 & 1u << 3) {
++		printf("SWEET WIFI: the SMMU numbers streams with 16 bits; not handled\n");
++		return false;
++	}
++	rs.page = idr1 >> 31 ? 0x10000u : 0x1000u;
++	rs.pages = 2u << (idr1 >> 28 & 7);
++	if (2u * rs.pages * rs.page != SMMU_SIZE) {
++		printf("SWEET WIFI: SMMU says 2 x %u pages of %#x bytes, not 1 MiB; contexts not used\n", rs.pages, rs.page);
++		return false;
++	}
++	rs.match = ~0u;
++	for (uint32_t n = 0; n < matches && SMMU_SMR(n) < 0xc00; n++) {
++		uint32_t smr = wifi_rd(rs.base + SMMU_SMR(n)), s2cr = wifi_rd(rs.base + SMMU_S2CR(n));
++		if (smr >> 31) {
++			if ((((smr & 0x7fff) ^ RADIO_STREAM) & ~((smr >> 16) & 0x7fff)) == 0) {
++				printf("SWEET WIFI: stream %#x already belongs to SMR%u; left alone\n", RADIO_STREAM, n);
++				return false;
++			}
++			used[s2cr & 0xff] = true;
++		} else if (rs.match == ~0u) {
++			rs.match = n;
++			rs.old_smr = smr;
++			rs.old_s2cr = s2cr;
++		}
++	}
++	for (rs.context = 0; rs.context < contexts && used[rs.context]; rs.context++) {
++	}
++	if (rs.match == ~0u || rs.context >= contexts) {
++		printf("SWEET WIFI: the SMMU has no free match register or context\n");
++		return false;
++	}
++	for (unsigned i = 0; i < SMMU_SAVED; i++) {
++		rs.saved[i] = wifi_rd(smmu_ctx(smmu_saved_offsets[i]));
++	}
++	rs.cbar = wifi_rd(smmu_second(SMMU_CBAR(rs.context)));
++	rs.cba2r = wifi_rd(smmu_second(SMMU_CBA2R(rs.context)));
++	printf("SWEET WIFI: free: SMR%u (%#x, s2cr %#x) and context %u at %#x: sctlr %#x cbar %#x fsr %#x\n", rs.match,
++	    rs.old_smr, rs.old_s2cr, rs.context, SMMU_PA + (rs.pages + rs.context) * rs.page, rs.saved[0], rs.cbar,
++	    wifi_rd(smmu_ctx(SMMU_CB_FSR)));
++	if (rs.saved[0] & 1) {
++		printf("SWEET WIFI: context %u is switched on although no stream uses it: somebody's; left alone\n", rs.context);
++		return false;
++	}
++	if (wifi_rd(smmu_ctx(SMMU_CB_FSR)) & SMMU_FSR_ALL) {
++		printf("SWEET WIFI: context %u has pending faults; left alone\n", rs.context);
++		return false;
++	}
++	rs.found = true;
++	return true;
++}
++
++static void
++smmu_faults(const char *when)
++{
++	if (!rs.installed) {
++		return;
++	}
++	uint32_t status = wifi_rd(smmu_ctx(SMMU_CB_FSR)), global = wifi_rd(rs.base + SMMU_SGFSR);
++	if ((status & SMMU_FSR_ALL) == 0 && global == 0) {
++		printf("SWEET WIFI: %s: no SMMU faults (context %u fsr %#x)\n", when, rs.context, status);
++		return;
++	}
++	printf("SWEET WIFI: %s: SMMU FAULT: context %u fsr %#x far %#llx fsynr0 %#x; global sgfsr %#x sgfsynr %#x/%#x\n", when,
++	    rs.context, status, (uint64_t)wifi_rd(smmu_ctx(SMMU_CB_FAR + 4)) << 32 | wifi_rd(smmu_ctx(SMMU_CB_FAR)),
++	    wifi_rd(smmu_ctx(SMMU_CB_FSYNR0)), global, wifi_rd(rs.base + SMMU_SGFSYNR0), wifi_rd(rs.base + SMMU_SGFSYNR1));
++}
++
++/* Stream 0x1c01 through our context (tables made beforehand); every global write read back. */
++static bool
++smmu_install(void)
++{
++	if (!rs.base || !smmu_find() || !smmu_set(RADIO_IOVA, 0, 0)) {
++		return false;
++	}
++	smmu_flush();
++	uint64_t root = kvtophys(rs.tables) | (uint64_t)rs.context << 48;
++	uint32_t sees = 1u << 31 | RADIO_STREAM;
++	printf("SWEET WIFI: SMMU: context %u gets our tables (root %#llx), SMR%u sends stream %#x to it\n", rs.context,
++	    root & PTE_ADDRESS, rs.match, RADIO_STREAM);
++	wifi_wr(smmu_ctx(SMMU_CB_SCTLR), 0);
++	wifi_wr(smmu_second(SMMU_CBA2R(rs.context)), 1);         /* 64-bit descriptors */
++	wifi_wr(smmu_second(SMMU_CBAR(rs.context)), SMMU_CBAR_STAGE_1);
++	wifi_wr(smmu_ctx(SMMU_CB_TCR2), SMMU_TCR2);
++	wifi_wr(smmu_ctx(SMMU_CB_TCR), SMMU_TCR_39_BITS);
++	wifi_wr(smmu_ctx(SMMU_CB_TTBR0), (uint32_t)root);
++	wifi_wr(smmu_ctx(SMMU_CB_TTBR0 + 4), (uint32_t)(root >> 32));
++	wifi_wr(smmu_ctx(SMMU_CB_TTBR1), 0);
++	wifi_wr(smmu_ctx(SMMU_CB_TTBR1 + 4), 0);
++	wifi_wr(smmu_ctx(SMMU_CB_MAIR0), SMMU_MAIR0);
++	wifi_wr(smmu_ctx(SMMU_CB_MAIR1), 0);
++	wifi_wr(smmu_ctx(SMMU_CB_FSR), SMMU_FSR_ALL);
++	rs.installed = true;            /* from here on there is something to put back */
++	if (!smmu_tlb_sync()) {
++		return false;
++	}
++	wifi_wr(smmu_ctx(SMMU_CB_SCTLR), SMMU_SCTLR_ON);
++	wifi_wr(rs.base + SMMU_S2CR(rs.match), rs.context);
++	wifi_wr(rs.base + SMMU_SMR(rs.match), sees);
++	/* The global registers are the hypervisor's to grant: see what it made of them. */
++	uint32_t smr = wifi_rd(rs.base + SMMU_SMR(rs.match)), s2cr = wifi_rd(rs.base + SMMU_S2CR(rs.match));
++	uint32_t cbar = wifi_rd(smmu_second(SMMU_CBAR(rs.context))), sctlr = wifi_rd(smmu_ctx(SMMU_CB_SCTLR));
++	uint32_t ttbr_lo = wifi_rd(smmu_ctx(SMMU_CB_TTBR0)), ttbr_hi = wifi_rd(smmu_ctx(SMMU_CB_TTBR0 + 4));
++	printf("SWEET WIFI: SMMU read back: smr %#x s2cr %#x cbar %#x sctlr %#x ttbr0 %#x:%#x tcr %#x tcr2 %#x\n", smr, s2cr,
++	    cbar, sctlr, ttbr_hi, ttbr_lo, wifi_rd(smmu_ctx(SMMU_CB_TCR)), wifi_rd(smmu_ctx(SMMU_CB_TCR2)));
++	if (smr != sees || (s2cr & 0x300ff) != rs.context || (cbar & 0x30000) != (SMMU_CBAR_STAGE_1 & 0x30000) ||
++	    !(sctlr & 1) || ttbr_lo != (uint32_t)root || ttbr_hi != (uint32_t)(root >> 32)) {
++		printf("SWEET WIFI: THE SMMU DID NOT TAKE IT: stream %#x is not going through context %u\n", RADIO_STREAM,
++		    rs.context);
++		return false;
++	}
++	printf("SWEET WIFI: THE RADIO'S STREAM %#x GOES THROUGH SMMU CONTEXT %u WITH OUR TABLES\n", RADIO_STREAM, rs.context);
++	smmu_faults("installed");
++	return true;
++}
++
++/* As found; called with the endpoint in reset (PERST low) or never enabled. */
++static void
++smmu_restore(void)
++{
++	if (!rs.found) {
++		return;
++	}
++	if (rs.installed) {
++		smmu_faults("before restore");
++	}
++	wifi_wr(rs.base + SMMU_SMR(rs.match), rs.old_smr);
++	wifi_wr(rs.base + SMMU_S2CR(rs.match), rs.old_s2cr);
++	wifi_wr(smmu_ctx(SMMU_CB_SCTLR), 0);
++	for (unsigned i = 1; i < SMMU_SAVED; i++) {
++		wifi_wr(smmu_ctx(smmu_saved_offsets[i]), rs.saved[i]);
++	}
++	wifi_wr(smmu_second(SMMU_CBAR(rs.context)), rs.cbar);
++	wifi_wr(smmu_second(SMMU_CBA2R(rs.context)), rs.cba2r);
++	wifi_wr(smmu_ctx(SMMU_CB_SCTLR), rs.saved[0]);
++	bool restored = wifi_rd(rs.base + SMMU_SMR(rs.match)) == rs.old_smr &&
++	    wifi_rd(rs.base + SMMU_S2CR(rs.match)) == rs.old_s2cr &&
++	    wifi_rd(smmu_second(SMMU_CBAR(rs.context))) == rs.cbar &&
++	    wifi_rd(smmu_second(SMMU_CBA2R(rs.context))) == rs.cba2r;
++	for (unsigned i = 0; i < SMMU_SAVED; i++) {
++		restored &= wifi_rd(smmu_ctx(smmu_saved_offsets[i])) == rs.saved[i];
++	}
++	printf("SWEET WIFI: SMMU SMR%u and context %u put back as found: %s\n", rs.match, rs.context,
++	    restored ? "yes" : "NO (read back differs)");
++	rs.installed = false;
++	rs.found = false;
++}
++
++/* `size` bytes at the next free IOVA: from physical `pa` on, or (va != 0) each page of `va` where it is. */
++static bool
++radio_map(uint64_t pa, vm_offset_t va, uint64_t size, uint64_t attributes, uint64_t *iova)
++{
++	size = round_page(size);
++	if (rs.next + size > RADIO_IOVA_SIZE) {
++		printf("SWEET WIFI: the radio's 256 MiB of addresses are used up\n");
++		return false;
++	}
++	*iova = RADIO_IOVA + rs.next;
++	for (uint64_t offset = 0; offset < size; offset += 4096) {
++		uint64_t page = va ? kvtophys(va + offset) : pa + offset;
++		if (!smmu_set(*iova + offset, page, attributes)) {
++			return false;
++		}
++	}
++	smmu_flush();
++	rs.next += size;
++	return smmu_tlb_sync();
++}
++
++/* ---- DMA memory for MHI --------------------------------------------------------------- */
++
++/*
++ * One physical run, mapped a second time non-cacheable (as umi's
++ * lx_os_radio_memory); the cached view is cleaned once and not used again.
++ * A large block that does not come in one run is taken page by page instead,
++ * used through the cached view, and cleaned to memory whenever MHI hands it
++ * to the radio (wifi_sync). Only the firmware image (the radio reads it, the
++ * CPU never reads what the radio wrote) is that large: rings and receive
++ * buffers stay below WIFI_SCATTER_MIN and must come in one run.
++ */
++#define WIFI_SCATTER_MIN        (1024u * 1024u)
++#define WIFI_CACHED_MAX 8
++static struct {
++	vm_offset_t va;
++	size_t size;
++} wifi_cached[WIFI_CACHED_MAX];
++
++static int
++wifi_allocate(void *context, size_t size, struct sweet_mhi_dma *dma)
++{
++	(void)context;
++	vm_offset_t cached = 0;
++	uint64_t iova = 0;
++	if (size == 0 || size > 16u * 1024u * 1024u) {
++		return EINVAL;
++	}
++	size = round_page(size);
++	if (kmem_alloc_contig(kernel_map, &cached, size, 0, 0, 0, KMA_KOBJECT | KMA_ZERO | KMA_DATA,
++	    VM_KERN_MEMORY_IOKIT) == KERN_SUCCESS) {
++		uint64_t pa = kvtophys(cached);
++		for (vm_offset_t line = cached; line < cached + size; line += 64) {
++			__asm__ volatile ("dc civac, %0" : : "r" (line));
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		vm_offset_t uncached = ml_io_map_unmappable(pa, size, VM_WIMG_WCOMB);
++		if (!uncached || !radio_map(pa, 0, size, RADIO_PTE, &iova)) {
++			return ENOMEM;
++		}
++		dma->bytes = (void *)uncached;
++	} else {
++		unsigned slot;
++		for (slot = 0; slot < WIFI_CACHED_MAX && wifi_cached[slot].va; slot++) {
++		}
++		if (size < WIFI_SCATTER_MIN || slot == WIFI_CACHED_MAX || kmem_alloc(kernel_map, &cached, size,
++		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			printf("SWEET WIFI: no %zu bytes of DMA memory\n", size);
++			return ENOMEM;
++		}
++		if (!radio_map(0, cached, size, RADIO_PTE, &iova)) {
++			return ENOMEM;
++		}
++		wifi_cached[slot].va = cached;
++		wifi_cached[slot].size = size;
++		dma->bytes = (void *)cached;
++		printf("SWEET WIFI: %zu KiB not in one run: taken page by page (cached, cleaned before use)\n", size >> 10);
++	}
++	dma->address = iova;
++	dma->size = size;
++	return 0;
++}
++
++static void
++wifi_sync(void *context, const struct sweet_mhi_dma *dma)
++{
++	(void)context;
++	for (unsigned i = 0; i < WIFI_CACHED_MAX; i++) {
++		if (wifi_cached[i].va && (vm_offset_t)dma->bytes == wifi_cached[i].va) {
++			for (vm_offset_t line = wifi_cached[i].va; line < wifi_cached[i].va + wifi_cached[i].size; line += 64) {
++				__asm__ volatile ("dc cvac, %0" : : "r" (line));
++			}
++		}
++	}
++	/* Publish writes before a doorbell is rung. */
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static uint32_t
++mhi_read(void *context, uint32_t offset)
++{
++	(void)context;
++	return offset <= 0xffc && !(offset & 3) ? pcie_read(NULL, WIFI_BAR + offset) : UINT32_MAX;
++}
++
++static void
++mhi_write(void *context, uint32_t offset, uint32_t value)
++{
++	(void)context;
++	if (offset <= 0xffc && !(offset & 3)) {
++		pcie_write(NULL, WIFI_BAR + offset, value);
++	}
++}
++
++/* ---- QRTR: what the firmware announces ------------------------------------------------ */
++
++static unsigned wifi_services, wifi_wlfw;
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
++}
++
++static void
++wifi_qrtr_packet(void *context, const void *data, size_t length)
++{
++	(void)context;
++	const uint8_t *packet = data;
++	if (length < 32 || le32(packet) != 1) {
++		printf("SWEET WIFI: QRTR: %zu bytes, not a version 1 packet\n", length);
++		return;
++	}
++	uint32_t type = le32(packet + 4), size = le32(packet + 20);
++	const uint8_t *payload = packet + 32;
++	if (size > length - 32) {
++		printf("SWEET WIFI: QRTR: type %u says %u bytes, has %zu\n", type, size, length - 32);
++		return;
++	}
++	if ((type == 4 || type == 5) && size >= 20) {
++		uint32_t service = le32(payload + 4), instance = le32(payload + 8);
++		printf("SWEET WIFI: QRTR %s service %#x version %u instance %u at node %u port %#x%s\n",
++		    type == 4 ? "NEW_SERVER" : "DEL_SERVER", service, instance & 0xff, instance >> 8, le32(payload + 12),
++		    le32(payload + 16), service == 0x45 ? " = THE WLAN FIRMWARE SERVICE (WLFW)" : "");
++		if (type == 4) {
++			wifi_services++;
++			wifi_wlfw += service == 0x45;
++		}
++		return;
++	}
++	static const char *const names[] = { "?", "DATA", "HELLO", "BYE", "NEW_SERVER", "DEL_SERVER", "DEL_CLIENT",
++		                             "RESUME_TX", "EXIT", "PING", "NEW_LOOKUP", "DEL_LOOKUP" };
++	printf("SWEET WIFI: QRTR %s from node %u port %#x, %u bytes\n", type < 12 ? names[type] : "?", le32(packet + 8),
++	    le32(packet + 12), size);
++}
++
++/* ---- the steps -------------------------------------------------------------------------- */
++
++static const uint8_t *
++wifi_file(const char *name, unsigned int *size)
++{
++	DTEntry node;
++	void const *prop = NULL;
++	if (SecureDTLookupEntry(NULL, "/sweet-wifi", &node) != kSuccess ||
++	    SecureDTGetProperty(node, name, &prop, size) != kSuccess) {
++		return NULL;
++	}
++	return prop;
++}
++
++/* Steps 4-7 with the SMMU context installed and the endpoint enumerated. */
++static int
++wifi_firmware(struct sweet_pcie *pcie, unsigned steps)
++{
++	static const struct sweet_mhi_io io = {
++		.context = NULL, .bar_size = 4096, .read32 = mhi_read, .write32 = mhi_write,
++		.allocate = wifi_allocate, .sync_for_device = wifi_sync, .delay_us = pcie_delay,
++		.report = pcie_report, .qrtr_packet = wifi_qrtr_packet,
++	};
++	static struct sweet_mhi mhi;
++	unsigned int size = 0;
++	const uint8_t *amss = wifi_file("amss", &size);
++	if (!amss || size < 512u * 1024u) {
++		printf("SWEET WIFI: step 4: no firmware in the ADT (/sweet-wifi \"amss\": mkadt.py --wifi-fw amss.bin)\n");
++		return ENOENT;
++	}
++	uint32_t hash = 2166136261u;
++	for (unsigned i = 0; i < size; i++) {
++		hash = (hash ^ amss[i]) * 16777619u;
++	}
++	printf("SWEET WIFI: step 4: firmware %u bytes, FNV32 %#x, starts %02x%02x%02x%02x\n", size, hash, amss[0], amss[1],
++	    amss[2], amss[3]);
++	memset(&mhi, 0, sizeof(mhi));
++	int error = sweet_mhi_probe(&mhi, &io);
++	if (!error) {
++		error = sweet_pcie_prepare_radio(pcie);
++	}
++	uint64_t msi = 0;
++	if (!error && !radio_map(RADIO_MSI_REGISTER & ~4095ull, 0, 4096, RADIO_PTE_DEVICE, &msi)) {
++		error = ENOMEM;
++	}
++	if (!error) {
++		error = sweet_pcie_setup_mhi_msi(pcie, msi + (RADIO_MSI_REGISTER & 4095), RADIO_MSI_DATA);
++	}
++	if (!error) {
++		error = sweet_pcie_enable_dma(pcie);
++	}
++	if (!error) {
++		error = sweet_mhi_download_sbl(&mhi, amss, size);
++		printf("SWEET WIFI: step 4: BHI download of the first 512 KiB: errno %d\n", error);
++	}
++	if (!error && steps >= 5) {
++		error = sweet_mhi_prepare_ready(&mhi);
++		printf("SWEET WIFI: step 5: MHI READY, contexts, M0: errno %d\n", error);
++	}
++	if (!error && steps >= 6) {
++		error = sweet_mhi_download_amss(&mhi, amss, size);
++		if (!error) {
++			error = sweet_mhi_wait_mission(&mhi);
++		}
++		printf("SWEET WIFI: step 6: BHIe download and mission mode: errno %d%s\n", error,
++		    error ? "" : ": THE WI-FI FIRMWARE RUNS");
++	}
++	if (!error && steps >= 7) {
++		unsigned received = 0;
++		error = sweet_mhi_start_ipcr(&mhi);
++		if (!error) {
++			error = sweet_mhi_send_qrtr_hello(&mhi);
++		}
++		for (unsigned waited = 0; !error && waited < wifi_poll_ms; waited += 1000) {
++			unsigned now = 0;
++			error = sweet_mhi_poll_ipcr(&mhi, 1000, &now);
++			received += now;
++		}
++		printf("SWEET WIFI: step 7: QRTR errno %d, %u packets, %u services announced%s\n", error, received,
++		    wifi_services, wifi_wlfw ? ": THE WLAN FIRMWARE SERVICE IS UP" : "");
++	}
++	uint32_t ee = UINT32_MAX;
++	if (mhi.io) {
++		(void)sweet_mhi_execution_environment(&mhi, &ee);
++	}
++	if (error && mhi.io) {
++		printf("SWEET WIFI: BHI error %#x debug %#x/%#x/%#x, MHI status %#x\n", mhi_read(NULL, mhi.bhi + 0x30),
++		    mhi_read(NULL, mhi.bhi + 0x34), mhi_read(NULL, mhi.bhi + 0x38), mhi_read(NULL, mhi.bhi + 0x3c),
++		    mhi_read(NULL, 0x48));
++	}
++	printf("SWEET WIFI: firmware steps up to %u: errno %d, execution environment %#x\n", steps, error, ee);
++	return error;
++}
++
++static int
++wifi_run(unsigned steps)
++{
++	static const struct sweet_pcie_io io = {
++		.context = NULL, .read32 = pcie_read, .write32 = pcie_write, .power_on = pcie_power,
++		.delay_us = pcie_delay, .report = pcie_report,
++	};
++	static struct sweet_pcie pcie;
++	if (!wifi_map_regions()) {
++		return ENOMEM;
++	}
++	wifi_survey();
++	if (steps < 2) {
++		return 0;
++	}
++	printf("SWEET WIFI: step 2: rails, wlan-en, PCIe0 link; bus mastering stays off\n");
++	memset(&pcie, 0, sizeof(pcie));
++	int error = sweet_pcie_enumerate(&pcie, &io);
++	if (!error) {
++		pcie_report(NULL, "MHICFG", pcie_read(NULL, WIFI_BAR + 0x10));
++		pcie_report(NULL, "BHI offset", pcie_read(NULL, WIFI_BAR + 0x28));
++		pcie_report(NULL, "BHIE offset", pcie_read(NULL, WIFI_BAR + 0x2c));
++		printf("SWEET WIFI: step 2: THE QCA6390 ANSWERS ON PCIe0\n");
++		smmu_survey();
++	}
++	if (!error && steps >= 3) {
++		error = smmu_install() ? 0 : EIO;
++		printf("SWEET WIFI: step 3: SMMU context for the radio: %s\n", error ? "refused" : "taken");
++	}
++	if (!error && steps >= 4) {
++		error = wifi_firmware(&pcie, steps);
++	}
++	/* Reset propagates to the endpoint before its translation goes away. */
++	sweet_pcie_quiesce(&pcie);
++	smmu_restore();
++	return error;
++}
++
++static void
++wifi_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	int chan = 0;
++	if (wifi_delay) {
++		(void)tsleep(&chan, PZERO, "sweetwifi", (int)wifi_delay * hz);
++	}
++	printf("SWEET WIFI: steps 1..%u\n", wifi_steps);
++	int error = wifi_run(wifi_steps);
++	printf("SWEET WIFI: done: steps 1..%u, errno %d; the radio is held in reset\n", wifi_steps, error);
++	(void)thread_terminate(current_thread());
++}
++
++void
++sweet_wifi_init(void)
++{
++	thread_t thread;
++	(void)PE_parse_boot_argn("sweetwifi", &wifi_steps, sizeof(wifi_steps));
++	(void)PE_parse_boot_argn("sweetwifidelay", &wifi_delay, sizeof(wifi_delay));
++	(void)PE_parse_boot_argn("sweetwifipoll", &wifi_poll_ms, sizeof(wifi_poll_ms));
++	if (!wifi_steps) {
++		return;
++	}
++	if (wifi_steps > 7) {
++		wifi_steps = 7;
++	}
++	if (wifi_poll_ms < 1000 || wifi_poll_ms > 60000) {
++		wifi_poll_ms = 5000;
++	}
++	if (kernel_thread_start(wifi_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET WIFI: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
