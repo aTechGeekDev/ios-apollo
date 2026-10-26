@@ -10,7 +10,7 @@ Apple's open-source XNU kernel (xnu-8796), patched for the phone, boots the **un
 
 | | |
 | --- | --- |
-| Boot | Stock bootloader → `fastboot boot` shim → XNU → iOS from `userdata` → **lock screen**, home screen, Control Center, Settings, app switcher, home gesture |
+| Boot | Stock bootloader → `fastboot boot` shim → XNU → iOS from `userdata` → **lock screen**, home screen, Control Center, Settings, app switcher, home gesture; **wallpapers and widgets** (app extensions registered, 2026-10-26) |
 | CPU | All 8 cores, clocked up (1804 / 2419 / 2841 MHz) |
 | Touch | Working (Novatek NT36675 over SPI, firmware loaded at every boot) |
 | Buttons | Power, volume up, volume down |

@@ -29,6 +29,17 @@ screen (image versions v8-v14 in NOTES.md):
   audio           VirtualAudio HAL plug-in disabled (mediaserverd crash)
   MediaToolbox    StartRecorderServer=false (camera filter prewarm calls a
                   NULL OpenGL function without a GPU -> mediaserverd crash loop)
+  extensions      ExtensionKit feature flag enforce_xpc_cache_code_signing off
+                  (/private/var/preferences/FeatureFlags/Domain/ExtensionKit.plist:
+                  the extension point catalog is trusted only through a detached
+                  signature checked against trust caches we lack, so every app
+                  extension (wallpapers, widgets) was turned down) and launchd's
+                  override list (/private/var/db/com.apple.xpc.launchd/disabled.plist)
+                  switching off fairplayd.H2 and bluetoothd: both restart every few
+                  seconds here (no FairPlay hardware, no Bluetooth driver) and a
+                  request queued on them is never answered, which deadlocked
+                  LaunchServices' app scan (apollo boots 47-48; boot 50 with both:
+                  wallpapers and widgets work; ios-sailfish removes fairplayd too)
   CoreAnimation   CAEnableDeepFramebuffer, CAEnableFramebufferCompression and
                   CAEnableIOSurfaceCompression off in the global preferences
                   (mobile's and root's): with a GPU renderer CoreAnimation
@@ -228,6 +239,20 @@ def audio(root):
         print('StartRecorderServer off', os.path.relpath(conf, root))
 
 
+def extensions(root):
+    d = os.path.join(root, 'private/var/preferences/FeatureFlags/Domain')
+    os.makedirs(d, exist_ok=True)
+    save(os.path.join(d, 'ExtensionKit.plist'), {'enforce_xpc_cache_code_signing': {'Enabled': False}}, 0, 0, 0o644,
+         plistlib.FMT_XML)
+    d = os.path.join(root, 'private/var/db/com.apple.xpc.launchd')
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, 'disabled.plist')
+    data = load(path) if os.path.exists(path) else {}
+    data.update({'com.apple.fairplayd.H2': True, 'com.apple.bluetoothd': True})
+    save(path, data, 0, 0, 0o644, plistlib.FMT_XML)
+    print('ExtensionKit flag off; launchd disabled.plist: fairplayd.H2, bluetoothd')
+
+
 def main():
     args = [a for a in sys.argv[1:] if a != '--oslog']
     if len(args) != 1 or not os.path.isdir(os.path.join(args[0], 'System/Library/xpc')):
@@ -239,6 +264,7 @@ def main():
     stock_apps(root)
     activation(root)
     audio(root)
+    extensions(root)
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})
