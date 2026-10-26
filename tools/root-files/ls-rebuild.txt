@@ -1,0 +1,11 @@
+# LaunchServices rebuilds its database at the next boot (mkadt.py --files-from; one boot, then leave out).
+#
+# Bergamota (ry-diffusion/Bergamota docs/EXTENSION_POINTS_2.md, iPhone X 16.7.16 20H392 = our
+# IPSW): lsd seeded its database while the extension catalog was unreadable and dropped every app
+# extension ("Ignoring app extension" x418); the stored database is marked seeded and complete for
+# this build, so lsd never seeds again (pkd: 0 plugins, PosterBoard: 0 extensions). Removing it
+# makes lsd seed again, now with the catalog readable (files.txt: ExtensionKit flag). The container
+# UUID is the one the iPhone X image ships with; a path that is not there is logged "not there".
+-/private/var/mobile/Containers/Data/InternalDaemon/3ED48A87-B795-429E-9BCB-E3502EA1A6EC/Library/Caches/com.apple.LaunchServices-4035-v2.csstore
+-/private/var/mobile/Containers/Data/InternalDaemon/3ED48A87-B795-429E-9BCB-E3502EA1A6EC/Library/Caches/com.apple.LaunchServices.syncInterrupted
+-/private/var/mobile/Containers/Data/InternalDaemon/3ED48A87-B795-429E-9BCB-E3502EA1A6EC/Library/Caches/com.apple.LaunchServices.error
