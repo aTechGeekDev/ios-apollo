@@ -4,9 +4,10 @@
 #   tools/sweet-symbolicate.sh LOG [OUT]          (OUT default: LOG with -sym.txt)
 #
 # The shared cache is only in the iOS root image, so: mounts research/ios-root/ios16-root.img
-# read-only at /mnt/iosroot (unless something is mounted there), links the cache files into
-# research/dsc/ (ipsw keeps its symbol index next to the cache, so the folder must be writable;
-# the links cost no space) and runs tools/sweet-crash.py --last (the last sample only) on LOG.
+# read-only at /mnt/iosroot (unless something is mounted there), copies the cache files into
+# research/dsc/ once (a few GB: ipsw keeps its symbol index next to the cache, so the folder must
+# be writable, and it follows symbolic links to absolute paths wrongly) and runs
+# tools/sweet-crash.py --last (the last sample only) on LOG.
 # Needs ipsw (github.com/blacktop/ipsw): see the message below if it is missing.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
@@ -25,8 +26,15 @@ if ! mountpoint -q "$mnt"; then
 fi
 dsc=$here/research/dsc
 mkdir -p "$dsc"
+copied=0
 for f in "$mnt"/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64*; do
-	ln -sf "$f" "$dsc/"
+	to=$dsc/$(basename "$f")
+	[ -L "$to" ] && rm -f "$to"             # links from the first version of this script
+	if [ ! -f "$to" ] || [ "$(stat -c %s "$to")" != "$(stat -c %s "$f")" ]; then
+		[ $copied = 1 ] || echo "copying the shared cache into $dsc (once)..."
+		copied=1
+		cp "$f" "$to.part" && mv "$to.part" "$to"
+	fi
 done
 [ -e "$dsc/dyld_shared_cache_arm64" ] || die "no shared cache under $mnt/System/Library/Caches/com.apple.dyld"
 # the programs' own binaries are root's only (0700 folders on the image): readable copies for the disassembly
