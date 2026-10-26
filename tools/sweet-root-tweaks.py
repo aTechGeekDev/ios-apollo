@@ -14,6 +14,12 @@ screen (image versions v8-v14 in NOTES.md):
                   crash-loops and Setup blocks on its CoreTelephony XPC)
   containers      /private/var/containers/{Bundle,Data/System,Shared/SystemGroup,Temp}
                   (on iOS they live on the data volume)
+  stock apps      the removable ones (Weather, Notes, Calendar, ...) moved from
+                  /private/var/staged_system_apps to /Applications: on an
+                  iPhone the first boot's data migration (SystemAppMigrator)
+                  installs them, and this root skips the migration (below);
+                  LaunchServices registers /Applications when it builds its
+                  database at the first boot. Takes effect on a fresh root only
   migration       LastSystemVersion, in the plain file and in the ByHost
                   (kCFPreferencesCurrentHost) file datamigrator reads, named
                   by the IOPlatformUUID the kernel derives from mkadt.py's
@@ -152,6 +158,25 @@ def containers(root):
             print('mkdir', d)
 
 
+def stock_apps(root):
+    staged = os.path.join(root, 'private/var/staged_system_apps')
+    apps = os.path.join(root, 'Applications')
+    if not os.path.isdir(staged):
+        print('warning: no /private/var/staged_system_apps in the image; removable stock apps not added')
+        return
+    moved, there = [], []
+    for name in sorted(os.listdir(staged)):
+        if not name.endswith('.app'):
+            continue
+        if os.path.exists(os.path.join(apps, name)):
+            there.append(name)
+            continue
+        os.rename(os.path.join(staged, name), os.path.join(apps, name))
+        moved.append(name)
+    print(f'stock apps: {len(moved)} moved to /Applications {[n[:-4] for n in moved]}, '
+          f'{len(there)} already there, {len([n for n in os.listdir(apps) if n.endswith(".app")])} in /Applications')
+
+
 def find_container(root, kind, identifier):
     for meta in glob.glob(os.path.join(root, 'private/var/containers', kind, '*',
                                        '.com.apple.mobile_container_manager.metadata.plist')):
@@ -200,6 +225,7 @@ def main():
     launchd(root)
     oslog(root, '--oslog' in sys.argv[1:])
     containers(root)
+    stock_apps(root)
     activation(root)
     audio(root)
     merge_pref(root, 'com.apple.migration', {
