@@ -1,0 +1,41 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -373,6 +373,19 @@
+ 		}
+ 		uintptr_t src = s->kernelAddress();
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
++		uint64_t start = s->offset;
++		uint32_t row = s->bytesPerRow;
++		/*
++		 * A surface of planes is shown from its first: CoreAnimation's GPU renderer draws the
++		 * screen into 'b3a8' surfaces (10-bit colour plane + opacity plane), and the CoreAnimation
++		 * bridge (libsweet-gl) puts the frame into that plane as 'BGRA' bytes. The plane has its
++		 * own offset and row length, which need not be the surface's.
++		 */
++		if (s->planeCount > 0) {
++			start = s->planes[0].offset;
++			row = s->planes[0].bytesPerRow;
++			bpe = s->planes[0].bytesPerElement;
++		}
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;
+ 			h = (int32_t)s->height;
+@@ -408,8 +421,7 @@
+ 		if (h > (int32_t)fHeight - dy) {
+ 			h = (int32_t)fHeight - dy;
+ 		}
+-		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+-		    (uint64_t)(sx + w) * 4;
++		uint64_t last = start + (uint64_t)(sy + h - 1) * row + (uint64_t)(sx + w) * 4;
+ 		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+@@ -417,7 +429,7 @@
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
++				    (const void *)(src + start + (uint64_t)(sy + y) * row + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
+ 		}

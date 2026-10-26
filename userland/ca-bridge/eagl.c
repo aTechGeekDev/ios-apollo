@@ -250,6 +250,7 @@ struct image {
 	GLuint mirror;                  /* a texture that is the surface's memory, which the GPU copies the frame into (blit_targets) */
 	bool wrapped;                   /* the surface is memory of somebody's with a surface made around it */
 	bool alpha_first;               /* its pixels are opacity, blue, green, red in memory: see my_attachImage() */
+	bool deep;                      /* a 'b3a8' surface, whose first plane holds the frame as blue-first bytes: see my_attachImage() */
 	bool painted;                   /* something has been drawn into it (it is a target in fact, not only in name) */
 	unsigned looked;                /* ... the frame in which that memory was last looked at, */
 	uint64_t sum;                   /* ... and what it added up to */
@@ -579,6 +580,21 @@ image_forget(struct eagl *e, GLuint texture)
 	}
 }
 
+/* The memory of the plane an image is, and how long its rows are (a surface of one plane: the surface's own). */
+static uint8_t *
+image_base(const struct image *image)
+{
+	return IOSurfaceGetPlaneCount(image->surface) > 0 ? IOSurfaceGetBaseAddressOfPlane(image->surface, image->plane) :
+	    IOSurfaceGetBaseAddress(image->surface);
+}
+
+static size_t
+image_row(const struct image *image)
+{
+	return IOSurfaceGetPlaneCount(image->surface) > 0 ? IOSurfaceGetBytesPerRowOfPlane(image->surface, image->plane) :
+	    IOSurfaceGetBytesPerRow(image->surface);
+}
+
 /* Apple's OpenGL ES takes blue-first pixels into a texture called GL_RGBA; everybody else's calls the texture so too. */
 static GLenum
 internal_format(GLenum internal, GLenum format)
@@ -617,7 +633,7 @@ surface_mirrored(struct eagl *e, struct image *image)
 	IOSurfaceRef surface = image->surface;
 	GLint bound = 0;
 
-	if (!blit_targets || !share_surfaces || !image->target || image->alpha_first ||
+	if (!blit_targets || !share_surfaces || !image->target || image->alpha_first || image->deep ||
 	    image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE || image->plane != 0 ||
 	    (size_t)image->width != IOSurfaceGetWidth(surface) || (size_t)image->height != IOSurfaceGetHeight(surface)) {
 		return false;
@@ -645,7 +661,8 @@ surface_shared(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
 
-	if (!share_surfaces || image->invert || image->alpha_first || image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE ||
+	if (!share_surfaces || image->invert || image->alpha_first || image->deep || image->format != GL_BGRA ||
+	    image->type != GL_UNSIGNED_BYTE ||
 	    image->plane != 0 || (size_t)image->width != IOSurfaceGetWidth(surface) ||
 	    (size_t)image->height != IOSurfaceGetHeight(surface) ||
 	    !sweet_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
@@ -775,7 +792,7 @@ static void
 target_to_surface(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
-	size_t row = IOSurfaceGetBytesPerRow(surface);
+	size_t row = image_row(image);
 	uint8_t *base;
 
 	image->drawn = false;
@@ -817,7 +834,7 @@ target_to_surface(struct eagl *e, struct image *image)
 	glBindFramebuffer(GL_FRAMEBUFFER, e->reader);
 	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, image->texture, 0);
 	if (IOSurfaceLock(surface, 0, NULL) == 0) {
-		base = IOSurfaceGetBaseAddress(surface);
+		base = image_base(image);
 		glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(row / 4));
 		glPixelStorei(GL_PACK_ALIGNMENT, 4);
 		if (!image->invert) {
@@ -935,7 +952,7 @@ static void
 show_texture(struct eagl *e, struct image *image)
 {
 	GLint width = 0, height = 0, bound = 0;
-	size_t row = IOSurfaceGetBytesPerRow(image->surface);
+	size_t row = image_row(image);
 	uint8_t *pixels, *base;
 	GLuint texture = shown_texture;
 
@@ -972,7 +989,7 @@ show_texture(struct eagl *e, struct image *image)
 	glPixelStorei(GL_PACK_ALIGNMENT, 4);
 	glBindFramebuffer(GL_FRAMEBUFFER, e->framebuffer);
 	if (glGetError() == 0 && IOSurfaceLock(image->surface, 0, NULL) == 0) {
-		base = IOSurfaceGetBaseAddress(image->surface);
+		base = image_base(image);
 		for (GLint y = 0; y < height * shown_zoom && y < image->height; y++) {
 			const uint8_t *from = pixels + (size_t)(y / shown_zoom) * (size_t)width * 4;
 			uint8_t *to = base + row * (size_t)y;
@@ -3970,6 +3987,7 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	GLint texture = 0;
 	uint32_t pixels;
 	uint64_t began;
+	bool plain, deep;
 
 	(void)selector;
 	if (e == NULL || surface == NULL) {
@@ -3979,14 +3997,28 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	clear_now(e);
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
 	pixels = IOSurfaceGetPixelFormat(surface);
-	if (target != GL_TEXTURE_2D || texture == 0 || (pixels != 'BGRA' && pixels != 0) ||
-	    IOSurfaceGetBytesPerElement(surface) != 4 || IOSurfaceGetPlaneCount(surface) != 0 ||
+	plain = (pixels == 'BGRA' || pixels == 0) && IOSurfaceGetBytesPerElement(surface) == 4 &&
+	    IOSurfaceGetPlaneCount(surface) == 0;
+	/*
+	 * 'b3a8' (kCVPixelFormatType_30RGBLE_8A_BiPlanar: a plane of red, green and blue in 10 bits
+	 * each to a word, and a plane of 8-bit opacity) is what CoreAnimation draws the iPhone X's
+	 * screen in once it has an OpenGL ES renderer (apollo boot 35; with the software renderer the
+	 * screen is 'BGRA', boot 33). It is drawn here as a blue-first texture of 8 bits, as any
+	 * other, and the frame goes into the first plane as those bytes: the one who reads that
+	 * plane is the kernel's framebuffer, which takes it as 'BGRA' (xnu 0115). The opacity plane
+	 * is left alone (the screen has no use for it).
+	 */
+	deep = pixels == 'b3a8' && IOSurfaceGetPlaneCount(surface) == 2 && IOSurfaceGetBytesPerElementOfPlane(surface, 0) == 4 &&
+	    IOSurfaceGetWidthOfPlane(surface, 0) == IOSurfaceGetWidth(surface) &&
+	    IOSurfaceGetHeightOfPlane(surface, 0) == IOSurfaceGetHeight(surface);
+	if (target != GL_TEXTURE_2D || texture == 0 || !(plain || deep) ||
 	    (image = image_new(e, (GLuint)texture, surface)) == NULL) {
 		say("sweet-gl: -attachImage: target %#lx, texture %d, an IOSurface of '%.4s': not done\n", target, texture,
 		    (const char *)&(uint32_t){ __builtin_bswap32(pixels) });
 		return NO;
 	}
 	image->target = true;
+	image->deep = deep;
 	image->to = GL_TEXTURE_2D;
 	image->invert = inverted;
 	image->width = (GLsizei)IOSurfaceGetWidth(surface);
@@ -4019,7 +4051,7 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	if (attached++ < 24) {
 		say("sweet-gl: -attachImage: texture %d is IOSurface %u ('%.4s' %d x %d, %zu bytes a row)%s%s\n", texture,
 		    IOSurfaceGetID(surface), (const char *)&(uint32_t){ __builtin_bswap32(pixels) }, image->width, image->height,
-		    IOSurfaceGetBytesPerRow(surface), inverted ? ", drawn inverted" : "", image->shared ? ": its memory" :
+		    image_row(image), inverted ? ", drawn inverted" : "", image->shared ? ": its memory" :
 		    image->mirror != 0 ? ": a texture, copied into its memory by the GPU" : ": a copy");
 	}
 	eagl_leave(e, 0x970);
