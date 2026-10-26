@@ -20,6 +20,7 @@ on:
     paths:
       - "xnu/patches/**"
       - "tools/validate-repo.py"
+      - "tools/mk-wlfw-header.py"
       - ".github/workflows/xnu.yml"
 
 concurrency:
@@ -63,6 +64,30 @@ jobs:
           sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
           grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
           ls dxb/patches
+
+      # bsd/dev/sweet_wlfw.c (0127) speaks the QCA6390 firmware's QMI messages as Linux's ath11k
+      # describes them. Those descriptions are BSD-3-Clause-Clear and are not kept in git: they are
+      # taken from Linux 7.0.14 here, checked, and handed to the build as a generated patch.
+      - name: WLFW message header (ath11k of Linux 7.0.14)
+        run: |
+          mkdir -p ath11k
+          base=https://raw.githubusercontent.com/gregkh/linux/v7.0.14/drivers/net/wireless/ath/ath11k
+          for f in qmi.c qmi.h core.c hw.c ce.h htc.h; do
+            curl -sSfL --retry 4 -o "ath11k/$f" "$base/$f"
+          done
+          cat > ath11k.sha256 <<'SUMS'
+          3c560fd52bde408aa2f879902bdad973b52aeac588999ef49e54e0b1436e6d67  ath11k/qmi.c
+          9d6014eb4720185fe82887fb200243e90da6cce312a2cd6959c260b648d36285  ath11k/qmi.h
+          89f618dc1986bd1e218b38c4555a4dd19c160c3ad38681dfb9f85324a983266f  ath11k/core.c
+          b84c11bfa5ec3ea12b6908c30453a9c2b8efc09226c2091d3203ae8ac6a7a1df  ath11k/hw.c
+          b46cc3e5f9bce723b8f500a97dd93ddb2d156a8b6a2dded1bdb45b936929ef9d  ath11k/ce.h
+          c395754a59ae715badf4c96e7aace1c5e70395cd74c08383e91bc4ce1bafd4e4  ath11k/htc.h
+          SUMS
+          sed -i '' 's/^ *//' ath11k.sha256
+          shasum -a 256 -c ath11k.sha256
+          python3 tools/mk-wlfw-header.py ath11k sweet_wlfw_ath11k.h \
+            --patch dxb/patches/0999-generated-sweet-wlfw-ath11k.patch
+          head -3 dxb/patches/0999-generated-sweet-wlfw-ath11k.patch
 
       - name: Deps
         run: |
