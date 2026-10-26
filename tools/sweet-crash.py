@@ -27,11 +27,33 @@ MAIN = {'SpringBoard': 'System/Library/CoreServices/SpringBoard.app/SpringBoard'
 known = {}
 
 
+ANSI = re.compile(r'\x1b\[[0-9;]*m')
+said_raw = False
+
+
 def a2s(cache, addr):
+    """ipsw's answer for addr, whichever of its output styles it uses (they changed between
+    versions): "0x...: image`symbol", a "symbol=... image=..." log line, or the last plain line."""
+    global said_raw
     if addr not in known:
-        r = subprocess.run(['ipsw', 'dyld', 'a2s', cache, hex(addr)], capture_output=True, text=True)
-        lines = [l for l in r.stdout.splitlines() if l.startswith('0x')]
-        known[addr] = lines[-1].split(': ', 1)[1] if lines else '?'
+        r = subprocess.run(['ipsw', 'dyld', 'a2s', '--no-color', cache, hex(addr)], capture_output=True, text=True)
+        if r.returncode != 0 and 'unknown flag' in r.stderr:
+            r = subprocess.run(['ipsw', 'dyld', 'a2s', cache, hex(addr)], capture_output=True, text=True)
+        out = ANSI.sub('', r.stdout + '\n' + r.stderr)
+        name = None
+        for line in out.splitlines():
+            line = line.strip()
+            m = re.match(r'0x[0-9a-fA-F]+:\s*(.+)', line)
+            if m:
+                name = m.group(1)
+            m = re.search(r'symbol=("[^"]*"|\S+)', line)
+            if m:
+                image = re.search(r'(?:image|dylib)=("[^"]*"|\S+)', line)
+                name = m.group(1).strip('"') + (f' ({os.path.basename(image.group(1).strip(chr(34)))})' if image else '')
+        if name is None and not said_raw:
+            said_raw = True
+            print(f'    (ipsw dyld a2s {hex(addr)} said, exit {r.returncode}: {out.strip()[:600]!r})', file=sys.stderr)
+        known[addr] = name or '?'
     return known[addr]
 
 

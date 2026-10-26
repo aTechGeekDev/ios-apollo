@@ -29,6 +29,12 @@ for f in "$mnt"/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64*; d
 	ln -sf "$f" "$dsc/"
 done
 [ -e "$dsc/dyld_shared_cache_arm64" ] || die "no shared cache under $mnt/System/Library/Caches/com.apple.dyld"
+# the programs' own binaries are root's only (0700 folders on the image): readable copies for the disassembly
+bins=$dsc/root
+for rel in usr/libexec/backboardd System/Library/CoreServices/SpringBoard.app/SpringBoard; do
+	mkdir -p "$bins/$(dirname "$rel")"
+	[ -s "$bins/$rel" ] || { sudo cat "$mnt/$rel" > "$bins/$rel"; }
+done
 echo "naming the addresses (the first run builds ipsw's symbol index: a few minutes)..."
-python3 "$here/tools/sweet-crash.py" --last "$dsc/dyld_shared_cache_arm64" "$mnt" "$log" > "$out"
+python3 "$here/tools/sweet-crash.py" --last "$dsc/dyld_shared_cache_arm64" "$bins" "$log" > "$out"
 echo "written: $out"
