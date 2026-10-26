@@ -29,6 +29,12 @@ screen (image versions v8-v14 in NOTES.md):
   audio           VirtualAudio HAL plug-in disabled (mediaserverd crash)
   MediaToolbox    StartRecorderServer=false (camera filter prewarm calls a
                   NULL OpenGL function without a GPU -> mediaserverd crash loop)
+  CoreAnimation   CAEnableDeepFramebuffer, CAEnableFramebufferCompression and
+                  CAEnableIOSurfaceCompression off in the global preferences
+                  (mobile's and root's): with a GPU renderer CoreAnimation
+                  otherwise draws the screen in 'b3a8' (10-bit + opacity
+                  planes), which the panel copy and the CoreAnimation bridge
+                  do not take (apollo boots 35/36; ios-flame found the switch)
   SpringBoard     BKNoWatchdogs (one slow CPU path, no scene-create watchdog
                   kills), no cloud-configuration UI
   Setup           skipped: SetupDone, SetupFinishedAllSteps, SetupVersion 11,
@@ -62,13 +68,18 @@ def save(path, data, uid, gid, mode, fmt=plistlib.FMT_BINARY):
     os.chmod(path, mode)
 
 
-def merge_pref(root, name, values):
-    """Merge keys into /var/mobile/Library/Preferences/NAME.plist (mobile, 0600)."""
-    path = os.path.join(root, 'private/var/mobile/Library/Preferences', name + '.plist')
+def merge_pref(root, name, values, home='mobile', uid=MOBILE):
+    """Merge keys into /var/HOME/Library/Preferences/NAME.plist (that user's, 0600)."""
+    d = os.path.join(root, 'private/var', home, 'Library/Preferences')
+    if not os.path.isdir(d):
+        os.makedirs(d)
+        os.chown(d, uid, uid)
+        os.chmod(d, 0o755)
+    path = os.path.join(d, name + '.plist')
     data = load(path) if os.path.exists(path) else {}
     data.update(values)
-    save(path, data, MOBILE, MOBILE, 0o600)
-    print('pref', name, sorted(values))
+    save(path, data, uid, uid, 0o600)
+    print('pref', home, name, sorted(values))
 
 
 def platform_uuid():
@@ -232,6 +243,10 @@ def main():
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})
     merge_host_pref(root, 'com.apple.migration', {'LastSystemVersion': BUILD})
+    for home, uid in (('mobile', MOBILE), ('root', 0)):
+        merge_pref(root, '.GlobalPreferences', {
+            'CAEnableDeepFramebuffer': False, 'CAEnableFramebufferCompression': False,
+            'CAEnableIOSurfaceCompression': False}, home, uid)
     merge_pref(root, 'com.apple.springboard', {
         'BKNoWatchdogs': True,
         'FBLaunchWatchdogExceptions': {'com.apple.purplebuddy': 100.0},

@@ -580,19 +580,45 @@ image_forget(struct eagl *e, GLuint texture)
 	}
 }
 
-/* The memory of the plane an image is, and how long its rows are (a surface of one plane: the surface's own). */
+/*
+ * The memory of the plane an image is, and how long its rows are (a surface of one plane: the
+ * surface's own). A 'b3a8' surface's first plane is taken from the surface's own numbers: the
+ * kernel lays that plane at the start with the surface's row length, and IOSurface.framework's
+ * plane accessors do not read the kernel's plane descriptions right yet (apollo boot 36: "0 bytes
+ * a row" for a plane the kernel gave 4544; see say_planes()).
+ */
 static uint8_t *
 image_base(const struct image *image)
 {
-	return IOSurfaceGetPlaneCount(image->surface) > 0 ? IOSurfaceGetBaseAddressOfPlane(image->surface, image->plane) :
-	    IOSurfaceGetBaseAddress(image->surface);
+	return IOSurfaceGetPlaneCount(image->surface) > 0 && !image->deep ?
+	    IOSurfaceGetBaseAddressOfPlane(image->surface, image->plane) : IOSurfaceGetBaseAddress(image->surface);
 }
 
 static size_t
 image_row(const struct image *image)
 {
-	return IOSurfaceGetPlaneCount(image->surface) > 0 ? IOSurfaceGetBytesPerRowOfPlane(image->surface, image->plane) :
-	    IOSurfaceGetBytesPerRow(image->surface);
+	return IOSurfaceGetPlaneCount(image->surface) > 0 && !image->deep ?
+	    IOSurfaceGetBytesPerRowOfPlane(image->surface, image->plane) : IOSurfaceGetBytesPerRow(image->surface);
+}
+
+/* What IOSurface.framework says of a surface of planes, plane by plane (the kernel logs what it laid out). */
+static void
+say_planes(IOSurfaceRef surface)
+{
+	const uint8_t *base = IOSurfaceGetBaseAddress(surface);
+
+	say("sweet-gl: IOSurface %u: %zu x %zu, %zu bytes a row, %zu an element, %zu in all, %zu planes\n", IOSurfaceGetID(surface),
+	    IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface), IOSurfaceGetBytesPerRow(surface),
+	    IOSurfaceGetBytesPerElement(surface), IOSurfaceGetAllocSize(surface), IOSurfaceGetPlaneCount(surface));
+	for (size_t i = 0; i < IOSurfaceGetPlaneCount(surface) && i < 4; i++) {
+		const uint8_t *at = IOSurfaceGetBaseAddressOfPlane(surface, i);
+
+		say("sweet-gl:   plane %zu: %zu x %zu, %zu bytes a row, %zu an element (%zu x %zu), at +%ld\n", i,
+		    IOSurfaceGetWidthOfPlane(surface, i), IOSurfaceGetHeightOfPlane(surface, i),
+		    IOSurfaceGetBytesPerRowOfPlane(surface, i), IOSurfaceGetBytesPerElementOfPlane(surface, i),
+		    IOSurfaceGetElementWidthOfPlane(surface, i), IOSurfaceGetElementHeightOfPlane(surface, i),
+		    base != NULL && at != NULL ? (long)(at - base) : -1L);
+	}
 }
 
 /* Apple's OpenGL ES takes blue-first pixels into a texture called GL_RGBA; everybody else's calls the texture so too. */
@@ -713,7 +739,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 {
 	IOSurfaceRef surface = image->surface;
 	bool planar = IOSurfaceGetPlaneCount(surface) > 0;
-	size_t row = planar ? IOSurfaceGetBytesPerRowOfPlane(surface, image->plane) : IOSurfaceGetBytesPerRow(surface);
+	size_t row = image_row(image);
 	unsigned pixel = bytes_a_pixel(image->format, image->type);
 	GLint row_length = 0, alignment = 4;
 	uint8_t *base, *flipped = NULL;
@@ -726,7 +752,7 @@ surface_to_texture(struct eagl *e, struct image *image)
 		say("sweet-gl: an IOSurface cannot be locked\n");
 		return;
 	}
-	base = planar ? IOSurfaceGetBaseAddressOfPlane(surface, image->plane) : IOSurfaceGetBaseAddress(surface);
+	base = image_base(image);
 	if ((image->invert || alpha_first) && (flipped = calloc(row, (size_t)image->height)) != NULL) {
 		for (GLsizei y = 0; y < image->height; y++) {
 			const uint8_t *from = base + row * (size_t)(image->invert ? image->height - 1 - y : y);
@@ -4011,6 +4037,9 @@ my_attachImage(id self, SEL selector, unsigned long target, IOSurfaceRef surface
 	deep = pixels == 'b3a8' && IOSurfaceGetPlaneCount(surface) == 2 && IOSurfaceGetBytesPerElementOfPlane(surface, 0) == 4 &&
 	    IOSurfaceGetWidthOfPlane(surface, 0) == IOSurfaceGetWidth(surface) &&
 	    IOSurfaceGetHeightOfPlane(surface, 0) == IOSurfaceGetHeight(surface);
+	if (IOSurfaceGetPlaneCount(surface) > 0 && attached < 4) {
+		say_planes(surface);
+	}
 	if (target != GL_TEXTURE_2D || texture == 0 || !(plain || deep) ||
 	    (image = image_new(e, (GLuint)texture, surface)) == NULL) {
 		say("sweet-gl: -attachImage: target %#lx, texture %d, an IOSurface of '%.4s': not done\n", target, texture,

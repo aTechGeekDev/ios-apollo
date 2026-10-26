@@ -3,8 +3,9 @@
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
 address comes from the sweet live FDT. Usage:
-  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--touch-fw FW.bin] [--gmu-fw a650_gmu.bin]
+  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--p3] [--touch-fw FW.bin] [--gmu-fw a650_gmu.bin]
             [--sqe-fw a650_sqe.fw] [--zap-mdt a650_zap.mdt] [--zap-seg a650_zap.b02]
+/product says the display is sRGB, not the iPhone X's P3 (--p3 keeps P3): see build().
 --touch-fw embeds the NT36675 touch firmware (Xiaomi's
 novatek_nt36675_j3s_fw01.bin, not in git) as /sweet-touch "firmware"; the
 apollo touch driver downloads it into the chip over SPI. --gmu-fw embeds the
@@ -89,7 +90,7 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_extra=()):
+def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_extra=(), p3=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
@@ -235,6 +236,15 @@ def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_
     ])
 
     product_props = d22ap_product()
+    if product_props and not p3:
+        # The panel gets 8-bit 'BGRA' (the kernel copies every frame as such). With the iPhone X's
+        # "P3", iOS picks deep-colour surfaces: with a GPU renderer CoreAnimation draws the screen
+        # in 'b3a8' (apollo boots 35/36: the CoreAnimation bridge, backboardd crash loop), and
+        # MaterialKit's 'b3a8' / CoreAnimation's 'w30r' snapshots are ones its software renderer
+        # cannot draw into (white dock backgrounds; as ios-sailfish found). MobileGestalt reads
+        # these two at the first boot of a root.
+        product_props = [(k, cstr('sRGB') if k in ('artwork-display-gamut', 'display-gamut') else v)
+                         for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the
@@ -284,7 +294,7 @@ if __name__ == '__main__':
     if gpu_extra and not gmu_fw:
         sys.exit('--sqe-fw, --zap-mdt and --zap-seg need --gmu-fw')
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, touch_fw=touch_fw, gmu_fw=gmu_fw,
-                 gpu_extra=gpu_extra)
+                 gpu_extra=gpu_extra, p3='--p3' in sys.argv)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
