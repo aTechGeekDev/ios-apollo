@@ -1,0 +1,102 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -38,6 +38,7 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" bool sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size);     /* SweetGPU.cpp */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -150,6 +151,83 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * apollo (SM8250, DPU 6.0): what the bootloader left the display controller doing. Read only:
++ * groundwork for scanning iOS surfaces out directly instead of copying them (MakrSas/ios-topaz
++ * 0092 points an SSPP's SRC0_ADDR at the surface) and for the panel's refresh rate (120/144 Hz).
++ * MDP at 0x0ae01000 (MDSS + 0x1000); offsets from Linux's dpu_6_0_sm8250.h: SSPP VIG0-3 0x4000 +
++ * 0x2000 each, DMA0-3 0x24000 + 0x2000 each (SRC_SIZE 0x00, SRC_XY 0x08, OUT_SIZE 0x0c, SRC0_ADDR
++ * 0x14, SRC_YSTRIDE0 0x24, SRC_FORMAT 0x30); CTL0-5 0x1000 + 0x200 each (LAYER0 0x00, TOP 0x14,
++ * FLUSH 0x18); INTF0-3 0x6a000 + 0x800 each (HSYNC_CTL 0x08, VSYNC_PERIOD_F0 0x0c, TIMING_ENGINE_EN
++ * 0x6c, FRAME_COUNT 0xac): the frame counters are read twice, 500 ms apart.
++ * Boot-arg sweetfb_probe=0: not done; =2: also the apps SMMU's stream matches for the display
++ * stream IDs (0x800-0x8ff) at 0x15000000 (SMR 0x800 + 4n, S2CR 0xc00 + 4n; type 0 translate,
++ * 1 bypass, 2 fault).
++ */
++static void
++sweet_fb_probe(uint64_t fb)
++{
++	static const struct {
++		const char *name;
++		uint32_t base;
++	} pipes[] = { { "VIG0", 0x4000 }, { "VIG1", 0x6000 }, { "VIG2", 0x8000 }, { "VIG3", 0xa000 },
++		      { "DMA0", 0x24000 }, { "DMA1", 0x26000 }, { "DMA2", 0x28000 }, { "DMA3", 0x2a000 } };
++	uint32_t level = 1, frames[4];
++	volatile uint32_t *mdp;
++
++	PE_parse_boot_argn("sweetfb_probe", &level, sizeof(level));
++	if (level == 0) {
++		return;
++	}
++	mdp = (volatile uint32_t *)ml_io_map(0x0ae01000, 0x70000);
++	if (mdp == NULL) {
++		IOLog("SWEET FB: probe: MDP not mapped\n");
++		return;
++	}
++	for (uint32_t i = 0; i < sizeof(pipes) / sizeof(pipes[0]); i++) {
++		volatile uint32_t *p = mdp + pipes[i].base / 4;
++		uint32_t size = p[0x00 / 4], xy = p[0x08 / 4], out = p[0x0c / 4], addr = p[0x14 / 4];
++
++		IOLog("SWEET FB: probe %s src 0x%x %ux%u at %u,%u stride %u format 0x%x out %ux%u%s\n", pipes[i].name, addr,
++		    size & 0xffff, size >> 16, xy & 0xffff, xy >> 16, p[0x24 / 4] & 0xffff, p[0x30 / 4], out & 0xffff, out >> 16,
++		    addr != 0 && addr == (uint32_t)fb ? "  <- the boot framebuffer" : "");
++	}
++	for (uint32_t i = 0; i < 6; i++) {
++		volatile uint32_t *c = mdp + (0x1000 + 0x200 * i) / 4;
++
++		IOLog("SWEET FB: probe CTL%u layer0 0x%x layer1 0x%x top 0x%x flush 0x%x\n", i, c[0x00 / 4], c[0x04 / 4],
++		    c[0x14 / 4], c[0x18 / 4]);
++	}
++	for (uint32_t i = 0; i < 4; i++) {
++		frames[i] = mdp[(0x6a000 + 0x800 * i + 0xac) / 4];
++	}
++	IOSleep(500);
++	for (uint32_t i = 0; i < 4; i++) {
++		volatile uint32_t *f = mdp + (0x6a000 + 0x800 * i) / 4;
++		uint32_t hsync = f[0x08 / 4], vperiod = f[0x0c / 4], now = f[0xac / 4];
++
++		IOLog("SWEET FB: probe INTF%u engine %u hsync period %u vsync period %u (%u lines); %u frames in 500 ms\n", i,
++		    f[0x6c / 4], hsync & 0xffff, vperiod, (hsync & 0xffff) != 0 ? vperiod / (hsync & 0xffff) : 0, now - frames[i]);
++	}
++	if (level < 2) {
++		return;
++	}
++	volatile uint32_t *smmu = (volatile uint32_t *)ml_io_map(0x15000000, 0x1000);
++	if (smmu == NULL) {
++		return;
++	}
++	uint32_t groups = smmu[0x20 / 4] & 0xff;
++	IOLog("SWEET FB: probe SMMU IDR0 0x%x: %u stream match groups\n", smmu[0x20 / 4], groups);
++	for (uint32_t i = 0; i < groups && i < 128; i++) {
++		uint32_t smr = smmu[(0x800 + 4 * i) / 4], s2cr = smmu[(0xc00 + 4 * i) / 4];
++
++		if ((smr & 0x80000000u) && ((smr & 0xffff) >> 8) == 0x08) {
++			IOLog("SWEET FB: probe SMMU group %u SMR 0x%x (id 0x%x mask 0x%x) S2CR 0x%x (type %u, context %u)\n", i, smr,
++			    smr & 0xffff, (smr >> 16) & 0x7fff, s2cr, (s2cr >> 16) & 3, s2cr & 0xff);
++		}
++	}
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -211,6 +289,7 @@
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	sweet_fb_probe(fPhys);
+ 	return true;
+ }
+ 

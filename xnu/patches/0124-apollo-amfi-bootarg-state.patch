@@ -1,0 +1,40 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -379,6 +379,7 @@
+  */
+ #define AMFI_SYSCALL_CHECK_DYLD_POLICY  0x5a
+ #define AMFI_DYLD_OUTPUT_ALLOW_ALL      0xffULL
++#define AMFI_SYSCALL_BOOTARG_STATE      0x60    /* amfi_interface_query_bootarg_state */
+ 
+ static int
+ sweet_amfi_dyld_syscall(__unused struct proc *p, int call, user_addr_t arg)
+@@ -391,6 +392,20 @@
+ 	char inject[8];
+ 	int error;
+ 
++	if (call == AMFI_SYSCALL_BOOTARG_STATE) {
++		/*
++		 * lsd (the extension point catalog) and installd (MIDaemonConfiguration) ask whether the
++		 * signed /System/Library/xpc/extensions.plist must be checked: enforced unless
++		 * (state & 0x86) != 0. With no real AMFI the check fails and no app extension is known
++		 * (no wallpapers, widgets wait). Bergamota's answer (xnu 0099, same 20H392 build): 0x86.
++		 * Boot-arg sweetamfistate=0: ENOPOLICY as before.
++		 */
++		uint64_t state = 0x86;
++		uint32_t on = 1;
++
++		(void)PE_parse_boot_argn("sweetamfistate", &on, sizeof(on));
++		return on ? copyout(&state, arg, sizeof(state)) : ENOPOLICY;
++	}
+ 	if (call != AMFI_SYSCALL_CHECK_DYLD_POLICY || !PE_parse_boot_argn("sweetinject", inject, sizeof(inject))) {
+ 		return ENOPOLICY;
+ 	}
+@@ -407,7 +422,7 @@
+ 
+ static struct mac_policy_conf sweet_amfi_dyld_conf = {
+ 	.mpc_name = "AMFI",
+-	.mpc_fullname = "SWEET dyld policy (AMFI's name, request 0x5a only)",
++	.mpc_fullname = "SWEET dyld policy (AMFI's name, requests 0x5a and 0x60 only)",
+ 	.mpc_ops = &sweet_amfi_dyld_ops,
+ };
+ 
