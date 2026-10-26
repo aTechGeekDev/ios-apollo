@@ -15,7 +15,7 @@ Apple's open-source XNU kernel (xnu-8796), patched for the phone, boots the **un
 | Touch | Working (Novatek NT36675 over SPI, firmware loaded at every boot) |
 | Buttons | Power, volume up, volume down |
 | Display | iOS drawn in software and copied to the panel |
-| GPU | Adreno 650 up; a program drives it. Mesa (OpenGL ES) and a CoreAnimation bridge are built, not yet run on the phone |
+| GPU | Adreno 650 up. **Mesa draws with it** (OpenGL ES 3.2, freedreno). The CoreAnimation bridge (iOS drawing on the GPU) is built, not yet run on the phone |
 | Not yet | Display power, USB networking, battery, Wi-Fi, Bluetooth, audio, cameras, cellular |
 
 The first boot of a fresh root runs iOS data migration once (an hour or more); later boots are quick. Day-to-day progress and the next steps are in [`NOTES.md`](NOTES.md).
