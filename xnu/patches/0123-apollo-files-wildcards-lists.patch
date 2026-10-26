@@ -1,0 +1,265 @@
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -3,9 +3,12 @@
+  *
+  * tools/mkadt.py --file DEST=LOCAL / --files-from LIST put them into the device tree node
+  * /sweet-files: "fileN" = path, NUL, contents; "ownerN" (if there) = uid, gid, mode (three
+- * 32-bit words) for fileN; "deleteN" = a path to remove. bsdinit_task() calls
++ * 32-bit words) for fileN; "deleteN" = a path to remove; "listN" = a path whose matches (or, for a
++ * folder, whose entries) are printed. In "deleteN" and "listN" a path component may hold one '*'
++ * (any run of characters; three such components at most): iOS names some folders by a UUID made
++ * on the phone (LaunchServices' container), and only files are removed that way. bsdinit_task() calls
+  * sweet_files_install() right before it loads launchd: the root is mounted (read-write with
+- * boot-arg rootrw=1) and nothing has the files open yet. The removals go first; then each
++ * boot-arg rootrw=1) and nothing has the files open yet. The lists go first, then the removals; then each
+  * file is written whole (created, or truncated and written), owner and mode as ownerN says,
+  * else root and 0755 under /usr/local/, 0644 elsewhere; folders missing on the way are made
+  * with the file's owner, mode 0755 (vfs_syscalls.c sweet_kernel_mkdir). The boot after keeps
+@@ -28,6 +31,8 @@
+ #include <sys/vnode.h>
+ #include <sys/uio.h>
+ #include <sys/proc.h>
++#include <sys/dirent.h>
++#include <sys/vnode_if.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ 
+@@ -79,6 +84,203 @@
+ 	return error;
+ }
+ 
++/*
++ * Paths with '*' components (boot-time only, one thread: static buffers). sweet_glob_path holds the
++ * folder being looked at; each level of '*' keeps its own list of matching names.
++ */
++#define SWEET_GLOB_DEPTH        3
++#define SWEET_GLOB_NAMES        32
++#define SWEET_GLOB_MAX          64      /* matches acted on for one path */
++static char sweet_glob_path[1024];
++static char sweet_glob_names[SWEET_GLOB_DEPTH][SWEET_GLOB_NAMES][256];
++static uint8_t sweet_glob_types[SWEET_GLOB_DEPTH][SWEET_GLOB_NAMES];
++static char sweet_glob_dirbuf[8192] __attribute__((aligned(8)));
++
++static bool
++sweet_has_star(const char *s, size_t n)
++{
++	for (size_t i = 0; i < n && s[i] != '\0'; i++) {
++		if (s[i] == '*') {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* NAME (LEN bytes) against PATTERN (PLEN bytes, at most one '*') */
++static bool
++sweet_glob_name(const char *name, size_t len, const char *pattern, size_t plen)
++{
++	size_t star = plen, tail;
++
++	for (size_t i = 0; i < plen; i++) {
++		if (pattern[i] == '*') {
++			star = i;
++			break;
++		}
++	}
++	if (star == plen) {
++		return len == plen && memcmp(name, pattern, len) == 0;
++	}
++	tail = plen - star - 1;
++	return len >= star + tail && memcmp(name, pattern, star) == 0 && memcmp(name + len - tail, pattern + star + 1, tail) == 0;
++}
++
++/* The entries of folder sweet_glob_path that match PATTERN (PLEN bytes) into LEVEL's list; how many. */
++static unsigned
++sweet_glob_read(unsigned level, const char *pattern, size_t plen)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t dvp = NULLVP;
++	unsigned count = 0;
++	off_t offset = 0;
++	int eof = 0;
++	bool full = false;
++
++	if (vnode_open(sweet_glob_path[0] != '\0' ? sweet_glob_path : "/", FREAD, 0, 0, &dvp, ctx) != 0) {
++		return 0;
++	}
++	while (!eof && !full) {
++		uio_t uio = uio_create(1, offset, UIO_SYSSPACE, UIO_READ);
++		int entries = 0, error;
++		size_t got;
++
++		if (uio == NULL) {
++			break;
++		}
++		uio_addiov(uio, (user_addr_t)(uintptr_t)sweet_glob_dirbuf, sizeof(sweet_glob_dirbuf));
++		error = VNOP_READDIR(dvp, uio, VNODE_READDIR_EXTENDED, &eof, &entries, ctx);
++		got = sizeof(sweet_glob_dirbuf) - (size_t)uio_resid(uio);
++		offset = uio_offset(uio);
++		uio_free(uio);
++		if (error != 0 || got == 0) {
++			break;
++		}
++		for (size_t at = 0; at + __builtin_offsetof(struct direntry, d_name) <= got;) {
++			const char *record = sweet_glob_dirbuf + at;
++			uint16_t reclen, namlen;
++			uint8_t type;
++
++			memcpy(&reclen, record + __builtin_offsetof(struct direntry, d_reclen), sizeof(reclen));
++			memcpy(&namlen, record + __builtin_offsetof(struct direntry, d_namlen), sizeof(namlen));
++			memcpy(&type, record + __builtin_offsetof(struct direntry, d_type), sizeof(type));
++			if (reclen == 0 || at + reclen > got) {
++				break;
++			}
++			at += reclen;
++			const char *name = record + __builtin_offsetof(struct direntry, d_name);
++			if (namlen == 0 || namlen >= 256 || (namlen == 1 && name[0] == '.') ||
++			    (namlen == 2 && name[0] == '.' && name[1] == '.') || !sweet_glob_name(name, namlen, pattern, plen)) {
++				continue;
++			}
++			if (count == SWEET_GLOB_NAMES) {
++				printf("SWEET FILES: %s: more than %u matches of a '*'; the rest left out\n", sweet_glob_path, count);
++				full = true;
++				break;
++			}
++			memcpy(sweet_glob_names[level][count], name, namlen);
++			sweet_glob_names[level][count][namlen] = '\0';
++			sweet_glob_types[level][count] = type;
++			count++;
++		}
++	}
++	vnode_close(dvp, FREAD, ctx);
++	return count;
++}
++
++/* A match: printed (LIST) or removed (files only). */
++static void
++sweet_glob_act(bool list, uint8_t type, unsigned *done)
++{
++	(*done)++;
++	if (list) {
++		printf("SWEET FILES: %s%s\n", sweet_glob_path, type == DT_DIR ? "/" : "");
++		return;
++	}
++	if (type != DT_REG) {
++		printf("SWEET FILES: %s: not a file; left\n", sweet_glob_path);
++		return;
++	}
++	int error = unlink1(vfs_context_kernel(), NULLVP, (user_addr_t)(uintptr_t)sweet_glob_path, UIO_SYSSPACE, 0);
++	printf("SWEET FILES: %s: %s (error %d)\n", sweet_glob_path, error == 0 ? "removed" : "NOT removed", error);
++}
++
++/* sweet_glob_path (LEN characters, a folder) followed by REST (components, no leading '/'): every match. */
++static void
++sweet_glob_walk(size_t len, const char *rest, unsigned level, bool list, unsigned *done)
++{
++	const char *comp = rest;
++	size_t at = len;
++
++	for (;;) {
++		const char *end = comp;
++
++		while (*end != '\0' && *end != '/') {
++			end++;
++		}
++		size_t clen = (size_t)(end - comp);
++		if (clen == 0 || at + 1 + clen >= sizeof(sweet_glob_path)) {
++			break;
++		}
++		if (!sweet_has_star(comp, clen)) {
++			sweet_glob_path[at] = '/';
++			memcpy(sweet_glob_path + at + 1, comp, clen);
++			at += 1 + clen;
++			sweet_glob_path[at] = '\0';
++			if (*end == '\0') {
++				/* a named last component after a '*': acted on only if it is there */
++				vnode_t vp = NULLVP;
++				if (vnode_lookup(sweet_glob_path, 0, &vp, vfs_context_kernel()) == 0) {
++					uint8_t type = vnode_isdir(vp) ? DT_DIR : vnode_isreg(vp) ? DT_REG : DT_UNKNOWN;
++					vnode_put(vp);
++					sweet_glob_act(list, type, done);
++				}
++				break;
++			}
++			comp = end + 1;
++			continue;
++		}
++		if (level >= SWEET_GLOB_DEPTH) {
++			printf("SWEET FILES: %s: more than %u '*' components; left\n", rest, SWEET_GLOB_DEPTH);
++			break;
++		}
++		unsigned n = sweet_glob_read(level, comp, clen);
++		for (unsigned i = 0; i < n && *done < SWEET_GLOB_MAX; i++) {
++			size_t nlen = strlen(sweet_glob_names[level][i]);
++
++			if (at + 1 + nlen >= sizeof(sweet_glob_path)) {
++				continue;
++			}
++			sweet_glob_path[at] = '/';
++			memcpy(sweet_glob_path + at + 1, sweet_glob_names[level][i], nlen + 1);
++			if (*end == '\0') {
++				sweet_glob_act(list, sweet_glob_types[level][i], done);
++			} else if (sweet_glob_types[level][i] == DT_DIR) {
++				sweet_glob_walk(at + 1 + nlen, end + 1, level + 1, list, done);
++			}
++			sweet_glob_path[at] = '\0';
++		}
++		break;
++	}
++	sweet_glob_path[len] = '\0';
++}
++
++/* PATH ('*' components allowed): every match printed (LIST; a folder without '*': its entries) or removed. */
++static void
++sweet_glob(const char *path, bool list)
++{
++	char pattern[1024];
++	unsigned done = 0;
++
++	strlcpy(pattern, path, sizeof(pattern));
++	if (list && !sweet_has_star(pattern, sizeof(pattern))) {
++		strlcat(pattern, "/*", sizeof(pattern));
++	}
++	sweet_glob_path[0] = '\0';
++	sweet_glob_walk(0, pattern + 1, 0, list, &done);
++	printf("SWEET FILES: %s: %u match%s %s\n", path, done, done == 1 ? "" : "es", list ? "listed" : "acted on");
++}
++
+ /* The folders PATH's file goes in, those that are not there yet made (OWNER's, 0755). */
+ static int
+ sweet_file_folders(const char *path, const struct sweet_owner *owner)
+@@ -156,6 +358,23 @@
+ 		const void *prop = NULL;
+ 		unsigned int size = 0;
+ 
++		snprintf(name, sizeof(name), "list%u", i);
++		if (SecureDTGetProperty(node, name, &prop, &size) != kSuccess) {
++			break;
++		}
++		const char *path = prop;
++		size_t len = strnlen(path, size < 1024 ? size : 1024);
++		if (len == 0 || len >= size || len >= 1024 || !sweet_file_allowed(path)) {
++			printf("SWEET FILES: %s: not a path that may be listed\n", name);
++			continue;
++		}
++		sweet_glob(path, true);
++	}
++	for (unsigned i = 0; i < 64; i++) {
++		char name[16];
++		const void *prop = NULL;
++		unsigned int size = 0;
++
+ 		snprintf(name, sizeof(name), "delete%u", i);
+ 		if (SecureDTGetProperty(node, name, &prop, &size) != kSuccess) {
+ 			break;
+@@ -166,6 +385,10 @@
+ 			printf("SWEET FILES: %s: not a path that may be removed; left\n", name);
+ 			continue;
+ 		}
++		if (sweet_has_star(path, len)) {
++			sweet_glob(path, false);
++			continue;
++		}
+ 		int error = unlink1(vfs_context_kernel(), NULLVP, (user_addr_t)(uintptr_t)path, UIO_SYSSPACE, 0);
+ 		printf("SWEET FILES: %s: %s (error %d)\n", path, error == 0 ? "removed" : error == ENOENT ? "not there" : "NOT removed",
+ 		    error);

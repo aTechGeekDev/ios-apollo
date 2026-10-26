@@ -1,11 +1,18 @@
 # LaunchServices rebuilds its database at the next boot (mkadt.py --files-from; one boot, then leave out).
 #
-# Bergamota (ry-diffusion/Bergamota docs/EXTENSION_POINTS_2.md, iPhone X 16.7.16 20H392 = our
-# IPSW): lsd seeded its database while the extension catalog was unreadable and dropped every app
+# Bergamota (ry-diffusion/Bergamota docs/EXTENSION_POINTS_2.md, iPhone X 16.7.16 20H392 = our IPSW):
+# lsd seeded its database while the extension catalog was unreadable and dropped every app
 # extension ("Ignoring app extension" x418); the stored database is marked seeded and complete for
 # this build, so lsd never seeds again (pkd: 0 plugins, PosterBoard: 0 extensions). Removing it
-# makes lsd seed again, now with the catalog readable (files.txt: ExtensionKit flag). The container
-# UUID is the one the iPhone X image ships with; a path that is not there is logged "not there".
--/private/var/mobile/Containers/Data/InternalDaemon/3ED48A87-B795-429E-9BCB-E3502EA1A6EC/Library/Caches/com.apple.LaunchServices-4035-v2.csstore
--/private/var/mobile/Containers/Data/InternalDaemon/3ED48A87-B795-429E-9BCB-E3502EA1A6EC/Library/Caches/com.apple.LaunchServices.syncInterrupted
--/private/var/mobile/Containers/Data/InternalDaemon/3ED48A87-B795-429E-9BCB-E3502EA1A6EC/Library/Caches/com.apple.LaunchServices.error
+# makes lsd seed again, now with the catalog readable (files.txt: ExtensionKit flag).
+# The database lives in a container folder named by a UUID made on the phone (Bergamota's
+# 3ED48A87-... was "not there" on apollo, boot 45), hence the '*' (xnu 0123). The "?" lines
+# print what is there first (kernel log, SWEET FILES), the "-" lines remove only the store files.
+?/private/var/mobile/Containers/Data/InternalDaemon/*/Library/Caches/com.apple.LaunchServices*
+?/private/var/containers/Data/System/*/Library/Caches/com.apple.LaunchServices*
+?/private/var/mobile/Library/Caches/com.apple.LaunchServices*
+-/private/var/mobile/Containers/Data/InternalDaemon/*/Library/Caches/com.apple.LaunchServices-*.csstore
+-/private/var/mobile/Containers/Data/InternalDaemon/*/Library/Caches/com.apple.LaunchServices.syncInterrupted
+-/private/var/mobile/Containers/Data/InternalDaemon/*/Library/Caches/com.apple.LaunchServices.error
+-/private/var/containers/Data/System/*/Library/Caches/com.apple.LaunchServices-*.csstore
+-/private/var/mobile/Library/Caches/com.apple.LaunchServices-*.csstore
