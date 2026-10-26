@@ -1178,14 +1178,16 @@ frame_end(struct eagl *e, bool finished)
 	if (e->triangles > e->most_triangles) {
 		e->most_triangles = e->triangles;
 	}
-	if (e->frames <= 40 || e->frames % 20 == 0) {
+	/* every 20 frames for the first 2000, then every 1200 (~20 s at 60 Hz): a long run (boot 44's 40 minutes of the
+	 * migration progress bar) must not push the boot out of the kernel's 4 MiB log */
+	if (e->frames <= 40 || (e->frames <= 2000 ? e->frames % 20 : e->frames % 1200) == 0) {
 		say("sweet-gl: frame %u: %u GL calls, %u draws, %u triangles, %u clears; %u textures refilled from IOSurfaces "
 		    "(%llu KB); %u picture%s copied out, %u drawn in place; %llu us (%llu handing on, %llu waiting, %llu copying "
 		    "out), %llu before it for the IOSurfaces\n", e->frames, e->calls, e->draws, e->triangles, e->clears, e->uploads,
 		    e->upload_bytes >> 10, copied, copied == 1 ? "" : "s", in_place, after - e->began, e->flushing, waited - before,
 		    after - waited, e->attaching);
 	}
-	if (e->frames == 30 || e->frames % 200 == 0) {
+	if (e->frames == 30 || (e->frames <= 2000 ? e->frames % 200 : e->frames % 3600) == 0) {
 		summary(e);
 	}
 	census_report();
