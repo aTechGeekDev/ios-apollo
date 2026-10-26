@@ -695,7 +695,7 @@
 +	const uint8_t bdf[] = {1, 0};
 +	for (unsigned i = 0; i < sizeof(bdf); i++) {
 +		hash ^= bdf[i];
-+		for (unsigned b = 0; b < 8; b++) hash = (hash << 1) ^ ((hash & 0x80) ? 7 : 0);
++		for (unsigned b = 0; b < 8; b++) hash = (uint8_t)((hash << 1) ^ ((hash & 0x80) ? 7 : 0));
 +	}
 +	uint32_t route = PARF + 0x2000 + 4 * hash;
 +	uint32_t old = rd(p, route), wanted = 0x01000100;
@@ -1281,7 +1281,7 @@
 +	while (host->event_consumer[ring] != producer && processed < length / 16) {
 +		uint64_t current = host->event_consumer[ring];
 +		size_t offset = (size_t)(current - base);
-+		volatile uint32_t *event = (volatile uint32_t *)
++		volatile uint32_t *event = (volatile uint32_t *)(volatile void *)
 +		    ((volatile uint8_t *)host->event_ring[ring].bytes + offset);
 +		dma_read_barrier();
 +		uint64_t pointer = event[0] | (uint64_t)event[1] << 32;
@@ -1318,7 +1318,7 @@
 +				return EIO;
 +			}
 +			unsigned tre_slot = (unsigned)((pointer - host->ipcr_rx_ring.address) / 16);
-+			const volatile uint32_t *completed_tre = (const volatile uint32_t *)
++			const volatile uint32_t *completed_tre = (const volatile uint32_t *)(const volatile void *)
 +			    ((const volatile uint8_t *)host->ipcr_rx_ring.bytes + tre_slot * 16u);
 +			dma_read_barrier();
 +			uint64_t buffer = completed_tre[0] |
@@ -1346,7 +1346,7 @@
 +			/* Repost the completed payload buffer at the producer end of the RX ring. */
 +			uint64_t next = host->ipcr_rx_wp;
 +			size_t rx_offset = (size_t)(next - host->ipcr_rx_ring.address);
-+			volatile uint32_t *tre = (volatile uint32_t *)
++			volatile uint32_t *tre = (volatile uint32_t *)(volatile void *)
 +			    ((volatile uint8_t *)host->ipcr_rx_ring.bytes + rx_offset);
 +			tre[0] = (uint32_t)buffer;
 +			tre[1] = (uint32_t)(buffer >> 32);
@@ -1381,7 +1381,7 @@
 +	size_t length = 128u * 16u;
 +	uint64_t command = host->command_wp;
 +	if (!ring_pointer_valid(base, length, command)) return EINVAL;
-+	volatile uint32_t *tre = (volatile uint32_t *)
++	volatile uint32_t *tre = (volatile uint32_t *)(volatile void *)
 +	    ((volatile uint8_t *)host->command_ring.bytes + (size_t)(command - base));
 +	tre[0] = tre[1] = tre[2] = 0;
 +	tre[3] = 1u << 16; /* MHI_CMD_NOP */
@@ -1419,7 +1419,7 @@
 +	size_t length = 128u * 16u;
 +	uint64_t command = host->command_wp;
 +	if (!ring_pointer_valid(base, length, command)) return EINVAL;
-+	volatile uint32_t *tre = (volatile uint32_t *)
++	volatile uint32_t *tre = (volatile uint32_t *)(volatile void *)
 +	    ((volatile uint8_t *)host->command_ring.bytes + (size_t)(command - base));
 +	tre[0] = tre[1] = tre[2] = 0;
 +	tre[3] = (channel << 24) | (18u << 16); /* START_CHAN */
@@ -1469,7 +1469,7 @@
 +	uint64_t event_base = host->event_ring[0].address;
 +	uint64_t event_current = host->event_consumer[0];
 +	if (event_current >= event_base && event_current < event_base + 32u * 16u) {
-+		volatile uint32_t *pending = (volatile uint32_t *)
++		volatile uint32_t *pending = (volatile uint32_t *)(volatile void *)
 +		    ((volatile uint8_t *)host->event_ring[0].bytes +
 +		    (size_t)(event_current - event_base));
 +		dma_read_barrier();
@@ -1600,7 +1600,7 @@
 +	    (uint64_t)slot * IPCR_BUFFER_SIZE;
 +	memcpy((uint8_t *)host->ipcr_tx_buffers.bytes +
 +	    (size_t)slot * IPCR_BUFFER_SIZE, packet, length);
-+	volatile uint32_t *tre = (volatile uint32_t *)
++	volatile uint32_t *tre = (volatile uint32_t *)(volatile void *)
 +	    ((volatile uint8_t *)host->ipcr_tx_ring.bytes + (size_t)(command - ring_base));
 +	tre[0] = (uint32_t)buffer_address;
 +	tre[1] = (uint32_t)(buffer_address >> 32);
