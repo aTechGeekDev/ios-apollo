@@ -3363,6 +3363,153 @@ my_glGetIntegerv(void *context, GLenum name, GLint *values)
 	EAGL_LEAVE(e, 0x348);
 }
 
+/*
+ * What CoreAnimation hands over as pixels is often memory its clients share with it read-only
+ * (VM tag 51, rounded to pages). Mesa reads what the call and the unpack state say is there. In
+ * boot 50 that ran past the end of 5128192-byte images three times (backboardd SIGSEGV, far = the
+ * region's end, the read in Mesa under one frame of ours), taking SpringBoard down with it. Before
+ * an upload the bytes Mesa will read are worked out and set against the readable memory from
+ * `pixels` on; when it does not cover them, the call gets a zero-padded copy of what is there, and
+ * the first of these are logged with everything asked, so that the reason can be found.
+ */
+#define GL_UNPACK_SKIP_ROWS             0x0cf3
+#define GL_UNPACK_SKIP_PIXELS           0x0cf4
+#define GL_PIXEL_UNPACK_BUFFER_BINDING  0x88ef
+
+/* Bytes of one pixel of `format` and `type` as OpenGL ES 3 lays them out; 0 for a kind not known here. */
+static size_t
+unpack_pixel_bytes(GLenum format, GLenum type)
+{
+	size_t parts;
+
+	switch (format) {
+	case GL_RGBA: case GL_BGRA: case 0x8d99:                /* RGBA_INTEGER */
+		parts = 4;
+		break;
+	case 0x1907: case 0x8d98:                               /* RGB, RGB_INTEGER */
+		parts = 3;
+		break;
+	case 0x8227: case 0x8228: case 0x190a:                  /* RG, RG_INTEGER, LUMINANCE_ALPHA */
+		parts = 2;
+		break;
+	case 0x1903: case 0x8d94: case 0x1906: case 0x1909: case 0x1902:  /* RED, RED_INTEGER, ALPHA, LUMINANCE, DEPTH */
+		parts = 1;
+		break;
+	case 0x84f9:                                            /* DEPTH_STENCIL */
+		return type == 0x8dad ? 8 : 4;                  /* FLOAT_32_UNSIGNED_INT_24_8_REV, else 24_8 */
+	default:
+		return 0;
+	}
+	switch (type) {
+	case GL_UNSIGNED_BYTE: case 0x1400:                     /* (signed) bytes */
+		return parts;
+	case 0x1402: case 0x1403: case 0x140b: case 0x8d61:     /* shorts, half floats */
+		return 2 * parts;
+	case 0x1404: case 0x1405: case 0x1406:                  /* ints, floats */
+		return 4 * parts;
+	case 0x8033: case 0x8034: case 0x8363: case 0x8365: case 0x8366:  /* 4444, 5551, 565 and the reversed */
+		return 2;
+	case 0x8368: case 0x8c3b: case 0x8c3e: case 0x84fa:     /* 2_10_10_10_REV, 10F_11F_11F, 5_9_9_9, 24_8 */
+		return 4;
+	default:
+		return 0;
+	}
+}
+
+/* How many bytes from `p` on can be read, looking no further than `want`; the first region's facts go to `region`. */
+static size_t
+readable_from(const void *p, size_t want, vm_address_t *start, vm_size_t *length, unsigned *tag, int *protection)
+{
+	vm_address_t cursor = (vm_address_t)p;
+	size_t have = 0;
+
+	*start = 0;
+	*length = 0;
+	*tag = 0;
+	*protection = 0;
+	for (unsigned regions = 0; regions < 16 && have < want; regions++) {
+		vm_address_t address = cursor;
+		vm_size_t size = 0;
+		natural_t depth = 0;
+		struct vm_region_submap_info_64 info;
+		mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+
+		if (vm_region_recurse_64(mach_task_self(), &address, &size, &depth, (vm_region_recurse_info_t)&info, &count) !=
+		    KERN_SUCCESS || address > cursor || !(info.protection & VM_PROT_READ)) {
+			break;
+		}
+		if (regions == 0) {
+			*start = address;
+			*length = size;
+			*tag = info.user_tag;
+			*protection = info.protection;
+		}
+		have = (size_t)(address + size - (vm_address_t)p);
+		cursor = address + size;
+	}
+	return have;
+}
+
+static __attribute__((noinline)) const void *
+pixels_guarded(const char *call, GLenum format, GLenum type, GLsizei width, GLsizei height, size_t compressed,
+    const void *pixels, void **copy, const void *caller)
+{
+	static unsigned told;
+	GLint row_length = 0, alignment = 4, skip_rows = 0, skip_pixels = 0, buffer = 0;
+	size_t pixel, row, minimum, full, have;
+	vm_address_t start;
+	vm_size_t length;
+	unsigned tag;
+	int protection;
+
+	*copy = NULL;
+	if (pixels == NULL || width <= 0 || height <= 0) {
+		return pixels;
+	}
+	glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &buffer);
+	if (buffer != 0) {
+		return pixels;                  /* an offset into a buffer object, not memory */
+	}
+	if (compressed != 0) {
+		minimum = full = compressed;
+		pixel = row = 0;
+	} else {
+		if ((pixel = unpack_pixel_bytes(format, type)) == 0) {
+			return pixels;
+		}
+		glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
+		glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+		glGetIntegerv(GL_UNPACK_SKIP_ROWS, &skip_rows);
+		glGetIntegerv(GL_UNPACK_SKIP_PIXELS, &skip_pixels);
+		if (alignment <= 0) {
+			alignment = 1;
+		}
+		row = (size_t)(row_length > 0 ? row_length : width) * pixel;
+		row = (row + (size_t)alignment - 1) / (size_t)alignment * (size_t)alignment;
+		minimum = (size_t)(skip_rows > 0 ? skip_rows : 0) * row + (size_t)(skip_pixels > 0 ? skip_pixels : 0) * pixel +
+		    row * (size_t)(height - 1) + (size_t)width * pixel;
+		full = minimum - (size_t)width * pixel + row;
+	}
+	have = readable_from(pixels, full, &start, &length, &tag, &protection);
+	if (have >= full) {
+		return pixels;
+	}
+	if (told < 24) {
+		told++;
+		say("sweet-gl: %s READS PAST THE MEMORY THERE: format %#x type %#x, %d x %d, %zu a pixel, row length %d (%zu bytes "
+		    "a row), alignment %d, skip %d rows %d pixels; reads %zu (%zu with the last row whole), %zu there: region %#lx+%#lx "
+		    "prot %d tag %u, pixels at +%#lx; asked for by %p: a padded copy goes instead\n", call, format, type, width,
+		    height, pixel, row_length, row, alignment, skip_rows, skip_pixels, minimum, full, have, (unsigned long)start,
+		    (unsigned long)length, protection, tag, (unsigned long)((vm_address_t)pixels - start),
+		    caller);
+	}
+	if ((*copy = calloc(1, full)) == NULL) {
+		return NULL;                    /* better an empty texture than a crash */
+	}
+	memcpy(*copy, pixels, have);
+	return *copy;
+}
+
 static void
 my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsizei width, GLsizei height, GLint border,
     GLenum format, GLenum type, const void *pixels)
@@ -3388,7 +3535,11 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
 		group_forget(e, e->bound[e->unit]);
 	}
 	uint64_t began = slow_calls_us != 0 ? now_us() : 0;
-	glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type, pixels);
+	void *copy;
+	const void *safe = pixels_guarded("glTexImage2D", format, type, width, height, 0, pixels, &copy,
+	    __builtin_return_address(0));
+	glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type, safe);
+	free(copy);
 	if (began != 0 && now_us() - began >= slow_calls_us) {
 		/* (with glslow=US: which pictures take long to hand over) */
 		say("tl: slow-tex %dx%d level %d format %#x type %#x%s %llu at %llu\n", width, height, level, format, type,
@@ -3414,7 +3565,11 @@ my_glTexSubImage2D(void *context, GLenum target, GLint level, GLint x, GLint y, 
 		group_read(e, e->bound[e->unit]);
 		group_forget(e, e->bound[e->unit]);
 	}
-	glTexSubImage2D(target, level, x, y, width, height, format, type, pixels);
+	void *copy;
+	const void *safe = pixels_guarded("glTexSubImage2D", format, type, width, height, 0, pixels, &copy,
+	    __builtin_return_address(0));
+	glTexSubImage2D(target, level, x, y, width, height, format, type, safe);
+	free(copy);
 	EAGL_LEAVE(e, 0x9a0);
 }
 
@@ -3536,7 +3691,11 @@ my_glCompressedTexImage2D(void *context, GLenum target, GLint level, GLenum inte
 	if (told < 40) {
 		(void)glGetError();             /* so that what is left behind is this call's own */
 	}
-	glCompressedTexImage2D(target, level, internal, width, height, border, size, data);
+	void *copy;
+	const void *safe = pixels_guarded("glCompressedTexImage2D", internal, 0, width, height, size > 0 ? (size_t)size : 0, data,
+	    &copy, __builtin_return_address(0));
+	glCompressedTexImage2D(target, level, internal, width, height, border, size, safe);
+	free(copy);
 	/*
 	 * A format the driver has not got is refused here, and then the texture stays undefined and
 	 * is read as whatever the driver leaves in it -- magenta, with some. The first of these are
