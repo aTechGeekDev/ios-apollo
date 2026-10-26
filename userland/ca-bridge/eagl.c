@@ -3736,6 +3736,96 @@ static const char vertex_start[] =
     "#define texture2DLod textureLod\n"
     "#line 1\n";
 
+/*
+ * Texture functions CoreAnimation's OpenGL ES renderer has no shader for (iOS 16.7.16, 20H392):
+ * create_shader finds a null entry in its tex_fragment_shaders table, and function_supported
+ * answers from that table, so CoreAnimation goes without them -- materials and vibrancy came out
+ * as flat pale plates (apollo boot 40: Spotlight's results, the widgets). As ios-sailfish does
+ * (tools/sweetgl/eagl.c, the same QuartzCore: the A11 shared cache of 20H392), the entries are
+ * pointed at calls of these functions (install_texture_functions()), whose text
+ * my_glShaderSource() puts ahead of the shader's main():
+ *   0x2d (vibrantColorMatrix: Control Center's off circles, App Library's plates): what is
+ *        behind through the matrix, unpremultiplied, mixed in by the layer's opacity (the
+ *        software renderer's tex_vibrant_color_matrix)
+ *   0x14 (a colour matrix without its premultiply flag): the matrix on the colour as it is
+ *   0x26/0x27 (Context::variable_masked_blur_surface, CAFilter variableBlur): the passes that
+ *        would make smaller copies draw nothing (a surface here has one level), 0x27 blurs in
+ *        one pass instead: 24 taps on a golden-angle disc, Gaussian weighted, the radius from
+ *        the mask
+ * They are written for this library's dialect: version 3.00 with the old words defined back
+ * (fragment_start), gl_LastFragData by EXT_shader_framebuffer_fetch (fragment_fetch).
+ */
+static int texfns_on = 1;                       /* boot-arg gltexfns=0: CoreAnimation's table left alone */
+static const char texfn_matrix[] = "uniform lowp vec4 color_matrix[5];\n";
+static const char texfn_vcm[] =
+    "lowp vec4 sgl_vcm(lowp vec4 s) {\n"
+    "  lowp vec4 d = gl_LastFragData[0];\n"
+    "  lowp vec4 u = vec4(d.rgb / max(d.a, .005), d.a);\n"
+    "  u = clamp(u.r * color_matrix[0] + u.g * color_matrix[1] + u.b * color_matrix[2]\n"
+    "    + u.a * color_matrix[3] + color_matrix[4], 0., 1.);\n"
+    "  u.rgb *= u.a;\n"
+    "  return mix(d, d.a > 0. ? u : vec4(0.), s.a);\n"
+    "}\n";
+static const char texfn_cm4[] =
+    "lowp vec4 sgl_cm4(lowp vec4 s) {\n"
+    "  lowp vec4 u = clamp(s.r * color_matrix[0] + s.g * color_matrix[1] + s.b * color_matrix[2]\n"
+    "    + s.a * color_matrix[3] + color_matrix[4], 0., 1.);\n"
+    "  return vec4(min(u.rgb, u.a), u.a);\n"
+    "}\n";
+static const char texfn_nop[] =
+    "lowp vec4 sgl_nop() {\n"
+    "  discard;\n"
+    "  return vec4(0.);\n"
+    "}\n";
+static const char texfn_vblur[] =
+    "uniform highp vec4 minmax_dir;\n"
+    "lowp vec4 sgl_vblur(lowp vec4 m) {\n"
+    "  highp vec2 tc = texcoord0_0;\n"
+    "  highp vec2 px = vec2(length(vec2(dFdx(tc.x), dFdy(tc.x))), length(vec2(dFdx(tc.y), dFdy(tc.y))));\n"
+    "  mediump float r = (minmax_dir.y > .5 ? 1. - m.a : m.a) * minmax_dir.x * .5;\n"
+    "  mediump vec4 acc = texture2D(texture0, tc);\n"
+    "  if (r < .5) {\n"
+    "    return acc;\n"
+    "  }\n"
+    "  mediump float wsum = 1.;\n"
+    "  for (int i = 1; i <= 24; i++) {\n"
+    "    mediump float f = float(i) / 24.;\n"
+    "    mediump float ang = float(i) * 2.3999632;\n"
+    "    mediump float w = exp(-2. * f);\n"
+    "    acc += w * texture2D(texture0, tc + vec2(cos(ang), sin(ang)) * (sqrt(f) * r) * px);\n"
+    "    wsum += w;\n"
+    "  }\n"
+    "  return acc / wsum;\n"
+    "}\n";
+#define TEXFN_ROOM      (sizeof(texfn_matrix) + sizeof(texfn_vcm) + sizeof(texfn_cm4) + sizeof(texfn_nop) + sizeof(texfn_vblur))
+
+/* The functions TEXT calls (and color_matrix if it does not declare it), ahead of its main(); TEXT has room for them. */
+static void
+texfn_insert(char *text)
+{
+	char *at = strstr(text, "void main");
+	const char *parts[5];
+	size_t add = 0;
+
+	if (at == NULL || strstr(text, "sgl_") == NULL) {
+		return;
+	}
+	parts[0] = (strstr(text, "sgl_vcm(") != NULL || strstr(text, "sgl_cm4(") != NULL) &&
+	    strstr(text, " color_matrix[5];") == NULL ? texfn_matrix : "";
+	parts[1] = strstr(text, "sgl_vcm(") != NULL ? texfn_vcm : "";
+	parts[2] = strstr(text, "sgl_cm4(") != NULL ? texfn_cm4 : "";
+	parts[3] = strstr(text, "sgl_nop(") != NULL ? texfn_nop : "";
+	parts[4] = strstr(text, "sgl_vblur(") != NULL ? texfn_vblur : "";
+	for (unsigned i = 0; i < 5; i++) {
+		add += strlen(parts[i]);
+	}
+	memmove(at + add, at, strlen(at) + 1);
+	for (unsigned i = 0; i < 5; i++) {
+		memcpy(at, parts[i], strlen(parts[i]));
+		at += strlen(parts[i]);
+	}
+}
+
 static GLuint
 my_glCreateShader(void *context, GLenum type)
 {
@@ -3767,15 +3857,16 @@ my_glShaderSource(void *context, GLuint shader, GLsizei count, const GLchar *con
 	for (GLsizei i = 0; i < count; i++) {
 		size += lengths != NULL && lengths[i] >= 0 ? (size_t)lengths[i] : strlen(strings[i]);
 	}
-	if ((text = calloc(1, 2 * size + 64)) == NULL) {
+	if ((text = calloc(1, 2 * size + 64 + TEXFN_ROOM)) == NULL) {
 		glShaderSource(shader, count, strings, lengths);
 		return;
 	}
 	for (GLsizei i = 0; i < count; i++) {
 		strncat(text, strings[i], lengths != NULL && lengths[i] >= 0 ? (size_t)lengths[i] : strlen(strings[i]));
 	}
+	texfn_insert(text);                     /* (before gl_LastFragData is looked for below: sgl_vcm reads it) */
 	/* "#extension" lines must stay ahead of everything that is not the preprocessor's: they move to the top */
-	head = text + size;
+	head = text + size + TEXFN_ROOM;
 	strcpy(head, parts[0]);
 	for (line = text; (line = strstr(line, "#extension")) != NULL; line += 2) {
 		size_t length = strcspn(line, "\n");
@@ -4131,6 +4222,70 @@ display_waits(void)
 	return waits;
 }
 
+/*
+ * The entries of CoreAnimation's tex_fragment_shaders for the functions above, and its
+ * create_shader's per-function uniform switch (a byte table, indexed by the function less 0x11)
+ * set to look up the uniform names they use: 0 color_matrix, 0x95 minmax_dir and the others of
+ * the blur, 0xde none. Addresses as the cache was built (ios-sailfish's); nothing is written
+ * unless the table holds what is expected (colorMatrix4x4Bias at 0x13, empty entries for ours).
+ */
+#define CA_TEX_SHADERS          0x1d5b44a10UL
+#define CA_UNIFORM_CASES        0x18855a1e4UL
+
+static bool
+write_constant(void *at, const void *value, size_t length, vm_prot_t back)
+{
+	vm_address_t page = (vm_address_t)at & ~(vm_address_t)vm_page_mask;
+
+	if (vm_protect(mach_task_self(), page, vm_page_size * 2, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) !=
+	    KERN_SUCCESS) {
+		return false;
+	}
+	memcpy(at, value, length);
+	vm_protect(mach_task_self(), page, vm_page_size * 2, FALSE, back);
+	return true;
+}
+
+static void
+install_texture_functions(void)
+{
+	static const struct {
+		uint8_t function;
+		const char *expression;
+		uint8_t uniforms;
+	} ours[] = { { 0x2d, "sgl_vcm(s0)", 0 }, { 0x14, "sgl_cm4(s0)", 0 }, { 0x26, "sgl_nop()", 0xde },
+		     { 0x27, "sgl_vblur(s1)", 0x95 } };
+	size_t length = 0;
+	const uint8_t *cache = _dyld_get_shared_cache_range(&length);
+	uintptr_t slide;
+	const char **table;
+	uint8_t *cases;
+
+	if (!texfns_on || cache == NULL) {
+		return;
+	}
+	slide = (uintptr_t)cache - CACHE_BASE;
+	table = (const char **)(CA_TEX_SHADERS + slide);
+	cases = (uint8_t *)(CA_UNIFORM_CASES - 0x11 + slide);
+	if (table[0x13] == NULL || strcmp(table[0x13], "colorMatrix4x4Bias(s0)") != 0 || cases[0x13] != 0) {
+		say("sweet-gl: texture functions: not the QuartzCore they were written for; left alone\n");
+		return;
+	}
+	for (size_t i = 0; i < sizeof(ours) / sizeof(ours[0]); i++) {
+		uint8_t function = ours[i].function, uniforms = ours[i].uniforms;
+		bool good;
+
+		if (table[function] != NULL || cases[function] != 0xde) {
+			say("sweet-gl: texture function %#x: not as expected (%p, %#x); left alone\n", function,
+			    (const void *)table[function], cases[function]);
+			continue;
+		}
+		good = write_constant(&table[function], &ours[i].expression, sizeof(char *), VM_PROT_READ) &&
+		    (uniforms == 0xde || write_constant(&cases[function], &uniforms, 1, VM_PROT_READ | VM_PROT_EXECUTE));
+		say("sweet-gl: texture function %#x = %s: %s\n", function, ours[i].expression, good ? "ours" : "COULD NOT BE WRITTEN");
+	}
+}
+
 __attribute__((constructor)) static void
 install(void)
 {
@@ -4201,6 +4356,7 @@ install(void)
 			slow_calls_us = strtoull(argument + 7, NULL, 10);
 		}
 		full_precision = strstr(arguments, "glprecision=0") == NULL;
+		texfns_on = strstr(arguments, "gltexfns=0") == NULL;
 		vblur_on = strstr(arguments, "vblur=0") != NULL ? 0 : strstr(arguments, "vblur=2") != NULL ? 2 : 1;
 		if ((argument = strstr(arguments, "glplain=")) != NULL) {
 			plain_draws = (int)strtoul(argument + 8, NULL, 10);
@@ -4259,6 +4415,7 @@ install(void)
 		}
 	}
 
+	install_texture_functions();
 	if (class == Nil && dlopen("/System/Library/Frameworks/OpenGLES.framework/OpenGLES", RTLD_LAZY) != NULL) {
 		class = objc_getClass("EAGLContext");
 	}
