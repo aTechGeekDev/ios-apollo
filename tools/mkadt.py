@@ -8,7 +8,9 @@ address comes from the sweet live FDT. Usage:
 /product says the display is sRGB, not the iPhone X's P3 (--p3 keeps P3): see build().
 --file /usr/local/PATH=LOCAL (as many as wanted) carries a file in /sweet-files; the kernel
 writes it onto the root before launchd starts (xnu 0120, bsd/dev/sweet_files.c): a new build
-of the CoreAnimation bridge or of Mesa without a new root image. Only /usr/local/ paths.
+of the CoreAnimation bridge or of Mesa without a new root image. --files-from LIST: the same
+for every "DEST=LOCAL" line of LIST (tools/wallpaper-files.py writes such lists). Only
+/usr/local/ and /Library/Wallpaper/ paths; 64 files and 48 MiB at most.
 --touch-fw embeds the NT36675 touch firmware (Xiaomi's
 novatek_nt36675_j3s_fw01.bin, not in git) as /sweet-touch "firmware"; the
 apollo touch driver downloads it into the chip over SPI. --gmu-fw embeds the
@@ -299,17 +301,27 @@ if __name__ == '__main__':
     if gpu_extra and not gmu_fw:
         sys.exit('--sqe-fw, --zap-mdt and --zap-seg need --gmu-fw')
     files = []
+    wanted = []                                 # (where it came from, "DEST=LOCAL")
     for i, arg in enumerate(sys.argv):
         if arg == '--file':
-            dest, _, local = sys.argv[i + 1].partition('=')
-            if not dest.startswith('/usr/local/') or '/../' in dest or not local:
-                sys.exit(f'--file {sys.argv[i + 1]}: give /usr/local/PATH=LOCAL_FILE')
-            files.append((dest, open(local, 'rb').read()))
-            print(f'file for the root: {dest} ({len(files[-1][1])} bytes)', file=sys.stderr)
+            wanted.append(('--file', sys.argv[i + 1]))
+        elif arg == '--files-from':
+            wanted += [(f'{sys.argv[i + 1]} line {n}', line.strip())
+                       for n, line in enumerate(open(sys.argv[i + 1]), 1) if line.strip() and not line.startswith('#')]
+    for where, spec in wanted:
+        dest, _, local = spec.partition('=')
+        # the kernel takes the same prefixes (sweet_file_allowed)
+        if not dest.startswith(('/usr/local/', '/Library/Wallpaper/')) or '/../' in dest + '/' or not local:
+            sys.exit(f'{where}: {spec}: give /usr/local/PATH=LOCAL_FILE or /Library/Wallpaper/PATH=LOCAL_FILE')
+        files.append((dest, open(local, 'rb').read()))
+        print(f'file for the root: {dest} ({len(files[-1][1])} bytes)', file=sys.stderr)
     if len(files) > 64:
-        sys.exit('--file: 64 at most')
+        sys.exit(f'--file/--files-from: {len(files)} files, 64 at most')
     if sum(len(d) for _, d in files) > 48 << 20:
-        sys.exit('--file: more than 48 MiB in all; the boot image would grow too much')
+        sys.exit(f'--file/--files-from: {sum(len(d) for _, d in files) / 1048576:.1f} MiB in all, more than 48 MiB; '
+                 'the boot image would grow too much')
+    if files:
+        print(f'files for the root: {len(files)}, {sum(len(d) for _, d in files) / 1048576:.1f} MiB', file=sys.stderr)
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, touch_fw=touch_fw, gmu_fw=gmu_fw,
                  gpu_extra=gpu_extra, p3='--p3' in sys.argv, files=files)
     blob = adt.serialize(root)

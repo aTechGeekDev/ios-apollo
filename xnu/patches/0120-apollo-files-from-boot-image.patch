@@ -25,7 +25,7 @@
  bsd/dev/unix_startup.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_files.c
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,111 @@
 +/*
 + * sweet_files.c - files the boot image carries, written onto the root before launchd starts.
 + *
@@ -33,12 +33,13 @@
 + * /sweet-files "fileN" = path, NUL, contents. bsdinit_task() calls sweet_files_install()
 + * right before it loads launchd: the root is mounted (read-write with boot-arg rootrw=1)
 + * and nothing has the files open yet. Each one is written whole (created, or truncated
-+ * and written), mode 0755, owner root; the boot after keeps it, with or without it in
++ * and written), mode 0755 (0644 outside /usr/local/), owner root; the boot after keeps it, with or without it in
 + * the device tree. So a new build of the CoreAnimation bridge or of Mesa goes onto the
 + * phone with a new boot image, and the root and what iOS has written into it (its first
 + * boot, settings) stay as they are.
 + *
-+ * Only paths under /usr/local/ are taken. Boot-arg sweetfiles=0: none are written.
++ * Only paths under /usr/local/ (our libraries) and /Library/Wallpaper/ (the stock wallpapers'
++ * layers as PNG: tools/wallpaper-files.py) are taken. Boot-arg sweetfiles=0: none are written.
 + */
 +#include <pexpert/arm64/board_config.h>
 +
@@ -56,7 +57,24 @@
 +
 +void sweet_files_install(void);
 +
-+#define SWEET_FILES_PREFIX      "/usr/local/"
++static const char *const sweet_files_prefixes[] = { "/usr/local/", "/Library/Wallpaper/" };
++
++/* (the kernel has no strstr: a ".." component, looked for by hand) */
++static bool
++sweet_file_allowed(const char *path)
++{
++	for (const char *p = path; *p != '\0'; p++) {
++		if (p[0] == '/' && p[1] == '.' && p[2] == '.' && (p[3] == '/' || p[3] == '\0')) {
++			return false;
++		}
++	}
++	for (size_t i = 0; i < sizeof(sweet_files_prefixes) / sizeof(sweet_files_prefixes[0]); i++) {
++		if (strncmp(path, sweet_files_prefixes[i], strlen(sweet_files_prefixes[i])) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
 +
 +static int
 +sweet_file_write(const char *path, const uint8_t *data, size_t size)
@@ -65,7 +83,8 @@
 +	vnode_t vp = NULLVP;
 +	int error;
 +
-+	error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, 0755, 0, &vp, ctx);
++	error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, strncmp(path, "/usr/local/", 11) == 0 ? 0755 : 0644, 0,
++	    &vp, ctx);
 +	if (error != 0) {
 +		return error;
 +	}
@@ -106,9 +125,8 @@
 +		}
 +		const char *path = prop;
 +		size_t len = strnlen(path, size < 1024 ? size : 1024);
-+		if (len == 0 || len >= size || len >= 1024 || strncmp(path, SWEET_FILES_PREFIX, strlen(SWEET_FILES_PREFIX)) != 0 ||
-+		    strstr(path, "/../") != NULL) {
-+			printf("SWEET FILES: %s: not a path under " SWEET_FILES_PREFIX "; not written\n", name);
++		if (len == 0 || len >= size || len >= 1024 || !sweet_file_allowed(path)) {
++			printf("SWEET FILES: %s: not a path that may be written; not written\n", name);
 +			continue;
 +		}
 +		const uint8_t *data = (const uint8_t *)prop + len + 1;
