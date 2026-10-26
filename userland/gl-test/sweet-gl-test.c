@@ -12,6 +12,8 @@
  * After HackiOS's userland/src/gl_test.c (OOSEX GANG, MIT): the triangle and the OSMesa ES
  * context. Mesa's and IOKit's declarations are written out here: the iPhoneOS SDK has neither.
  */
+#include <dlfcn.h>
+#include <errno.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <stdint.h>
@@ -91,6 +93,41 @@ extern void glReadPixels(int x, int y, int width, int height, unsigned format, u
 
 #define SIZE 256
 
+/* <sys/kern_memorystatus.h> (not in the iPhoneOS SDK), as far as used here */
+#define MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES        7
+#define MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES        8
+struct memlimit {
+	int32_t active;                 /* MB; <= 0 when set: no limit of its own, only the system-wide one */
+	uint32_t active_attr;
+	int32_t inactive;
+	uint32_t inactive_attr;
+};
+
+/*
+ * iOS kills a daemon that goes over its memory limit (jetsam), and launchd gives a job it has no
+ * settings for a small one: boot 33 lost this test inside OSMesaCreateContextAttribs that way
+ * (exit reason namespace 1 = jetsam, code 7 = per-process limit). As root it may lift its own.
+ */
+static void
+lift_memory_limit(void)
+{
+	int (*control)(uint32_t, int32_t, uint32_t, void *, size_t) =
+	    (int (*)(uint32_t, int32_t, uint32_t, void *, size_t))dlsym(RTLD_DEFAULT, "memorystatus_control");
+	struct memlimit before = { 0, 0, 0, 0 }, none = { -1, 0, -1, 0 }, after = { 0, 0, 0, 0 };
+
+	if (control == NULL) {
+		printf("sweet-gl-test: no memorystatus_control: memory limit left as it is\n");
+		return;
+	}
+	control(MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES, getpid(), 0, &before, sizeof(before));
+	if (control(MEMORYSTATUS_CMD_SET_MEMLIMIT_PROPERTIES, getpid(), 0, &none, sizeof(none)) != 0) {
+		printf("sweet-gl-test: memory limit %d MB, not lifted: %s\n", before.active, strerror(errno));
+		return;
+	}
+	control(MEMORYSTATUS_CMD_GET_MEMLIMIT_PROPERTIES, getpid(), 0, &after, sizeof(after));
+	printf("sweet-gl-test: memory limit %d MB -> %d MB\n", before.active, after.active);
+}
+
 static uint64_t
 now_us(void)
 {
@@ -157,6 +194,7 @@ main(int argc, char **argv)
 	if (frames == 0 || frames > 100000)
 		frames = 100;
 	setvbuf(stdout, NULL, _IOLBF, 0);
+	lift_memory_limit();
 	printf("sweet-gl-test: waiting for the SweetGPU service\n");
 	for (unsigned waited = 0; (service = IOServiceGetMatchingService(0, IOServiceMatching("SweetGPU"))) == 0; waited += 2) {
 		if (waited >= 180) {
