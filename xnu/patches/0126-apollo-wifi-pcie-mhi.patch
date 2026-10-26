@@ -1652,7 +1652,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_wifi.c
-@@ -0,0 +1,872 @@
+@@ -0,0 +1,880 @@
 +/*
 + * Wi-Fi of apollo (QCA6390 on PCIe0), phase 1: power, link, firmware boot.
 + * Nothing runs unless boot-arg sweetwifi=N asks for steps 1..N. The steps
@@ -1708,6 +1708,14 @@
 +extern int hz;
 +extern int sweet_rpmh_wifi_power(void);
 +void sweet_wifi_init(void);
++
++/* osfmk/arm/memory_types.h, not visible to BSD code (as in sweet_gpu.c) */
++#ifndef VM_WIMG_IO
++#define VM_WIMG_IO              0x7u    /* coherent | guarded | not cacheable: device */
++#endif
++#ifndef VM_WIMG_WCOMB
++#define VM_WIMG_WCOMB           0x6u    /* not cacheable | coherent: normal non-cacheable */
++#endif
 +
 +static uint32_t wifi_steps, wifi_delay = 5, wifi_poll_ms = 5000;
 +
