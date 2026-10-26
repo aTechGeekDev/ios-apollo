@@ -1,0 +1,2 @@
+# Undo jobs-off.txt: launchd's override list empty again.
+/private/var/db/com.apple.xpc.launchd/disabled.plist=tools/root-files/launchd-disabled-none.plist 0:0:0644

@@ -1,0 +1,10 @@
+# Jobs switched off through launchd's own override list (what `launchctl disable system/LABEL`
+# writes), instead of editing launchd.plist (boot 46: launchd_cache_loader refused an edited one).
+# fairplayd.H2: no FairPlay hardware here; it exits at launch and launchd starts it again every few
+# seconds, so requests queued on its port are never answered and the caller waits forever
+# (ios-sailfish: locationd and the CoreLocation data migrator; here the guess is LaunchServices'
+# seeding (boot 48: lsd stuck in its app scan) and Settings > About). bluetoothd: no Bluetooth
+# driver yet, same loop. A disabled job's services are not registered, so a request fails at once.
+# This replaces the phone's disabled.plist (its earlier contents are not known; launchd made it at
+# the first boot). Undo: jobs-on.txt.
+/private/var/db/com.apple.xpc.launchd/disabled.plist=tools/root-files/launchd-disabled.plist 0:0:0644
