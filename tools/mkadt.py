@@ -320,6 +320,9 @@ if __name__ == '__main__':
     wifi = []                                   # (property, bytes) of /sweet-wifi
     if '--wifi-fw' in sys.argv:
         where = sys.argv[sys.argv.index('--wifi-fw') + 1]
+        if not os.path.exists(where):
+            sys.exit(f'--wifi-fw {where}: not there. Pull the firmware from the phone first (in recovery): '
+                     'tools/pull-wifi-fw.sh')
         picked = {}
         if os.path.isdir(where):
             names = sorted(os.listdir(where))
