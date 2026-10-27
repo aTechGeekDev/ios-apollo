@@ -326,8 +326,9 @@ if __name__ == '__main__':
         picked = {}
         if os.path.isdir(where):
             names = sorted(os.listdir(where))
+            lower = {n.lower(): n for n in names}       # (FAT names may come in capitals: AMSS20.BIN)
             for prop, choices in (('amss', ('amss20.bin', 'amss.bin')), ('m3', ('m3.bin',)), ('regdb', ('regdb.bin',))):
-                found = [n for n in choices if n in names]
+                found = [lower[n] for n in choices if n in lower]
                 if found:
                     picked[prop] = os.path.join(where, found[0])
             boards = [n for n in names if re.fullmatch(r'(bdwlan|bd_).*\.elf', n, re.I)]

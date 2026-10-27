@@ -25,15 +25,27 @@ state=$(adb get-state 2>/dev/null | tr -d '\r' || true)
 # /vendor (and the modem partition) may need mounting in recovery.
 adb shell 'mount /vendor 2>/dev/null; mount -o ro /vendor 2>/dev/null; mount /firmware 2>/dev/null; mount -o ro /firmware 2>/dev/null; mount /vendor/firmware_mnt 2>/dev/null; mount -o ro /vendor/firmware_mnt 2>/dev/null' >/dev/null 2>&1 || true
 
+# The radio's firmware is in the modem partition (FAT; Android mounts it at /vendor/firmware_mnt), which a
+# recovery often leaves unmounted: then it is mounted here, read-only, with lower-case names as Android has them.
+adb shell 'if [ ! -d /vendor/firmware_mnt/image ]; then
+	for p in /dev/block/bootdevice/by-name/modem /dev/block/by-name/modem; do
+		[ -e "$p" ] || continue
+		mkdir -p /mnt/sweet-modem
+		mount -t vfat -o ro,shortname=lower "$p" /mnt/sweet-modem 2>/dev/null && break
+	done
+fi' >/dev/null 2>&1 || true
+trap "adb shell 'umount /mnt/sweet-modem 2>/dev/null' >/dev/null 2>&1 || true" EXIT
+
+rm -rf "$out"		# (only this script's pulls are there: a second run starts afresh)
 mkdir -p "$out"
 # One path a line; directories that do not exist are skipped quietly.
-adb shell 'for d in /vendor/firmware /vendor/firmware_mnt /firmware /vendor/etc/wifi /odm/firmware /system/vendor/firmware; do
+adb shell 'for d in /vendor/firmware /vendor/firmware_mnt /mnt/sweet-modem /firmware /vendor/etc/wifi /odm/firmware /system/vendor/firmware; do
 	[ -d "$d" ] && find "$d" -type f \( -iname "amss*.bin" -o -iname "m3*.bin" -o -iname "bdwlan*" -o -iname "bd_*" \
 		-o -iname "regdb*.bin" -o -ipath "*qca6390*" -o -iname "WCNSS_qcom_cfg.ini" \) 2>/dev/null
 done' | tr -d '\r' | sort -u > "$out/found.txt"
 
 if [ ! -s "$out/found.txt" ]; then
-	echo "pull-wifi-fw.sh: no QCA6390 firmware found under /vendor/firmware, /vendor/firmware_mnt, /firmware." >&2
+	echo "pull-wifi-fw.sh: no QCA6390 firmware found under /vendor/firmware, /vendor/firmware_mnt (or the modem partition), /firmware." >&2
 	echo "  Look by hand:  adb shell 'find / -xdev -iname \"amss*\" 2>/dev/null'" >&2
 	exit 1
 fi
@@ -42,7 +54,7 @@ echo "found on the phone:"
 sed 's/^/  /' "$out/found.txt"
 while IFS= read -r path; do
 	[ -n "$path" ] || continue
-	name=$(basename "$path")
+	name=$(basename "$path" | tr 'A-Z' 'a-z')	# (a FAT partition mounted without shortname=lower says AMSS20.BIN)
 	# the same name in two places (e.g. qca6390/ and the top): keep both, the second with its folder
 	dest=$out/$name
 	[ -e "$dest" ] && dest=$out/$(basename "$(dirname "$path")")-$name
