@@ -21,6 +21,9 @@ on:
       - "xnu/patches/**"
       - "tools/validate-repo.py"
       - "tools/mk-wlfw-header.py"
+      - "tools/mk-ath11k.sh"
+      - "tools/xnu-series-file.py"
+      - "wifi/**"
       - ".github/workflows/xnu.yml"
 
 concurrency:
@@ -102,6 +105,29 @@ jobs:
           sudo xcode-select -s "$XC"
           xcodebuild -version
           xcrun --find iig
+
+      # The Wi-Fi driver (0128): Linux 7.0.14's ath11k, unmodified, compiled on FreeBSD 15.1's
+      # LinuxKPI and our wifi/lx into one object that the kernel links (SWEET_OBJECTS, read by
+      # makedefs/MakeInc.def). Neither source tree is kept in git: both are fetched here at fixed
+      # commits, and only the files the build reads.
+      - name: Wi-Fi driver object (ath11k of Linux 7.0.14)
+        run: |
+          fetch() {   # fetch DIR URL TAG COMMIT PATH...
+            local dir=$1 url=$2 tag=$3 commit=$4
+            shift 4
+            git clone -q --depth 1 --filter=blob:none --sparse --branch "$tag" "$url" "$dir"
+            git -C "$dir" sparse-checkout set --no-cone "$@"
+            test "$(git -C "$dir" rev-parse HEAD)" = "$commit"
+          }
+          fetch linux https://github.com/gregkh/linux v7.0.14 458c6079fc1d41d564c37679c8ace02cd83ee817 \
+            /drivers/net/wireless/ath/ath11k/ /drivers/net/wireless/ath/spectral_common.h
+          fetch freebsd https://github.com/freebsd/freebsd-src release/15.1.0 96841ea08dcfa84b954a32dc5ae1a26c28966cf4 \
+            /COPYRIGHT $(tools/mk-ath11k.sh --freebsd-paths)
+          python3 tools/xnu-series-file.py khdr bsd/dev/hakios.lx.h bsd/dev/hakios.sta.h \
+            bsd/dev/hakios.qmi.h bsd/dev/hakios.qrtr.h
+          tools/mk-ath11k.sh linux freebsd khdr ath11k-build
+          cat ath11k-build/out/kernel-calls.txt | tr '\n' ' '; echo
+          echo "SWEET_OBJECTS=$PWD/ath11k-build/out/ath11k.o" >> "$GITHUB_ENV"
 
       - name: Build
         working-directory: dxb
