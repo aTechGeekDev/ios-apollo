@@ -58,10 +58,12 @@ while IFS= read -r path; do
 	# the same name in two places (e.g. qca6390/ and the top): keep both, the second with its folder
 	dest=$out/$name
 	[ -e "$dest" ] && dest=$out/$(basename "$(dirname "$path")")-$name
-	if adb pull "$path" "$dest" >/dev/null 2>&1 && [ -s "$dest" ]; then
+	# adb pull, or else through the shell that found it (some recoveries' adb pull does not see what the shell mounted)
+	if { err=$(adb pull "$path" "$dest" 2>&1 >/dev/null) && [ -s "$dest" ]; } ||
+	    { adb exec-out cat "$path" > "$dest" 2>/dev/null && [ -s "$dest" ]; }; then
 		printf 'pulled %-28s %9s bytes  sha256 %s\n' "${dest#"$out"/}" "$(stat -c %s "$dest")" "$(sha256sum "$dest" | cut -c1-16)"
 	else
-		printf 'could not pull %s\n' "$path"
+		printf 'could not pull %s: %s\n' "$path" "$(echo "$err" | tail -1)"
 		rm -f "$dest"
 	fi
 done < "$out/found.txt"

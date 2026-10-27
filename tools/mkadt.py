@@ -27,7 +27,7 @@ the 3D core from secure mode with them (sweetgpu=20 and up). --wifi-fw embeds th
 QCA6390 Wi-Fi firmware (the phone's amss20.bin / amss.bin, tools/pull-wifi-fw.sh, not in git)
 as /sweet-wifi "amss" for sweet_wifi.c (sweetwifi=4 and up, xnu 0126). Given the folder
 (research/apollo-wifi/) it also carries m3.bin as "m3", regdb.bin as "regdb" and the board file
-(the one bdwlan*/bd_* .elf there, or --wifi-board FILE) as "board" for sweet_wlfw.c (sweetwifi=9,
+(the one bdwlan*/bd_* .elf there, bd_j3sgl.elf if there are several, or --wifi-board FILE) as "board" for sweet_wlfw.c (sweetwifi=9,
 xnu 0127).
 """
 import hashlib, os, re, struct, sys
@@ -336,6 +336,12 @@ if __name__ == '__main__':
                 picked['board'] = sys.argv[sys.argv.index('--wifi-board') + 1]
             elif len(boards) == 1:
                 picked['board'] = os.path.join(where, boards[0])
+            elif 'bd_j3sgl.elf' in [n.lower() for n in boards]:
+                # the modem partition carries the board files of several Xiaomi phones; apollo is J3S, and
+                # j3sgl its global version (bd_j3s.elf: China, the Redmi K30S Ultra; bd_j3sin.elf: India)
+                picked['board'] = os.path.join(where, [n for n in boards if n.lower() == 'bd_j3sgl.elf'][0])
+                print('Wi-Fi board: several there; bd_j3sgl.elf (apollo, global) taken; --wifi-board FILE for another',
+                      file=sys.stderr)
             elif boards:
                 sys.exit(f'--wifi-fw {where}: board files {", ".join(boards)}: say which with --wifi-board FILE')
         else:
