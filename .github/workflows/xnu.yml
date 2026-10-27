@@ -145,6 +145,19 @@ jobs:
           grep -c -E ' error:' build.log || true
           grep -n -B4 -A8 -E ' error:' build.log | head -600 || true
 
+      # Green alone is not enough: build.sh skips a patch git apply refuses (a warning only), and a
+      # kernel linked without the Wi-Fi driver object runs sweet_lx.c's stand-ins. Both fail here.
+      - name: Check every patch and the Wi-Fi driver are in
+        run: |
+          ours=$( (cd xnu/patches && ls *.patch); echo 0999-generated-sweet-wlfw-ath11k.patch )
+          if grep -F 'Skipping patch' build.log | grep -F "$ours"; then
+            echo "a patch of ours was not applied"; exit 1
+          fi
+          for k in dxb/fakeroot/System/Library/Kernels/kernel.*; do [ -f "$k" ] && break; done
+          ls -l "$k"
+          strings -a "$k" | grep -F 'the firmware has said "unified ready"'     # wifi/lx/src/lx_bus.c: ath11k.o
+          strings -a "$k" | grep -F 'THE DRIVER IS UP'                           # bsd/dev/sweet_wifi.c (0128)
+
       - name: Package build tree for local compiles
         if: always()
         run: |
