@@ -1,0 +1,68 @@
+--- a/bsd/dev/sweet_sta.c
++++ b/bsd/dev/sweet_sta.c
+@@ -129,8 +129,24 @@
+ 			}
+ 			lck_mtx_unlock(&sta_lock);
+ 		} else if (leave) {
++			/*
++			 * (xnu 0133) The link is said to be gone only if there was one (as when the power goes off,
++			 * above): wifid leaves before every join, twice, joined or not, and a "link down" that reaches
++			 * it after its join has begun reads as the join failing (boot 57: the saved network's join came
++			 * through in the kernel, and Settings asked for the password again).
++			 */
++			struct hakios_sta_state *state = kalloc_data(sizeof(*state), Z_WAITOK | Z_ZERO);
++			bool was_joined = false;
++
++			if (state != NULL) {
++				ops->state(state);
++				was_joined = state->phase == HAKIOS_STA_JOINED || state->phase == HAKIOS_STA_JOINING;
++				kfree_data(state, sizeof(*state));
++			}
+ 			ops->leave();
+-			hakios_apple80211_event(HAKIOS_STA_LINK, 0);
++			if (was_joined) {
++				hakios_apple80211_event(HAKIOS_STA_LINK, 0);
++			}
+ 		} else if (do_join) {
+ 			error = ops->join(&join);
+ 			bzero(&join, sizeof(join));
+--- a/bsd/dev/sweet_apple80211.c
++++ b/bsd/dev/sweet_apple80211.c
+@@ -798,7 +798,15 @@
+ errno_t
+ hakios_apple80211_ioctl(u_long command, void *data)
+ {
+-	static unsigned said;
++	/*
++	 * (xnu 0133) Said: each kind of request (its number, get or set) its first 12 times; scans, joins,
++	 * leaves, power and the join's result (10, 19, 20, 21, 22) up to 600 times in all; a kind's answer
++	 * when it differs from the last one said. One count for all of them (800 lines) used to run out
++	 * before the first join (boot 57: nothing said after the ASSOCIATE).
++	 */
++	static uint16_t said[512][2];
++	static int said_error[512][2];
++	static unsigned said_important;
+ 	struct apple80211req *request = data;
+ 	char who[32] = "?", what[200] = "";
+ 	bool is_set = command == SIOCSA80211;
+@@ -810,9 +818,17 @@
+ 	proc_selfname(who, sizeof(who));
+ 	error = is_set ? set(request, what, sizeof(what)) : get(request);
+ 	note(request, is_set, error);
+-	/* (a request that is repeated for ever is said a few hundred times) */
+-	if (said < 800) {
+-		said++;
++	unsigned kind = request->req_type < 512 ? request->req_type : 511;
++	bool important = kind == 10 || kind == 19 || kind == 20 || kind == 21 || kind == 22;
++	bool changed = said[kind][is_set] != 0 && said_error[kind][is_set] != error;
++	if (said[kind][is_set] < 12 || (important && said_important < 600) || (changed && said_important < 600)) {
++		if (said[kind][is_set] >= 12) {
++			said_important++;
++		}
++		if (said[kind][is_set] < UINT16_MAX) {
++			said[kind][is_set]++;
++		}
++		said_error[kind][is_set] = error;
+ 		printf("apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
+ 		    type_name(request->req_type), request->req_val, request->req_len, what, error == 0 ? "answered\n" : error ==
+ 		    EOPNOTSUPP ? "REFUSED\n" : "");
