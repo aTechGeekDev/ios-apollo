@@ -18,7 +18,8 @@ Apple's open-source XNU kernel (xnu-8796), patched for the phone, boots the **un
 | GPU | Adreno 650 up. **Mesa draws with it** (OpenGL ES 3.2, freedreno), and iOS's own renderer (CoreAnimation in backboardd) draws **the whole GUI** on it through the bridge: lock screen, home screen, keyboard, and the blur of Control Center, Spotlight and the App Library (2026-10-26). A backboardd crash on some image uploads has a fix built, not yet tested |
 | Wi-Fi | **Working** (QCA6390, Linux's ath11k built into the kernel, `sweetwifi=12`): iOS's Wi-Fi settings list the networks around; WPA2 networks join from Settings or Control Center; passwords are kept and saved networks join by themselves after a reboot; the signal-strength icon is right; the Wi-Fi switch turns the radio off and on; the internet works in apps and Safari (2026-10-28) |
 | Bluetooth | **The radio works in the kernel** (QCA6390 over the UART of serial engine 6, the phone's own firmware, `sweetbt=5`: it hears the LE devices around, 2026-10-28). iOS's Bluetooth (bluetoothd, Settings) is the next step |
-| Not yet | Display power, USB networking, battery, Bluetooth, audio, cameras, cellular |
+| Audio | **iOS's sound plays through both speakers** (2026-10-28): the audio DSP started from the phone's own firmware, the tertiary TDM interface and the two CS35L41 amplifiers (kernel drivers of [hakios-apollo](https://github.com/enesuzun2002/hakios-apollo)), and its audio-server plug-in (`userland/audio/`), `apollo_audio=5`; 20 dB under Android's level by default (`apollo_sound_below=`). No microphones or vibration yet |
+| Not yet | Display power, USB networking, battery, Bluetooth in iOS, microphones, vibration, cameras, cellular |
 
 The first boot of a fresh root runs iOS data migration once (an hour or more); later boots are quick. Day-to-day progress and the next steps are in [`NOTES.md`](NOTES.md).
 
