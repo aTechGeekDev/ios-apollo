@@ -1,0 +1,135 @@
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -10,7 +10,7 @@
+  * answer is kIOReturnNotFound; answering with a handle is the path a
+  * userspace reboot takes, so no bag file is needed.
+  *
+- * Every call is logged (selector, caller, argument shapes, result) so the
++ * Every call is logged (selector, caller, argument shapes, result; key wraps only at first) so the
+  * next selectors the system needs show up on the console; unknown ones fail
+  * with kIOReturnUnsupported.
+  */
+@@ -163,6 +163,70 @@
+ 	return sweet_aks_struct_out(args, buf, n);
+ }
+ 
++/*
++ * Wrap (10) and unwrap (11) a key (xnu 0134). securityd gives every keychain item a key of its
++ * own and has it wrapped by the key of the item's protection class before it stores the item,
++ * unwrapped to read it again; refused (kIOReturnUnsupported), the keychain keeps nothing -- a
++ * Wi-Fi password among it, so wifid asked for it again at every join (boot 58). With no Secure
++ * Enclave there is nothing secret to wrap with: as in HackiOS's iokit/Kernel/MiniAppleKeyStore.cpp
++ * (github.com/oosexgang/hackios-xnu-kernel, APSL 2.0), the "wrapped" key is a mark, the class and
++ * the key mixed with a fixed pattern, 8 bytes longer than the key as AES key wrap (RFC 3394) is,
++ * which is what callers make room for. It protects nothing (this key store has no passcode and is
++ * never locked anyway), and it is the same from boot to boot, so what was stored can be read back.
++ * In: scalars {handle, class}, the key (wrap) or the wrapped key (unwrap); out: the class (wrap),
++ * the result.
++ */
++static const uint8_t sweet_aks_wrap_mark[4] = { 'S', 'W', 'w', 'r' };
++
++static void
++sweet_aks_wrap_mix(uint8_t *bytes, uint32_t len)
++{
++	for (uint32_t i = 0; i < len; i++) {
++		bytes[i] = (uint8_t)(bytes[i] ^ (uint8_t)(0x5a + 37 * i));
++	}
++}
++
++static IOReturn
++sweet_aks_wrap(IOExternalMethodArguments *args, bool wrap, uint32_t in_struct)
++{
++	uint8_t in[8 + 64], out[8 + 64];
++
++	if (in_struct == 0 || in_struct > sizeof(in)) {
++		return kIOReturnBadArgument;
++	}
++	if (args->structureInputDescriptor != NULL) {
++		if (args->structureInputDescriptor->readBytes(0, in, in_struct) != in_struct) {
++			return kIOReturnBadArgument;
++		}
++	} else if (args->structureInput != NULL) {
++		memcpy(in, args->structureInput, in_struct);
++	} else {
++		return kIOReturnBadArgument;
++	}
++	if (wrap) {
++		if (in_struct > 64 || args->scalarInputCount < 2) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(out, sweet_aks_wrap_mark, sizeof(sweet_aks_wrap_mark));
++		out[4] = (uint8_t)args->scalarInput[1];
++		out[5] = out[6] = out[7] = 0;
++		memcpy(out + 8, in, in_struct);
++		sweet_aks_wrap_mix(out + 8, in_struct);
++		if (args->scalarOutputCount >= 1) {
++			args->scalarOutput[0] = args->scalarInput[1];
++			args->scalarOutputCount = 1;
++		}
++		return sweet_aks_struct_out(args, out, 8 + in_struct);
++	}
++	if (in_struct <= 8 || memcmp(in, sweet_aks_wrap_mark, sizeof(sweet_aks_wrap_mark)) != 0) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(out, in + 8, in_struct - 8);
++	sweet_aks_wrap_mix(out, in_struct - 8);
++	args->scalarOutputCount = 0;
++	return sweet_aks_struct_out(args, out, in_struct - 8);
++}
++
+ static uint32_t
+ sweet_aks_struct_out_size(IOExternalMethodArguments *args)
+ {
+@@ -227,11 +291,22 @@
+ 		args->scalarOutputCount = 0;
+ 		ret = sweet_aks_device_state(args);
+ 		break;
++	case kAKSWrapKey:
++	case kAKSUnwrapKey:
++		ret = sweet_aks_wrap(args, selector == kAKSWrapKey, in_struct);
++		break;
+ 	default:
+ 		ret = kIOReturnUnsupported;
+ 		break;
+ 	}
+ 
++	/* securityd wraps and unwraps for every keychain item: the first ones and the failures only */
++	static uint32_t wraps_said;
++	if ((selector == kAKSWrapKey || selector == kAKSUnwrapKey) && ret == kIOReturnSuccess &&
++	    wraps_said++ >= 16) {
++		return ret;
++	}
++
+ 	char name[32];
+ 	proc_selfname(name, sizeof(name));
+ 	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -77,6 +77,7 @@
+ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
++static uint32_t      sweet_surface_web_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+@@ -750,10 +751,16 @@
+ 			}
+ 		}
+ 	}
+-	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64) {
+-		char name[32];
+-		proc_selfname(name, sizeof(name));
++	/* and Safari's (xnu 0134: pages do not show; ios-spes found WebKit asking for the 10-bit
++	 * formats of a wide-colour display, 'w30r'/'b3a8', and drawing nothing into BGRA) */
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	bool web = strncmp(name, "com.apple.WebKit", 16) == 0 || strcmp(name, "MobileSafari") == 0;
++	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64 || (web && sweet_surface_web_logged < 48)) {
+ 		sweet_surface_creates_logged++;
++		if (web) {
++			sweet_surface_web_logged++;
++		}
+ 		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u -> 0x%x\n",
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
