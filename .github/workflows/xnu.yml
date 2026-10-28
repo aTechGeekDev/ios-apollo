@@ -145,11 +145,16 @@ jobs:
           grep -c -E ' error:' build.log || true
           grep -n -B4 -A8 -E ' error:' build.log | head -600 || true
 
-      # Warnings do not stop the build; in our own files they are shown here, green or not.
+      # Warnings do not stop the build; in our own files they are shown here, green or not (the
+      # vendored HID code's many old ones left out): a count per file, then the warnings.
       - name: Warnings in our files
         if: always()
         run: |
-          grep -E '/(bsd/dev/(sweet_|hakios)|iokit/Kernel/arm/)[^:]*:[0-9]+:[0-9]+: warning:' build.log | sort -u | head -200 || true
+          grep -E '/(bsd/dev/(sweet_|hakios)|bsd/kern/|iokit/Kernel/arm/)[^:]*:[0-9]+:[0-9]+: warning:' build.log |
+            grep -v '/iokit/Kernel/arm/hid/' | sort -u > our-warnings.txt || true
+          echo "$(wc -l < our-warnings.txt) warnings in our files"
+          sed -E 's#^.*/xnu/##; s#:[0-9]+:[0-9]+: warning:.*##' our-warnings.txt | sort | uniq -c | sort -rn | head -40
+          sed -E 's#^.*/xnu/##' our-warnings.txt | head -150
 
       # Green alone is not enough: build.sh skips a patch git apply refuses (a warning only), and a
       # kernel linked without the Wi-Fi driver object runs sweet_lx.c's stand-ins. Both fail here.
