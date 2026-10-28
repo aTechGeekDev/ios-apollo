@@ -1,0 +1,84 @@
+--- a/bsd/dev/sweet_apple80211.c
++++ b/bsd/dev/sweet_apple80211.c
+@@ -98,6 +98,18 @@
+  * is the signal itself, -41 dBm, and the status bar showed a weak signal next to the access point (boot 56).
+  */
+ #define NOISE_FLOOR             (-95)
++/*
++ * RSSI_BOUNDS (106): wifid asks it while it sets the device up (and tries again only on an error); the
++ * layout {version 1, the weakest, the strongest, a threshold} (dBm) and these values are iOSPlus10's
++ * (patches/xnu/README-wifi.md "0345", from the 20H392 binaries; the values are its guess, min < threshold
++ * < max). Refused, wifid had no range to put a signal in (boot 57: the status bar weak at -41 dBm).
++ */
++#define RSSI_BOUND_MIN          (-90)
++#define RSSI_BOUND_MAX          (-40)
++#define RSSI_BOUND_THRESHOLD    (-80)
++#define PHY_11A                 0x2u
++#define PHY_11B                 0x4u
++#define PHY_11G                 0x8u
+ #define CHANNEL_20MHZ           0x2u
+ #define CHANNEL_2GHZ            0x8u
+ #define CHANNEL_5GHZ            0x10u
+@@ -339,6 +351,25 @@
+ 	case 15:                                /* the mode: a station (APPLE80211_M_STA) */
+ 		request->req_val = 1;
+ 		return 0;
++	case 106: {                             /* (xnu 0132) the range a signal is put in, see RSSI_BOUND_MIN */
++		struct {
++			uint32_t version;
++			int32_t min, max, threshold;
++		} answer = { .version = 1, .min = RSSI_BOUND_MIN, .max = RSSI_BOUND_MAX, .threshold = RSSI_BOUND_THRESHOLD };
++
++		return give(request, &answer, sizeof(answer));
++	}
++	case 5:                                 /* (0132) power save: off (value) */
++	case 18:                                /* (0132) interference mitigation: off (value) */
++		request->req_val = 0;
++		return 0;
++	case 6: {                               /* (0132) protection mode {version, mode: off, threshold} */
++		struct {
++			uint32_t version, mode, threshold;
++		} answer = { .version = 1 };
++
++		return give(request, &answer, sizeof(answer));
++	}
+ 	case 27:
+ 	case 254: {                             /* the channels the radio may tune to */
+ 		struct apple80211_channels *answer;
+@@ -448,6 +479,24 @@
+ 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+ 		break;
+ 	}
++	case 14: {                              /* (0132) PHY mode {version, supported, active}: a/b/g; active 0 when not joined */
++		struct {
++			uint32_t version, supported, active;
++		} answer = { .version = 1, .supported = PHY_11A | PHY_11B | PHY_11G };
++
++		if (state->phase == HAKIOS_STA_JOINED) {
++			answer.active = state->bss.frequency != 0 && state->bss.frequency < 4000 ? PHY_11G : PHY_11A;
++		}
++		error = give(request, &answer, sizeof(answer));
++		break;
++	}
++	case 8:                                 /* (0132) the rate (value, Mbit/s): not measured; 54, the best legacy one */
++		if (state->phase != HAKIOS_STA_JOINED) {
++			error = ENXIO;
++		} else {
++			request->req_val = 54;
++		}
++		break;
+ 	case 17: {                              /* the noise floor, as the signal above */
+ 		struct {
+ 			uint32_t version, radios, unit;
+@@ -616,6 +665,11 @@
+ 	}
+ 	case 10:
+ 		return set_scan(request, said, said_size);
++	case 5:                                 /* (0132) power save: the driver has none */
++	case 365:                               /* (0132) the display on or off: nothing to do */
++	case 382:                               /* (0132) abort a scan: ours end by themselves (a scan is over) */
++		snprintf(said, said_size, " (accepted, nothing to do)");
++		return 0;
+ 	default:
+ 		return EOPNOTSUPP;
+ 	}
