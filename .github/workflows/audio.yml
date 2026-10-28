@@ -1,0 +1,44 @@
+name: audio
+
+# iOS's output device in its audio server (mediaserverd): the AudioServerPlugIn of the Mi 10T port
+# github.com/enesuzun2002/hakios-apollo (userland/audio/, MIT, LICENSE.hakios-apollo), built with
+# Xcode's iPhoneOS SDK and ad-hoc signed. Apart from userland.yml, so that it does not rebuild Mesa.
+# Artifact sweet-audio: HakiosAudio.driver/HakiosAudio, HakiosAudio.driver/Info.plist, SHA256SUMS;
+# tools/root-files/audio-on.txt puts it on the root (see userland/README.md).
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "userland/audio/**"
+      - ".github/workflows/audio.yml"
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build HakiosAudio.driver
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir -p obj out/HakiosAudio.driver
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" \
+            -O1 -Wall -bundle -framework CoreFoundation -o obj/HakiosAudio userland/audio/audio_plugin.c
+          # (signed before it goes into the bundle: codesign would otherwise sign the bundle as a whole)
+          codesign -s - -f obj/HakiosAudio
+          codesign -dv obj/HakiosAudio
+          file obj/HakiosAudio
+          otool -L obj/HakiosAudio
+          nm -gU obj/HakiosAudio | grep -F _HakiosAudio_Create
+          plutil -lint userland/audio/audio_plugin.plist
+          cp obj/HakiosAudio out/HakiosAudio.driver/HakiosAudio
+          cp userland/audio/audio_plugin.plist out/HakiosAudio.driver/Info.plist
+      - name: Checksums
+        run: |
+          cd out && find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweet-audio
+          path: out/

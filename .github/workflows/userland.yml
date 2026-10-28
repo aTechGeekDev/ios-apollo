@@ -11,6 +11,7 @@ on:
     paths:
       - "userland/**"
       - "!userland/README.md"
+      - "!userland/audio/**"
       - ".github/workflows/userland.yml"
 
 jobs:

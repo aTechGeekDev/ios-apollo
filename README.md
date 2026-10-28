@@ -116,7 +116,7 @@ adb reboot bootloader
 | `sweetwifi=N` | Wi-Fi bring-up steps 1..12 (QCA6390: power, PCIe link, SMMU, firmware boot, QRTR, firmware handshake, board data + M3, calibration; 11 = Linux's ath11k driver brings the radio up, scans, and goes down again; 12 = the driver stays up as `en0` for iOS's Wi-Fi); needs `mkadt.py --wifi-fw research/apollo-wifi` from step 4 |
 | `sweetwifimac=aa:bb:cc:dd:ee:ff` | the radio's MAC address for `sweetwifi=11/12` (without it, a random locally administered one per boot) |
 | `sweetbt=N` | Bluetooth bring-up steps 1..6 (QCA6390 over the UART of serial engine 6: 1-3 clocks, pins, UART loopback; 4 the chip's ROM answers; 5 firmware, then an LE scan and a classic inquiry in the kernel; 6 the radio stays up for iOS's bluetoothd); needs `mkadt.py --bt-fw research/apollo-bt` from step 5 |
-| `apollo_audio=N` / `apollo_adsp_step=N` | the sound (xnu 0139: the drivers of the Mi 10T port [hakios-apollo](https://github.com/enesuzun2002/hakios-apollo)): 1 the audio DSP up; 2 the tertiary TDM port; 3 a test tone into a stream, amplifiers off; 4 the tone through the CS35L41 amplifiers, 20 dB under Android's level (`apollo_sound_below=` eighths of a dB, `apollo_sound_secs=`); 5 what iOS plays, through `/dev/apollo-audio`. `apollo_adsp_step=N`: the DSP's steps 1..N with a log of each. Needs the DSP's firmware on the root once: `tools/pull-audio-fw.sh` and `mkadt.py --files-from research/apollo-audio/files-adsp.txt` for one boot |
+| `apollo_audio=N` / `apollo_adsp_step=N` | the sound (xnu 0139: the drivers of the Mi 10T port [hakios-apollo](https://github.com/enesuzun2002/hakios-apollo)): 1 the audio DSP up; 2 the tertiary TDM port; 3 a test tone into a stream, amplifiers off; 4 the tone through the CS35L41 amplifiers, 20 dB under Android's level (`apollo_sound_below=` eighths of a dB, `apollo_sound_secs=`); 5 what iOS plays, through `/dev/apollo-audio`: needs the audio server's plug-in on the root once (`mkadt.py --files-from tools/root-files/audio-on.txt` with the `sweet-audio` artifact of `.github/workflows/audio.yml`; xnu 0140 moves iOS's VirtualAudio.plugin back for it; undo: `audio-off.txt`) and `mediaserverd` in `sweetnull` for the plug-in's own lines. `apollo_adsp_step=N`: the DSP's steps 1..N with a log of each. Needs the DSP's firmware on the root once: `tools/pull-audio-fw.sh` and `mkadt.py --files-from research/apollo-audio/files-adsp.txt` for one boot |
 
 The other boot-args are described in their drivers' sources in `xnu/patches/` and in `NOTES.md`.
 
@@ -125,7 +125,7 @@ The other boot-args are described in their drivers' sources in `xnu/patches/` an
 | Path | What |
 | --- | --- |
 | `shim/` | Boot shim, packed as an Android boot image |
-| `xnu/patches/` | The kernel patches (0001–0139), applied in order by CI |
+| `xnu/patches/` | The kernel patches (0001–0140), applied in order by CI |
 | `wifi/` | HackiOS's Linux layer for the Wi-Fi driver; CI builds Linux's ath11k on it and links it into the kernel |
 | `userland/` | Programs and libraries for the phone: GPU tests, Mesa, the CoreAnimation bridge |
 | `tools/` | Device tree builder, payload packer, iOS root builder, log and crash tools |

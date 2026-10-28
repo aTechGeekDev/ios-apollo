@@ -1,0 +1,5 @@
+# Undoes audio-on.txt (one boot): the plug-in removed, the virtual audio device put aside again, as
+# the root was before (tools/sweet-root-tweaks.py). For when mediaserverd cannot live with them.
+-/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver/HakiosAudio
+-/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver/Info.plist
+>/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin=/Library/Audio/Plug-Ins/HAL.disabled/VirtualAudio.plugin

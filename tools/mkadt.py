@@ -14,8 +14,10 @@ same for every line "DEST=LOCAL [UID:GID:MODE]" of LIST (owner and octal mode; d
 0755 under /usr/local/, 0644 elsewhere; folders made on the way get the owner), and a line
 "-DEST" (or --delete DEST) removes DEST first, a line "?PATH" (or --list PATH) prints PATH's
 matches (a folder: its entries) into the kernel log; in those two a component may hold one '*'
-(xnu 0123; only files are removed that way). tools/wallpaper-files.py writes such lists;
-tools/root-files/ has settings. Only FILE_PREFIXES paths; 64 files and 48 MiB at most.
+(xnu 0123; only files are removed that way). A line ">FROM=TO" (or --move FROM=TO) renames a file
+or folder on the root, unless something is at TO already (xnu 0140; after the removals, before the
+files). tools/wallpaper-files.py writes such lists; tools/root-files/ has settings. Only
+FILE_PREFIXES paths; 64 files and 48 MiB at most.
 --touch-fw embeds the NT36675 touch firmware (Xiaomi's
 novatek_nt36675_j3s_fw01.bin, not in git) as /sweet-touch "firmware"; the
 apollo touch driver downloads it into the chip over SPI. --gmu-fw embeds the
@@ -82,7 +84,9 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 #   tools/remotezip.py URL DeviceTree.d22ap.im4p DIR
 #   ipsw img4 im4p extract DIR/Firmware/all_flash/DeviceTree.d22ap.im4p -o d22ap.adt
 # the paths the kernel writes (xnu 0120/0121 bsd/dev/sweet_files.c sweet_files_prefixes)
-FILE_PREFIXES = ('/usr/local/', '/Library/Wallpaper/', '/private/var/', '/System/Library/xpc/')
+FILE_PREFIXES = ('/usr/local/', '/Library/Wallpaper/', '/private/var/', '/System/Library/xpc/',
+                 # the sound (tools/root-files/audio-on.txt): iOS's VirtualAudio.plugin and our HakiosAudio.driver
+                 '/Library/Audio/Plug-Ins/', '/System/Library/Audio/Plug-Ins/HAL/')
 D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
 
 
@@ -111,7 +115,7 @@ def node(name, props=(), children=()):
 
 
 def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_extra=(), p3=False, files=(),
-          deletes=(), lists=(), wifi=(), macs=(), bt=()):
+          deletes=(), lists=(), wifi=(), macs=(), bt=(), moves=()):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
@@ -304,10 +308,11 @@ def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_
        ([node('sweet-bt', [ph()] + list(bt))] if bt else []) +
        ([node('sweet-files', [ph()] + [(f'list{i}', path.encode() + b'\0') for i, path in enumerate(lists)]
                               + [(f'delete{i}', path.encode() + b'\0') for i, path in enumerate(deletes)]
+                              + [(f'move{i}', a.encode() + b'\0' + b.encode() + b'\0') for i, (a, b) in enumerate(moves)]
                               + [(f'file{i}', path.encode() + b'\0' + data) for i, (path, data, _) in enumerate(files)]
                               + [(f'owner{i}', struct.pack('<3I', *owner))
                                  for i, (_, _, owner) in enumerate(files) if owner is not None])]
-        if files or deletes or lists else []))
+        if files or deletes or lists or moves else []))
 
 
 if __name__ == '__main__':
@@ -417,7 +422,7 @@ if __name__ == '__main__':
         if not macs:
             print('Bluetooth: no --wifi-fw, so no /chosen mac-address-bluetooth0: the chip keeps its NVM address',
                   file=sys.stderr)
-    files, deletes, lists = [], [], []          # (path, data, (uid, gid, mode) or None); paths; paths
+    files, deletes, lists, moves = [], [], [], []   # (path, data, (uid, gid, mode) or None); paths; paths; (from, to)
     wanted = []                                 # (where it came from, "DEST=LOCAL [UID:GID:MODE]" or "-DEST")
     for i, arg in enumerate(sys.argv):
         if arg == '--file':
@@ -426,10 +431,20 @@ if __name__ == '__main__':
             wanted.append(('--delete', '-' + sys.argv[i + 1]))
         elif arg == '--list':
             wanted.append(('--list', '?' + sys.argv[i + 1]))
+        elif arg == '--move':
+            wanted.append(('--move', '>' + sys.argv[i + 1]))
         elif arg == '--files-from':
             wanted += [(f'{sys.argv[i + 1]} line {n}', line.strip())
                        for n, line in enumerate(open(sys.argv[i + 1]), 1) if line.strip() and not line.startswith('#')]
     for where, spec in wanted:
+        if spec.startswith('>'):
+            source, _, dest = spec[1:].partition('=')
+            if not all(p.startswith(FILE_PREFIXES) and '/../' not in p + '/' and '*' not in p and p.rstrip('/') == p
+                       for p in (source, dest)) or source == dest:
+                sys.exit(f'{where}: {spec}: give >FROM=TO, both under ' + ', '.join(FILE_PREFIXES) + " (no '*', no '..')")
+            moves.append((source, dest))
+            print(f'moved on the root: {source} -> {dest}', file=sys.stderr)
+            continue
         owner = None
         parts = spec.rsplit(None, 1)
         if len(parts) == 2 and re.fullmatch(r'\d+:\d+:[0-7]{3,4}', parts[1]):
@@ -451,15 +466,17 @@ if __name__ == '__main__':
         files.append((dest, open(local, 'rb').read(), owner))
         print(f'file for the root: {dest} ({len(files[-1][1])} bytes' +
               (f', {owner[0]}:{owner[1]} {owner[2]:o})' if owner else ')'), file=sys.stderr)
-    if len(files) > 64 or len(deletes) > 64 or len(lists) > 64:
-        sys.exit(f'--file/--files-from: {len(files)} files, {len(deletes)} removals, {len(lists)} lists: 64 of each at most')
+    if len(files) > 64 or len(deletes) > 64 or len(lists) > 64 or len(moves) > 64:
+        sys.exit(f'--file/--files-from: {len(files)} files, {len(deletes)} removals, {len(lists)} lists, {len(moves)} moves: '
+                 '64 of each at most')
     if sum(len(d) for _, d, _ in files) > 48 << 20:
         sys.exit(f'--file/--files-from: {sum(len(d) for _, d, _ in files) / 1048576:.1f} MiB in all, more than 48 MiB; '
                  'the boot image would grow too much')
     if files:
         print(f'files for the root: {len(files)}, {sum(len(d) for _, d, _ in files) / 1048576:.1f} MiB', file=sys.stderr)
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, touch_fw=touch_fw, gmu_fw=gmu_fw,
-                 gpu_extra=gpu_extra, p3='--p3' in sys.argv, files=files, deletes=deletes, lists=lists, wifi=wifi, macs=macs, bt=bt)
+                 gpu_extra=gpu_extra, p3='--p3' in sys.argv, files=files, deletes=deletes, lists=lists, wifi=wifi, macs=macs, bt=bt,
+                 moves=moves)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

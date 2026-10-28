@@ -26,7 +26,9 @@ screen (image versions v8-v14 in NOTES.md):
                   /chosen unique-chip-id + chip-id; without it DataMigration
                   runs on every boot and holds SpringBoard at the Apple logo
                   (images v11/v12; apollo boot 29)
-  audio           VirtualAudio HAL plug-in disabled (mediaserverd crash)
+  audio           VirtualAudio HAL plug-in disabled (mediaserverd crash);
+                  tools/root-files/audio-on.txt moves it back together with
+                  our output device (apollo_audio=5)
   MediaToolbox    StartRecorderServer=false (camera filter prewarm calls a
                   NULL OpenGL function without a GPU -> mediaserverd crash loop)
   extensions      ExtensionKit feature flag enforce_xpc_cache_code_signing off

@@ -1,0 +1,14 @@
+# iOS's sound (kernel 0139 + 0140, boot-arg apollo_audio=5): for ONE boot; the root keeps it all
+# afterwards. Paths of the local side are from the repository's top; the plug-in is the audio
+# workflow's artifact (gh run download RUN_ID -n sweet-audio -D sweet-audio).
+#
+# iOS's virtual audio device, back in the folder the audio server (mediaserverd) loads its plug-ins
+# from: every route iOS has (the speaker, its volume, Control Center's) is one of its ports.
+# tools/sweet-root-tweaks.py had put it aside on our root, because with no output device at all it
+# crashed mediaserverd. (Moved by the kernel, xnu 0140; a second boot with this line says "something
+# is there already".)
+>/Library/Audio/Plug-Ins/HAL.disabled/VirtualAudio.plugin=/Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin
+# The output devices themselves (hakios-apollo's audio_plugin.c, userland/audio/): "Speaker", whose
+# samples it writes to /dev/apollo-audio, and the devices the virtual audio device wants beside it.
+/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver/HakiosAudio=sweet-audio/HakiosAudio.driver/HakiosAudio 0:0:0755
+/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver/Info.plist=sweet-audio/HakiosAudio.driver/Info.plist 0:0:0644
