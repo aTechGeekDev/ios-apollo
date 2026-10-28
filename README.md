@@ -16,8 +16,7 @@ Apple's open-source XNU kernel (xnu-8796), patched for the phone, boots the **un
 | Buttons | Power, volume up, volume down |
 | Display | iOS drawn by the GPU and copied to the panel (up to 60 frames a second with `sweetfb_hz=60`) |
 | GPU | Adreno 650 up. **Mesa draws with it** (OpenGL ES 3.2, freedreno), and iOS's own renderer (CoreAnimation in backboardd) draws **the whole GUI** on it through the bridge: lock screen, home screen, keyboard, and the blur of Control Center, Spotlight and the App Library (2026-10-26). A backboardd crash on some image uploads has a fix built, not yet tested |
-| Wi-Fi | Written and built, **not yet tested on the phone** (QCA6390): power, PCIe link, firmware boot and handshake (`sweetwifi=1..10`), then Linux's ath11k driver built into the kernel: a scan (`sweetwifi=11`), or `en0` for iOS's Wi-Fi settings (`sweetwifi=12`) |
-| Not yet | Display power, USB networking, battery, Bluetooth, audio, cameras, cellular |
+| Not yet | Display power, USB networking, battery, Wi-Fi, Bluetooth, audio, cameras, cellular |
 
 The first boot of a fresh root runs iOS data migration once (an hour or more); later boots are quick. Day-to-day progress and the next steps are in [`NOTES.md`](NOTES.md).
 
@@ -65,7 +64,7 @@ objcopy -I ihex -O binary novatek_nt36675_j3s_fw01.bin.ihex novatek_nt36675_j3s_
 cd ../..
 ```
 
-GPU and Wi-Fi firmware, from the phone (in recovery): `tools/pull-gpu-fw.sh` and `tools/pull-wifi-fw.sh` (into `research/apollo-gpu/` and `research/apollo-wifi/`).
+GPU firmware, from the phone (in recovery): `tools/pull-gpu-fw.sh`.
 
 **4. Build the boot image** (needs `aarch64-linux-gnu-gcc` and `mkbootimg`):
 
@@ -73,14 +72,13 @@ GPU and Wi-Fi firmware, from the phone (in recovery): `tools/pull-gpu-fw.sh` and
 python3 tools/mkadt.py shim/out/apollo.adt --highmem \
     --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
     --gmu-fw research/apollo-gpu/a650_gmu.bin --sqe-fw research/apollo-gpu/a650_sqe.fw \
-    --zap-mdt research/apollo-gpu/a650_zap.mdt --zap-seg research/apollo-gpu/a650_zap.b02 \
-    --wifi-fw research/apollo-wifi
+    --zap-mdt research/apollo-gpu/a650_zap.mdt --zap-seg research/apollo-gpu/a650_zap.b02
 python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/apollo.adt shim/out/payload.bin \
     --cmdline 'debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1'
 shim/build.sh ../shim/out/payload.bin          # -> shim/out/shim-boot.img
 ```
 
-For the GPU-drawn GUI add `sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd` to `--cmdline` (the bridge library must be on the root), and for the Wi-Fi test `sweetwifi=11`.
+For the GPU-drawn GUI add `sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd` to `--cmdline` (the bridge library must be on the root).
 
 **5. Boot:**
 
@@ -112,8 +110,6 @@ adb reboot bootloader
 | `sweetnull=A,B,...` | Copy what these programs print into the kernel log |
 | `sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd` | Load the CoreAnimation bridge (GPU drawing) into the window server |
 | `sweetgl=0` | Keep CoreAnimation's software renderer |
-| `sweetwifi=N` | Wi-Fi bring-up steps 1..12 (QCA6390: power, PCIe link, SMMU, firmware boot, QRTR, firmware handshake, board data + M3, calibration; 11 = Linux's ath11k driver brings the radio up, scans, and goes down again; 12 = the driver stays up as `en0` for iOS's Wi-Fi); needs `mkadt.py --wifi-fw research/apollo-wifi` from step 4 |
-| `sweetwifimac=aa:bb:cc:dd:ee:ff` | the radio's MAC address for `sweetwifi=11/12` (without it, a random locally administered one per boot) |
 
 The other boot-args are described in their drivers' sources in `xnu/patches/` and in `NOTES.md`.
 
@@ -122,8 +118,7 @@ The other boot-args are described in their drivers' sources in `xnu/patches/` an
 | Path | What |
 | --- | --- |
 | `shim/` | Boot shim, packed as an Android boot image |
-| `xnu/patches/` | The kernel patches (0001–0128), applied in order by CI |
-| `wifi/` | HackiOS's Linux layer for the Wi-Fi driver; CI builds Linux's ath11k on it and links it into the kernel |
+| `xnu/patches/` | The kernel patches (0001–0125), applied in order by CI |
 | `userland/` | Programs and libraries for the phone: GPU tests, Mesa, the CoreAnimation bridge |
 | `tools/` | Device tree builder, payload packer, iOS root builder, log and crash tools |
 | `NOTES.md` | Engineering log and current handoff |
@@ -134,6 +129,6 @@ Not in git: partition backups, device trees, recovery images, firmware, Apple's 
 
 ## Credits
 
-Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), [Mesa](https://mesa3d.org), [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel) (the Mesa and CoreAnimation approach, the Wi-Fi layer) and its [Xiaomi Mi 10 port](https://github.com/JopangJovan/hackios-xnu-kernel-umi) (the QCA6390 bring-up), Linux's ath11k driver and FreeBSD's LinuxKPI (fetched when CI builds the kernel, not kept here), Xiaomi's published kernel source and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
+Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), [Mesa](https://mesa3d.org), [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel) (the Mesa and CoreAnimation approach), Xiaomi's published kernel source and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
 
 MIT License, see [`LICENSE`](LICENSE).
