@@ -4,7 +4,7 @@
 Only what the early boot path actually reads (see NOTES.md); every MMIO
 address comes from the sweet live FDT. Usage:
   mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--p3] [--touch-fw FW.bin] [--gmu-fw a650_gmu.bin]
-            [--sqe-fw a650_sqe.fw] [--zap-mdt a650_zap.mdt] [--zap-seg a650_zap.b02] [--wifi-fw DIR|amss.bin] [--wifi-board FILE]
+            [--sqe-fw a650_sqe.fw] [--zap-mdt a650_zap.mdt] [--zap-seg a650_zap.b02] [--wifi-fw DIR|amss.bin] [--wifi-board FILE] [--wifi-mac aa:bb:cc:dd:ee:ff]
 /product says the display is sRGB, not the iPhone X's P3 (--p3 keeps P3): see build().
 --file /usr/local/PATH=LOCAL (as many as wanted) carries a file in /sweet-files; the kernel
 writes it onto the root before launchd starts (xnu 0120-0122, bsd/dev/sweet_files.c): a new
@@ -107,7 +107,7 @@ def node(name, props=(), children=()):
 
 
 def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_extra=(), p3=False, files=(),
-          deletes=(), lists=(), wifi=()):
+          deletes=(), lists=(), wifi=(), macs=()):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
@@ -154,7 +154,10 @@ def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_
         ('effective-production-status-ap', u32(0)),
         ('certificate-security-mode', u32(1)),
         ('effective-security-mode-sep', u32(1)),
-    ], [node('memory-map', [ph()]),
+        # The device's MAC addresses, as iBoot puts them here (--wifi-fw): without them MobileGestalt
+        # waits for an IONetworkController on every Wi-Fi address query (Settings > About), as
+        # iOSPlus10 found; mac-address-wifi0 is also en0's address (sweet_wifi.c, xnu 0129).
+    ] + [(f'mac-address-{name}', mac) for name, mac in macs], [node('memory-map', [ph()]),
         # Local boot policy (kern_csr.c): SIP relaxed like `csrutil disable`
         # (lp-sip0: untrusted kexts, unrestricted FS, task_for_pid, kernel
         # debugger, dtrace, nvram), lp-sip1: unauthenticated (unsealed) root.
@@ -327,6 +330,7 @@ if __name__ == '__main__':
     if gpu_extra and not gmu_fw:
         sys.exit('--sqe-fw, --zap-mdt and --zap-seg need --gmu-fw')
     wifi = []                                   # (property, bytes) of /sweet-wifi
+    macs = []                                   # (name, 6 bytes) for /chosen mac-address-NAME
     if '--wifi-fw' in sys.argv:
         where = sys.argv[sys.argv.index('--wifi-fw') + 1]
         if not os.path.exists(where):
@@ -368,6 +372,27 @@ if __name__ == '__main__':
             sys.exit('--wifi-fw: the QCA6390 firmware (amss) is between 512 KiB and 16 MiB')
         if 'board' in picked and len(dict(wifi)['board']) > 256 * 1024:
             sys.exit('--wifi-board: a board file of more than 256 KiB is not one the firmware takes')
+        # The radio's address: --wifi-mac, else the one kept in the firmware folder (made once, at random,
+        # locally administered: never in git), so that it stays the same from boot to boot.
+        mac_text = sys.argv[sys.argv.index('--wifi-mac') + 1] if '--wifi-mac' in sys.argv else None
+        mac_file = os.path.join(where, 'mac.txt') if os.path.isdir(where) else None
+        if mac_text is None and mac_file and os.path.exists(mac_file):
+            mac_text = open(mac_file).read().strip()
+        if mac_text is None:
+            made = bytearray(os.urandom(6))
+            made[0] = (made[0] & 0xfe) | 0x02
+            mac_text = ':'.join(f'{b:02x}' for b in made)
+            if mac_file:
+                with open(mac_file, 'w') as f:
+                    f.write(mac_text + '\n')
+        if not re.fullmatch(r'([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', mac_text) or int(mac_text[:2], 16) & 1:
+            sys.exit(f'--wifi-mac {mac_text}: not a station address (aa:bb:cc:dd:ee:ff, first byte even)')
+        wifi_mac = bytes(int(x, 16) for x in mac_text.split(':'))
+        # Bluetooth and Ethernet: the next two, as on Apple's devices
+        macs = [(name, wifi_mac[:5] + bytes([(wifi_mac[5] + i) & 0xff])) for i, name in
+                enumerate(('wifi0', 'bluetooth0', 'ethernet0'))]
+        print(f'Wi-Fi address (/chosen mac-address-wifi0, en0): {"--wifi-mac" if "--wifi-mac" in sys.argv else mac_file or "random"}',
+              file=sys.stderr)
     files, deletes, lists = [], [], []          # (path, data, (uid, gid, mode) or None); paths; paths
     wanted = []                                 # (where it came from, "DEST=LOCAL [UID:GID:MODE]" or "-DEST")
     for i, arg in enumerate(sys.argv):
@@ -410,7 +435,7 @@ if __name__ == '__main__':
     if files:
         print(f'files for the root: {len(files)}, {sum(len(d) for _, d, _ in files) / 1048576:.1f} MiB', file=sys.stderr)
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, touch_fw=touch_fw, gmu_fw=gmu_fw,
-                 gpu_extra=gpu_extra, p3='--p3' in sys.argv, files=files, deletes=deletes, lists=lists, wifi=wifi)
+                 gpu_extra=gpu_extra, p3='--p3' in sys.argv, files=files, deletes=deletes, lists=lists, wifi=wifi, macs=macs)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

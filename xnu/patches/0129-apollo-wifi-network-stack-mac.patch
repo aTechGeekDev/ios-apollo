@@ -1,0 +1,194 @@
+--- a/bsd/dev/sweet_wifi.c
++++ b/bsd/dev/sweet_wifi.c
+@@ -75,6 +75,7 @@
+ extern void hakios_lx_stop(void);
+ extern int hakios_lx_prepare(void);
+ extern void hakios_net_init(void);
++extern void SweetNetworkStackStart(void);       /* iokit/Kernel/arm/SweetNetworkStack.cpp (0129) */
+ void sweet_wifi_init(void);
+ const uint8_t *sweet_wifi_file(const char *name, unsigned int *size);
+ void *sweet_wifi_memory_at(size_t size, uint64_t iova);
+@@ -1533,8 +1534,10 @@
+ 
+ /*
+  * The radio's own address. Its firmware has none: Android hands it the phone's from its storage.
+- * Boot-arg sweetwifimac=aa:bb:cc:dd:ee:ff gives it; without one a random, locally administered
+- * one is made, the same for the whole boot. The log says which way, not the address.
++ * Boot-arg sweetwifimac=aa:bb:cc:dd:ee:ff gives it; else the ADT's /chosen "mac-address-wifi0"
++ * (mkadt.py --wifi-fw, xnu 0129: the address MobileGestalt reports as the Wi-Fi address, so the
++ * two agree); without either a random, locally administered one is made, the same for the whole
++ * boot. The log says which way, not the address.
+  */
+ bool
+ sweet_wifi_radio_address(uint8_t *address)
+@@ -1562,13 +1565,26 @@
+ 			}
+ 		}
+ 		good = good && count == 6 && !(made[0] & 1) && (made[0] | made[1] | made[2] | made[3] | made[4] | made[5]) != 0;
+-		if (!good) {
++		bool chosen = false;
++		DTEntry node;
++		void const *prop = NULL;
++		unsigned int size = 0;
++		if (!good && SecureDTLookupEntry(NULL, "/chosen", &node) == kSuccess &&
++		    SecureDTGetProperty(node, "mac-address-wifi0", &prop, &size) == kSuccess && size == 6) {
++			const uint8_t *adt = prop;
++			chosen = !(adt[0] & 1) && (adt[0] | adt[1] | adt[2] | adt[3] | adt[4] | adt[5]) != 0;
++			if (chosen) {
++				memcpy(made, adt, sizeof(made));
++			}
++		}
++		if (!good && !chosen) {
+ 			read_random(made, sizeof(made));
+ 			made[0] = (uint8_t)((made[0] & 0xfe) | 0x02);   /* one station's, locally administered */
+ 		}
+ 		have = true;
+-		printf("SWEET WIFI: the radio's address: %s\n", good ? "sweetwifimac, as given" : given ?
+-		    "SWEETWIFIMAC IS NOT AN ADDRESS: a random one for this boot" : "a random one for this boot (no sweetwifimac)");
++		printf("SWEET WIFI: the radio's address: %s\n", good ? "sweetwifimac, as given" : chosen ?
++		    "the ADT's /chosen mac-address-wifi0" : given ? "SWEETWIFIMAC IS NOT AN ADDRESS: a random one for this boot" :
++		    "a random one for this boot (no sweetwifimac, no /chosen mac-address-wifi0)");
+ 	}
+ 	memcpy(address, made, sizeof(made));
+ 	return true;
+@@ -1657,6 +1673,8 @@
+ 	}
+ 	if (wifi_steps >= 11) {
+ 		hakios_net_init();
++		/* before configd: its interface namer says the registry is quiet only once it has opened this */
++		SweetNetworkStackStart();
+ 	}
+ 	if (wifi_steps == 12) {
+ 		hakios_lx_net_early();          /* en0 and its registry entries before wifid looks for them */
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -18,6 +18,7 @@
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetGPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetWLAN.cpp                                   optional iokitcpp
++iokit/Kernel/arm/SweetNetworkStack.cpp                           optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetNetworkStack.cpp
+@@ -0,0 +1,119 @@
++/* From HackiOS's iokit/Kernel/MiniIONetworkStack.cpp (github.com/oosexgang/hackios-xnu-kernel; APSL 2.0), for
++ * apollo's Wi-Fi (xnu 0129); its warnings are not looked at (written for a build without -Werror). */
++#pragma clang diagnostic ignored "-Weverything"
++/*
++ * IONetworkStack: a stand-in for IONetworkStack of Apple's IONetworkingFamily, as seen by
++ * configd's interface namer.
++ *
++ * The real one gives the BSD names (en0, en1, ...) to the IONetworkInterface objects of the
++ * drivers, when the interface namer asks. Here interfaces are made with the BSD interface KPI
++ * (bsd/dev/sweet_net.c) and are born with their names, so there is never anything to name.
++ * But the namer wants this object all the same: until it has opened it, it does not say in
++ * configd's store that the registry has gone quiet (the key Plugin:InterfaceNamer, "*QUIET*"),
++ * and gives up only after five minutes ("*TIMEOUT*"). SystemConfiguration's
++ * SCNetworkInterfaceCopyAll() waits for one of the two, and with it whoever asks for the list of
++ * interfaces: wifid as soon as it has a device, and behind wifid Settings (boot 54: Settings hung
++ * on its Wi-Fi and About pages; the cause as iOSPlus10 traced it, patches/xnu/README-wifi.md).
++ *
++ * So: the service, a user client that can be opened, and a refusal of the naming request.
++ * Started by sweet_wifi_init() for sweetwifi=11 and 12, before launchd.
++ */
++
++#include <IOKit/IOLib.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++
++extern "C" void SweetNetworkStackStart(void);
++
++class IONetworkStack : public IOService
++{
++	OSDeclareDefaultStructors(IONetworkStack);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IONetworkStack, IOService);
++
++bool
++IONetworkStack::start(IOService * provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "IONetworkStackUserClient");
++	setName("IONetworkStack");
++	registerService();
++	return true;
++}
++
++class IONetworkStackUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(IONetworkStackUserClient);
++
++public:
++	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient);
++
++bool
++IONetworkStackUserClient::start(IOService * provider)
++{
++	char who[32] = "?";
++
++	if (!IOUserClient::start(provider)) {
++		return false;
++	}
++	/* whether the registry is quiet at this moment is what the namer goes on to ask */
++	proc_selfname(who, sizeof(who));
++	IOLog("SweetNetworkStack: opened by %s; the registry's busy state is %u\n", who,
++	    (unsigned) IOService::getServiceRoot()->getBusyState());
++	return true;
++}
++
++IOReturn
++IONetworkStackUserClient::clientClose(void)
++{
++	if (!isInactive()) {
++		terminate();
++	}
++	return kIOReturnSuccess;
++}
++
++/* "Name this interface" (a dictionary: IONetworkStackUserCommand, IOPathMatch, IOInterfaceUnit). */
++IOReturn
++IONetworkStackUserClient::setProperties(OSObject * properties)
++{
++	static unsigned said;
++
++	if (said++ < 4) {
++		IOLog("SweetNetworkStack: asked to name an interface: there are none of that kind\n");
++	}
++	return kIOReturnUnsupported;
++}
++
++/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
++
++void
++SweetNetworkStackStart(void)
++{
++	/* where the real one is: IOService:/IOResources/IONetworkStack */
++	IOService * resources = IOService::getResourceService();
++	IONetworkStack * stack = OSTypeAlloc(IONetworkStack);
++
++	if (resources == NULL || stack == NULL || !stack->init() || !stack->attach(resources)) {
++		OSSafeReleaseNULL(stack);
++		IOLog("SweetNetworkStack: cannot create the service\n");
++		return;
++	}
++	if (!stack->start(resources)) {
++		stack->detach(resources);
++	}
++	stack->release();
++}
