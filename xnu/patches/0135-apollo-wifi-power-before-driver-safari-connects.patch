@@ -1,0 +1,171 @@
+--- a/bsd/dev/sweet_sta.c
++++ b/bsd/dev/sweet_sta.c
+@@ -46,7 +46,8 @@
+ static bool sta_thread_made;
+ static bool sta_calls;                          /* the thread is in a call of the station side's */
+ static unsigned sta_reads;                      /* ... and so many others are in its state() */
+-static bool sta_on;                             /* the radio's power, as last asked for */
++static bool sta_on = true;                      /* the radio's power, as last asked for (on until then; also when */
++                                                /* asked before the station side is there: xnu 0135) */
+ 
+ /* what has been asked for and not begun */
+ static bool asked_power, asked_power_on, asked_scan, asked_join, asked_leave;
+@@ -184,6 +185,7 @@
+ hakios_sta_attach(const struct hakios_sta_ops *ops)
+ {
+ 	thread_t thread;
++	bool on;
+ 
+ 	if (ops == NULL) {
+ 		lck_mtx_lock(&sta_lock);
+@@ -215,10 +217,15 @@
+ 	channel_count = ops->channels(channels, CHANNELS_MOST);
+ 	lck_mtx_lock(&sta_lock);
+ 	sta_ops = ops;
+-	sta_on = true;
++	on = sta_on;
++	if (!on) {
++		/* (xnu 0135) off was asked for before the station side was there: it is put down now */
++		asked_power = true;
++		asked_power_on = false;
++	}
+ 	lck_mtx_unlock(&sta_lock);
+ 	thread_wakeup((event_t)&sta_ops);
+-	hakios_apple80211_event(HAKIOS_STA_POWER, 1);
++	hakios_apple80211_event(HAKIOS_STA_POWER, on);
+ }
+ 
+ void
+@@ -238,7 +245,7 @@
+ bool
+ hakios_sta_powered(void)
+ {
+-	return sta_ops != NULL && sta_on;
++	return sta_on;
+ }
+ 
+ bool
+@@ -256,11 +263,19 @@
+ hakios_sta_ask_power(bool on)
+ {
+ 	lck_mtx_lock(&sta_lock);
++	sta_on = on;
+ 	if (sta_ops == NULL) {
++		/*
++		 * (xnu 0135) The station side is not there yet (the driver is still coming up) or is
++		 * being restarted: what is asked for is kept and done when it comes (hakios_sta_attach).
++		 * Refused, wifid's idea of the power and ours parted: boot 59, wifid asked for off as it
++		 * started, before the driver was up (ENXIO); the radio came on all the same, and then
++		 * the Settings switch could not be turned off -- no other power request reached us.
++		 */
+ 		lck_mtx_unlock(&sta_lock);
+-		return ENXIO;
++		hakios_apple80211_event(HAKIOS_STA_POWER, on);
++		return 0;
+ 	}
+-	sta_on = on;
+ 	asked_power = true;
+ 	asked_power_on = on;
+ 	if (!on) {
+--- a/bsd/dev/sweet_apple80211.c
++++ b/bsd/dev/sweet_apple80211.c
+@@ -341,10 +341,10 @@
+ 		}
+ 		return give(request, bits, sizeof(bits));
+ 	}
+-	case 19: {                              /* the radio's power: one radio. Until the driver is up it counts as on: it */
+-		struct {                        /* is being brought up, and iOS asks this once, early */
++	case 19: {                              /* the radio's power: one radio, as last asked for (on until then). Also */
++		struct {                        /* before the driver is up (0135): iOS asks this once, early */
+ 			uint32_t version, radios, state[4];
+-		} answer = { .version = 1, .radios = 1, .state = { !hakios_sta_present() || hakios_sta_powered() } };
++		} answer = { .version = 1, .radios = 1, .state = { hakios_sta_powered() } };
+ 
+ 		return give(request, &answer, sizeof(answer));
+ 	}
+--- a/bsd/kern/uipc_syscalls.c
++++ b/bsd/kern/uipc_syscalls.c
+@@ -732,6 +732,63 @@
+ 	           retval);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * (project-BadApple xnu 0135) Where Safari's processes connect, and how that goes: on apollo
++ * Safari shows no pages while Spotlight's web results come (boots 58-59), and WebKit's processes
++ * all start with none crashing. The first 96 connects of MobileSafari and com.apple.WebKit.*:
++ * an address and port, or a local socket's path, and the error (36: in progress, as usual).
++ */
++static void
++sweet_connect_said(struct socket *so, struct sockaddr *sa, int error)
++{
++	static uint32_t said;
++	char name[32];
++	const char *kind;
++
++	if (sa == NULL || said >= 96) {
++		return;
++	}
++	proc_selfname(name, sizeof(name));
++	if (strncmp(name, "com.apple.WebKit", 16) != 0 && strcmp(name, "MobileSafari") != 0) {
++		return;
++	}
++	said++;
++	kind = so->so_type == SOCK_STREAM ? "tcp" : so->so_type == SOCK_DGRAM ? "udp" : "other";
++	if (sa->sa_family == AF_INET && sa->sa_len >= sizeof(struct sockaddr_in)) {
++		struct sockaddr_in in;
++		uint32_t a;
++
++		memcpy(&in, sa, sizeof(in));
++		a = ntohl(in.sin_addr.s_addr);
++		printf("net: %s connects to %u.%u.%u.%u port %u (%s): %d\n", name, a >> 24, (a >> 16) & 0xff, (a >> 8) & 0xff,
++		    a & 0xff, (unsigned)ntohs(in.sin_port), kind, error);
++	} else if (sa->sa_family == AF_INET6 && sa->sa_len >= sizeof(struct sockaddr_in6)) {
++		struct sockaddr_in6 in6;
++		unsigned g[8];
++
++		memcpy(&in6, sa, sizeof(in6));
++		for (unsigned i = 0; i < 8; i++) {
++			g[i] = (unsigned)in6.sin6_addr.s6_addr[2 * i] << 8 | in6.sin6_addr.s6_addr[2 * i + 1];
++		}
++		printf("net: %s connects to [%x:%x:%x:%x:%x:%x:%x:%x] port %u (%s): %d\n", name, g[0], g[1], g[2], g[3], g[4],
++		    g[5], g[6], g[7], (unsigned)ntohs(in6.sin6_port), kind, error);
++	} else if (sa->sa_family == AF_UNIX) {
++		char path[64];
++		size_t length = sa->sa_len > 2 ? (size_t)sa->sa_len - 2 : 0;
++
++		if (length > sizeof(path) - 1) {
++			length = sizeof(path) - 1;
++		}
++		memcpy(path, (const char *)sa + 2, length);     /* (sockaddr_un: length, family, the path) */
++		path[length] = '\0';
++		printf("net: %s connects to the local socket %s: %d\n", name, path, error);
++	} else {
++		printf("net: %s connects to an address of family %u: %d\n", name, (unsigned)sa->sa_family, error);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ int
+ connect_nocancel(proc_t p, struct connect_nocancel_args *uap, int32_ref_t retval)
+ {
+@@ -773,6 +830,9 @@
+ 	}
+ 
+ 	error = connectit(so, sa);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_connect_said(so, sa, error);
++#endif
+ 
+ 	if (sa != NULL && sa != SA(&ss)) {
+ 		free_sockaddr(sa);
+@@ -931,6 +991,9 @@
+ 
+ 	error = connectitx(so, src, dst, p, ep.sae_srcif, uap->associd,
+ 	    &cid, auio, uap->flags, &bytes_written);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_connect_said(so, dst, error);
++#endif
+ 	if (error == ERESTART) {
+ 		error = EINTR;
+ 	}
