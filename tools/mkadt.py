@@ -220,7 +220,16 @@ def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_
             ('compatible', cstr('sweet,display')),
             ('canvas-width', u32(1125)),
             ('canvas-height', u32(2436)),
-        ])])
+        ])] + (
+        # launchd starts wifid only when the device tree has a node named "wlan" or "marconi-wifi"
+        # (com.apple.wifid _LimitLoadToDeviceTree; launchd asks io_device_tree_entry_exists_with_name):
+        # without it Settings shows Wi-Fi greyed out (boot 53). As iOSPlus10 and ios-spes found.
+        # Only with --wifi-fw: the radio's driver (sweetwifi=12) is what wifid then talks to.
+        [node('wlan', [
+            ph(),
+            ('device_type', cstr('wlan')),
+            ('compatible', cstr('apollo,qca6390')),
+        ])] if wifi else []))
 
     fbcon = node('sweet-fbcon', [
         ph(),
