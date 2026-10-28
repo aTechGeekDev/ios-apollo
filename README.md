@@ -6,7 +6,7 @@ Apple's open-source XNU kernel (xnu-8796), patched for the phone, boots the **un
 
 > Experimental, not a daily-use OS. Apple's security model is mostly switched off, and installing the iOS root **erases Android's `userdata` partition**.
 
-## Status (2026-10-27)
+## Status (2026-10-28)
 
 | | |
 | --- | --- |
@@ -16,7 +16,7 @@ Apple's open-source XNU kernel (xnu-8796), patched for the phone, boots the **un
 | Buttons | Power, volume up, volume down |
 | Display | iOS drawn by the GPU and copied to the panel (up to 60 frames a second with `sweetfb_hz=60`) |
 | GPU | Adreno 650 up. **Mesa draws with it** (OpenGL ES 3.2, freedreno), and iOS's own renderer (CoreAnimation in backboardd) draws **the whole GUI** on it through the bridge: lock screen, home screen, keyboard, and the blur of Control Center, Spotlight and the App Library (2026-10-26). A backboardd crash on some image uploads has a fix built, not yet tested |
-| Wi-Fi | Written and built, **not yet tested on the phone** (QCA6390): power, PCIe link, firmware boot and handshake (`sweetwifi=1..10`), then Linux's ath11k driver built into the kernel: a scan (`sweetwifi=11`), or `en0` for iOS's Wi-Fi settings (`sweetwifi=12`) |
+| Wi-Fi | **Working** (QCA6390, Linux's ath11k built into the kernel, `sweetwifi=12`): iOS's Wi-Fi settings list the networks around, a WPA2 network is joined (from Control Center) and the internet works (2026-10-28). Joining from the Settings list and the signal-strength icon are being fixed |
 | Not yet | Display power, USB networking, battery, Bluetooth, audio, cameras, cellular |
 
 The first boot of a fresh root runs iOS data migration once (an hour or more); later boots are quick. Day-to-day progress and the next steps are in [`NOTES.md`](NOTES.md).
@@ -122,7 +122,7 @@ The other boot-args are described in their drivers' sources in `xnu/patches/` an
 | Path | What |
 | --- | --- |
 | `shim/` | Boot shim, packed as an Android boot image |
-| `xnu/patches/` | The kernel patches (0001–0130), applied in order by CI |
+| `xnu/patches/` | The kernel patches (0001–0131), applied in order by CI |
 | `wifi/` | HackiOS's Linux layer for the Wi-Fi driver; CI builds Linux's ath11k on it and links it into the kernel |
 | `userland/` | Programs and libraries for the phone: GPU tests, Mesa, the CoreAnimation bridge |
 | `tools/` | Device tree builder, payload packer, iOS root builder, log and crash tools |

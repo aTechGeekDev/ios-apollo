@@ -1,0 +1,127 @@
+--- a/bsd/dev/sweet_wifi.c
++++ b/bsd/dev/sweet_wifi.c
+@@ -76,6 +76,7 @@
+ extern int hakios_lx_prepare(void);
+ extern void hakios_net_init(void);
+ extern void SweetNetworkStackStart(void);       /* iokit/Kernel/arm/SweetNetworkStack.cpp (0129) */
++extern void SweetIOKitDaemonStandIn(void);      /* ... (0131) */
+ void sweet_wifi_init(void);
+ const uint8_t *sweet_wifi_file(const char *name, unsigned int *size);
+ void *sweet_wifi_memory_at(size_t size, uint64_t iova);
+@@ -1672,6 +1673,15 @@
+ 	(void)PE_parse_boot_argn("sweetwifi", &wifi_steps, sizeof(wifi_steps));
+ 	(void)PE_parse_boot_argn("sweetwifidelay", &wifi_delay, sizeof(wifi_delay));
+ 	(void)PE_parse_boot_argn("sweetwifipoll", &wifi_poll_ms, sizeof(wifi_poll_ms));
++	/*
++	 * Not the radio's, but here because this runs early in bsd_init: the registry is let go quiet
++	 * as on iOS (SweetNetworkStack.cpp, xnu 0131; every boot, sweetiokitquiet=0 leaves it).
++	 */
++	uint32_t quiet = 1;
++	(void)PE_parse_boot_argn("sweetiokitquiet", &quiet, sizeof(quiet));
++	if (quiet) {
++		SweetIOKitDaemonStandIn();
++	}
+ 	if (!wifi_steps) {
+ 		return;
+ 	}
+--- a/bsd/dev/sweet_apple80211.c
++++ b/bsd/dev/sweet_apple80211.c
+@@ -92,6 +92,12 @@
+ 
+ /* ---- the layouts ------------------------------------------------------------------------------------------ */
+ 
++/*
++ * The noise floor told with every signal (xnu 0131): ath11k's own figure (ATH11K_DEFAULT_NOISE_FLOOR, the value
++ * it reckons signal strengths against); the firmware is not asked. Without a noise floor (0) iOS's signal-to-noise
++ * is the signal itself, -41 dBm, and the status bar showed a weak signal next to the access point (boot 56).
++ */
++#define NOISE_FLOOR             (-95)
+ #define CHANNEL_20MHZ           0x2u
+ #define CHANNEL_2GHZ            0x8u
+ #define CHANNEL_5GHZ            0x10u
+@@ -265,6 +271,9 @@
+ 	result->version = 1;
+ 	channel_fill(&result->channel, bss->frequency, 0);
+ 	result->rssi = bss->rssi;
++	result->noise_known = 1;
++	result->noise = NOISE_FLOOR;
++	result->snr = (int16_t)(bss->rssi - NOISE_FLOOR);
+ 	result->beacon_interval = bss->beacon_interval;
+ 	result->capability = bss->capability;
+ 	memcpy(result->bssid, bss->bssid, sizeof(result->bssid));
+@@ -439,6 +448,16 @@
+ 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+ 		break;
+ 	}
++	case 17: {                              /* the noise floor, as the signal above */
++		struct {
++			uint32_t version, radios, unit;
++			int32_t each[4], all, each_ext[4], all_ext;
++		} answer = { .version = 1, .radios = 1, .each = { NOISE_FLOOR }, .all = NOISE_FLOOR,
++			     .each_ext = { NOISE_FLOOR }, .all_ext = NOISE_FLOOR };
++
++		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
++		break;
++	}
+ 	case 103:                               /* all of it, as a scan's result */
+ 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give_network(request, &state->bss);
+ 		break;
+@@ -656,6 +675,10 @@
+ 		if (state != NULL) {
+ 			hakios_sta_state(state);
+ 			link.rssi = status == 1 ? state->bss.rssi : 0;
++			if (status == 1) {
++				link.snr = (uint16_t)(state->bss.rssi - NOISE_FLOOR);
++				link.noise = (uint16_t)NOISE_FLOOR;
++			}
+ 			kfree_data(state, sizeof(*state));
+ 		}
+ 		post(EVENT_SSID_CHANGED, NULL, 0);
+--- a/iokit/Kernel/arm/SweetNetworkStack.cpp
++++ b/iokit/Kernel/arm/SweetNetworkStack.cpp
+@@ -24,10 +24,12 @@
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IORegistryEntry.h>
++#include <libkern/c++/OSKext.h>
+ #include <sys/systm.h>
+ #include <sys/proc.h>
+ 
+ extern "C" void SweetNetworkStackStart(void);
++extern "C" void SweetIOKitDaemonStandIn(void);
+ 
+ class IONetworkStack : public IOService
+ {
+@@ -166,6 +168,32 @@
+ 
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
++/*
++ * Boot 56: the registry stayed busy (1) with no busy service under its root. That is the count
++ * StartIOKitMatching() adds to the root "until the IOKit daemon has completely finished launching"
++ * (IOStartIOKit.cpp): this kernel is built with the macOS SDK (!NO_KEXTD), so it waits for
++ * kernelmanagerd, which an iOS root does not have (an iOS kernel, NO_KEXTD, never adds the count).
++ * The registry never went quiet, so configd's interface namer never said "*QUIET*" and everything
++ * behind SCNetworkInterfaceCopyAll() waited its 300 s (wifid, Settings). So the daemon's arrival is
++ * stood in for, once, as early as sweet_wifi_init() runs (bsd_init, after PE_init_iokit's
++ * StartIOKitMatching): the deferred matches start, the root's count goes, IOUserResources gets
++ * "IOKit", as when kernelmanagerd checks in. (Not when the kernel has no daemon to wait for:
++ * boot-arg -restore.)
++ */
++void
++SweetIOKitDaemonStandIn(void)
++{
++	static bool done;
++
++	if (done || !OSKext::iokitDaemonAvailable()) {
++		return;
++	}
++	done = true;
++	IOLog("SweetNetworkStack: no IOKit daemon on iOS: its arrival is stood in for (the registry's busy state %u)\n",
++	    (unsigned) IOService::getServiceRoot()->getBusyState());
++	IOService::iokitDaemonLaunched();
++}
++
+ void
+ SweetNetworkStackStart(void)
+ {
