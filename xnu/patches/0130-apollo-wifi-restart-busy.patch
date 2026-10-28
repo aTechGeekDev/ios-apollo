@@ -1,0 +1,130 @@
+--- a/bsd/dev/sweet_pcie.c
++++ b/bsd/dev/sweet_pcie.c
+@@ -159,6 +159,11 @@
+ 	int error;
+ 	TRY(gpio_output(p, 79, false, 1));
+ 	pause_us(p, 1000);
++	/* The PIPE clock is voted on once the PHY runs (below) and stays voted when the endpoint is
++	 * put in reset: an enumeration after that (ath11k's restart after calibration) would reset
++	 * the controller and PHY with it running. Start every enumeration as the first one does,
++	 * with the vote off (boot 55: the restart's link never came up, errno 60). */
++	TRY(update(p, GCC + 0x52008, BIT(4), 0));
+ 	TRY(io->power_on(io->context));
+ 	/* UMI stock pinctrl: CLKREQ mux1/pull-up; WAKE input/pull-up. */
+ 	TRY(update(p, GPIO + 80 * 0x1000, 0x3ff, 7));
+--- a/bsd/dev/sweet_wifi.c
++++ b/bsd/dev/sweet_wifi.c
+@@ -1401,10 +1401,20 @@
+ 		error = ENXIO;
+ 		goto out;
+ 	}
+-	memset(&wifi_pcie, 0, sizeof(wifi_pcie));
+-	error = sweet_pcie_enumerate(&wifi_pcie, &wifi_pcie_io);
+-	if (!error) {
+-		error = radio_up_locked(7, amss, size);
++	/* (boot 55: once the link did not come back; so: a moment with the radio off first, and
++	 * three tries) */
++	for (unsigned attempt = 1;; attempt++) {
++		delay(100000);
++		memset(&wifi_pcie, 0, sizeof(wifi_pcie));
++		error = sweet_pcie_enumerate(&wifi_pcie, &wifi_pcie_io);
++		if (!error) {
++			error = radio_up_locked(7, amss, size);
++		}
++		if (!error || attempt == 3) {
++			break;
++		}
++		printf("SWEET WIFI: the driver restarts the radio: attempt %u: errno %d; again\n", attempt, error);
++		sweet_pcie_quiesce(&wifi_pcie);
+ 	}
+ 	if (error) {
+ 		sweet_pcie_quiesce(&wifi_pcie);
+--- a/iokit/Kernel/arm/SweetNetworkStack.cpp
++++ b/iokit/Kernel/arm/SweetNetworkStack.cpp
+@@ -23,6 +23,7 @@
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
++#include <IOKit/IORegistryEntry.h>
+ #include <sys/systm.h>
+ #include <sys/proc.h>
+ 
+@@ -62,6 +63,66 @@
+ 
+ OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient);
+ 
++/*
++ * Boot 55: configd opened this with the registry busy (1), and still waited its 300 s: the
++ * namer publishes "*QUIET*" only when the whole registry is idle, so something stays busy. Which
++ * services are busy (the busiest leaves: busy, with no busy child) is said 20, 60 and 120 s after
++ * configd opened the stack.
++ */
++static void
++sayBusy(unsigned seconds)
++{
++	IOService * root = IOService::getServiceRoot();
++	unsigned shown = 0;
++
++	IOLog("SweetNetworkStack: %u s after configd: the registry's busy state is %u\n", seconds,
++	    (unsigned) root->getBusyState());
++	if (root->getBusyState() == 0) {
++		return;
++	}
++	IORegistryIterator * all = IORegistryIterator::iterateOver(root, gIOServicePlane, kIORegistryIterateRecursively);
++	if (all == NULL) {
++		return;
++	}
++	IORegistryEntry * entry;
++	while ((entry = all->getNextObject()) != NULL && shown < 12) {
++		IOService * service = OSDynamicCast(IOService, entry);
++		if (service == NULL || service->getBusyState() == 0) {
++			continue;
++		}
++		bool busyChild = false;
++		OSIterator * children = service->getChildIterator(gIOServicePlane);
++		if (children != NULL) {
++			OSObject * child;
++			while (!busyChild && (child = children->getNextObject()) != NULL) {
++				IOService * other = OSDynamicCast(IOService, child);
++				busyChild = other != NULL && other->getBusyState() != 0;
++			}
++			children->release();
++		}
++		if (!busyChild) {
++			IOLog("SweetNetworkStack: %u s after configd: BUSY: %s (class %s, busy %u)\n", seconds, service->getName(),
++			    service->getMetaClass()->getClassName(), (unsigned) service->getBusyState());
++			shown++;
++		}
++	}
++	all->release();
++}
++
++static void
++watchBusy(void * argument)
++{
++	static const unsigned at[] = { 20, 60, 120 };
++	unsigned waited = 0;
++
++	for (unsigned i = 0; i < sizeof(at) / sizeof(at[0]); i++) {
++		IOSleep((at[i] - waited) * 1000);
++		waited = at[i];
++		sayBusy(at[i]);
++	}
++	IOExitThread();
++}
++
+ bool
+ IONetworkStackUserClient::start(IOService * provider)
+ {
+@@ -74,6 +135,11 @@
+ 	proc_selfname(who, sizeof(who));
+ 	IOLog("SweetNetworkStack: opened by %s; the registry's busy state is %u\n", who,
+ 	    (unsigned) IOService::getServiceRoot()->getBusyState());
++	static bool watching;
++	if (!watching) {
++		watching = true;
++		(void) IOCreateThread(watchBusy, NULL);
++	}
+ 	return true;
+ }
+ 
