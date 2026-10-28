@@ -65,7 +65,7 @@ objcopy -I ihex -O binary novatek_nt36675_j3s_fw01.bin.ihex novatek_nt36675_j3s_
 cd ../..
 ```
 
-GPU and Wi-Fi firmware, from the phone (in recovery): `tools/pull-gpu-fw.sh` and `tools/pull-wifi-fw.sh` (into `research/apollo-gpu/` and `research/apollo-wifi/`).
+GPU, Wi-Fi and Bluetooth firmware, from the phone (in recovery): `tools/pull-gpu-fw.sh`, `tools/pull-wifi-fw.sh` and `tools/pull-bt-fw.sh` (into `research/apollo-gpu/`, `research/apollo-wifi/` and `research/apollo-bt/`; `mkadt.py --bt-fw research/apollo-bt`).
 
 **4. Build the boot image** (needs `aarch64-linux-gnu-gcc` and `mkbootimg`):
 
@@ -114,6 +114,7 @@ adb reboot bootloader
 | `sweetgl=0` | Keep CoreAnimation's software renderer |
 | `sweetwifi=N` | Wi-Fi bring-up steps 1..12 (QCA6390: power, PCIe link, SMMU, firmware boot, QRTR, firmware handshake, board data + M3, calibration; 11 = Linux's ath11k driver brings the radio up, scans, and goes down again; 12 = the driver stays up as `en0` for iOS's Wi-Fi); needs `mkadt.py --wifi-fw research/apollo-wifi` from step 4 |
 | `sweetwifimac=aa:bb:cc:dd:ee:ff` | the radio's MAC address for `sweetwifi=11/12` (without it, a random locally administered one per boot) |
+| `sweetbt=N` | Bluetooth bring-up steps 1..6 (QCA6390 over the UART of serial engine 6: 1-3 clocks, pins, UART loopback; 4 the chip's ROM answers; 5 firmware, then an LE scan and a classic inquiry in the kernel; 6 the radio stays up for iOS's bluetoothd); needs `mkadt.py --bt-fw research/apollo-bt` from step 5 |
 
 The other boot-args are described in their drivers' sources in `xnu/patches/` and in `NOTES.md`.
 
@@ -122,7 +123,7 @@ The other boot-args are described in their drivers' sources in `xnu/patches/` an
 | Path | What |
 | --- | --- |
 | `shim/` | Boot shim, packed as an Android boot image |
-| `xnu/patches/` | The kernel patches (0001–0135), applied in order by CI |
+| `xnu/patches/` | The kernel patches (0001–0136), applied in order by CI |
 | `wifi/` | HackiOS's Linux layer for the Wi-Fi driver; CI builds Linux's ath11k on it and links it into the kernel |
 | `userland/` | Programs and libraries for the phone: GPU tests, Mesa, the CoreAnimation bridge |
 | `tools/` | Device tree builder, payload packer, iOS root builder, log and crash tools |

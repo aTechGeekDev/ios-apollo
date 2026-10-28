@@ -5,6 +5,7 @@ Only what the early boot path actually reads (see NOTES.md); every MMIO
 address comes from the sweet live FDT. Usage:
   mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--p3] [--touch-fw FW.bin] [--gmu-fw a650_gmu.bin]
             [--sqe-fw a650_sqe.fw] [--zap-mdt a650_zap.mdt] [--zap-seg a650_zap.b02] [--wifi-fw DIR|amss.bin] [--wifi-board FILE] [--wifi-mac aa:bb:cc:dd:ee:ff]
+            [--bt-fw DIR]
 /product says the display is sRGB, not the iPhone X's P3 (--p3 keeps P3): see build().
 --file /usr/local/PATH=LOCAL (as many as wanted) carries a file in /sweet-files; the kernel
 writes it onto the root before launchd starts (xnu 0120-0122, bsd/dev/sweet_files.c): a new
@@ -28,7 +29,10 @@ QCA6390 Wi-Fi firmware (the phone's amss20.bin / amss.bin, tools/pull-wifi-fw.sh
 as /sweet-wifi "amss" for sweet_wifi.c (sweetwifi=4 and up, xnu 0126). Given the folder
 (research/apollo-wifi/) it also carries m3.bin as "m3", regdb.bin as "regdb" and the board file
 (the one bdwlan*/bd_* .elf there, bd_j3sgl.elf if there are several, or --wifi-board FILE) as "board" for sweet_wlfw.c (sweetwifi=9,
-xnu 0127).
+xnu 0127). --bt-fw DIR embeds the QCA6390 Bluetooth firmware (the phone's htbtfw20.tlv and
+htnv20.bin, tools/pull-bt-fw.sh, not in git) as /sweet-bt "patch" and "nvm" for sweet_bt.c
+(sweetbt=5 and up, xnu 0136); its address is the Wi-Fi's + 1 (/chosen mac-address-bluetooth0,
+made with --wifi-fw).
 """
 import hashlib, os, re, struct, sys
 
@@ -107,7 +111,7 @@ def node(name, props=(), children=()):
 
 
 def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_extra=(), p3=False, files=(),
-          deletes=(), lists=(), wifi=(), macs=()):
+          deletes=(), lists=(), wifi=(), macs=(), bt=()):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
@@ -297,6 +301,7 @@ def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_
        ([node('sweet-touch', [ph(), ('firmware', touch_fw)])] if touch_fw else []) +
        ([node('sweet-gpu', [ph(), ('gmu-firmware', gmu_fw)] + list(gpu_extra))] if gmu_fw else []) +
        ([node('sweet-wifi', [ph()] + list(wifi))] if wifi else []) +
+       ([node('sweet-bt', [ph()] + list(bt))] if bt else []) +
        ([node('sweet-files', [ph()] + [(f'list{i}', path.encode() + b'\0') for i, path in enumerate(lists)]
                               + [(f'delete{i}', path.encode() + b'\0') for i, path in enumerate(deletes)]
                               + [(f'file{i}', path.encode() + b'\0' + data) for i, (path, data, _) in enumerate(files)]
@@ -393,6 +398,25 @@ if __name__ == '__main__':
                 enumerate(('wifi0', 'bluetooth0', 'ethernet0'))]
         print(f'Wi-Fi address (/chosen mac-address-wifi0, en0): {"--wifi-mac" if "--wifi-mac" in sys.argv else mac_file or "random"}',
               file=sys.stderr)
+    bt = []                                     # (property, bytes) of /sweet-bt
+    if '--bt-fw' in sys.argv:
+        where = sys.argv[sys.argv.index('--bt-fw') + 1]
+        if not os.path.isdir(where):
+            sys.exit(f'--bt-fw {where}: not a folder. Pull the firmware from the phone first (in recovery): '
+                     'tools/pull-bt-fw.sh')
+        lower = {n.lower(): n for n in os.listdir(where)}
+        for prop, name, low, high in (('patch', 'htbtfw20.tlv', 28, 512 * 1024), ('nvm', 'htnv20.bin', 16, 16 * 1024)):
+            if name not in lower:
+                sys.exit(f'--bt-fw {where}: no {name} (tools/pull-bt-fw.sh puts it there)')
+            data = open(os.path.join(where, lower[name]), 'rb').read()
+            # (the kernel checks the same: a TLV whose 3-byte length is the rest of the file)
+            if not low <= len(data) <= high or int.from_bytes(data[1:4], 'little') != len(data) - 4:
+                sys.exit(f'--bt-fw: {name} ({len(data)} bytes) is not a QCA firmware record of {low} to {high} bytes')
+            bt.append((prop, data))
+            print(f'Bluetooth {prop}: {name}, {len(data)} bytes', file=sys.stderr)
+        if not macs:
+            print('Bluetooth: no --wifi-fw, so no /chosen mac-address-bluetooth0: the chip keeps its NVM address',
+                  file=sys.stderr)
     files, deletes, lists = [], [], []          # (path, data, (uid, gid, mode) or None); paths; paths
     wanted = []                                 # (where it came from, "DEST=LOCAL [UID:GID:MODE]" or "-DEST")
     for i, arg in enumerate(sys.argv):
@@ -435,7 +459,7 @@ if __name__ == '__main__':
     if files:
         print(f'files for the root: {len(files)}, {sum(len(d) for _, d, _ in files) / 1048576:.1f} MiB', file=sys.stderr)
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, touch_fw=touch_fw, gmu_fw=gmu_fw,
-                 gpu_extra=gpu_extra, p3='--p3' in sys.argv, files=files, deletes=deletes, lists=lists, wifi=wifi, macs=macs)
+                 gpu_extra=gpu_extra, p3='--p3' in sys.argv, files=files, deletes=deletes, lists=lists, wifi=wifi, macs=macs, bt=bt)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:
