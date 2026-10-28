@@ -247,7 +247,7 @@
 +#endif /* SWEET_BT_H */
 --- /dev/null
 +++ b/bsd/dev/sweet_bt.c
-@@ -0,0 +1,1279 @@
+@@ -0,0 +1,1280 @@
 +/*
 + * Bluetooth of apollo (xnu 0136): the Bluetooth side of the QCA6390 -- the Wi-Fi's chip -- on the
 + * UART of QUP serial engine 6. Nothing runs unless boot-arg sweetbt=N asks for steps 1..N; they
@@ -303,6 +303,7 @@
 +
 +extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern void thread_set_thread_name(thread_t thread, const char *name);
++extern kern_return_t thread_terminate(thread_t);
 +extern int sweet_rpmh_bt_power(void);
 +extern int SweetBluetoothPublish(const uint8_t address[6], const uint8_t commands[64]);  /* SweetBluetooth.cpp */
 +extern void SweetBluetoothSetReady(bool ready);

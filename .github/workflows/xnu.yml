@@ -145,6 +145,12 @@ jobs:
           grep -c -E ' error:' build.log || true
           grep -n -B4 -A8 -E ' error:' build.log | head -600 || true
 
+      # Warnings do not stop the build; in our own files they are shown here, green or not.
+      - name: Warnings in our files
+        if: always()
+        run: |
+          grep -E '/(bsd/dev/(sweet_|hakios)|iokit/Kernel/arm/)[^:]*:[0-9]+:[0-9]+: warning:' build.log | sort -u | head -200 || true
+
       # Green alone is not enough: build.sh skips a patch git apply refuses (a warning only), and a
       # kernel linked without the Wi-Fi driver object runs sweet_lx.c's stand-ins. Both fail here.
       - name: Check every patch and the Wi-Fi driver are in
