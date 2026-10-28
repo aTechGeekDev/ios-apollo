@@ -116,7 +116,7 @@ adb reboot bootloader
 | `sweetwifi=N` | Wi-Fi bring-up steps 1..12 (QCA6390: power, PCIe link, SMMU, firmware boot, QRTR, firmware handshake, board data + M3, calibration; 11 = Linux's ath11k driver brings the radio up, scans, and goes down again; 12 = the driver stays up as `en0` for iOS's Wi-Fi); needs `mkadt.py --wifi-fw research/apollo-wifi` from step 4 |
 | `sweetwifimac=aa:bb:cc:dd:ee:ff` | the radio's MAC address for `sweetwifi=11/12` (without it, a random locally administered one per boot) |
 | `sweetbt=N` | Bluetooth bring-up steps 1..6 (QCA6390 over the UART of serial engine 6: 1-3 clocks, pins, UART loopback; 4 the chip's ROM answers; 5 firmware, then an LE scan and a classic inquiry in the kernel; 6 the radio stays up for iOS's bluetoothd); needs `mkadt.py --bt-fw research/apollo-bt` from step 5 |
-| `adsp_step=N` / `adsp=1` | the audio DSP (xnu 0138, the Mi 10 port's driver): steps 1..11 with a log of each (shared memory, firmware, TrustZone start, GLINK, QRTR, APR), then shut down unless `adsp_keep=1`; `adsp=1` is all of them, kept up. Needs its firmware on the root once: `tools/pull-audio-fw.sh` and `mkadt.py --files-from research/apollo-audio/files-adsp.txt` for one boot |
+| `apollo_audio=N` / `apollo_adsp_step=N` | the sound (xnu 0139: the drivers of the Mi 10T port [hakios-apollo](https://github.com/enesuzun2002/hakios-apollo)): 1 the audio DSP up; 2 the tertiary TDM port; 3 a test tone into a stream, amplifiers off; 4 the tone through the CS35L41 amplifiers, 20 dB under Android's level (`apollo_sound_below=` eighths of a dB, `apollo_sound_secs=`); 5 what iOS plays, through `/dev/apollo-audio`. `apollo_adsp_step=N`: the DSP's steps 1..N with a log of each. Needs the DSP's firmware on the root once: `tools/pull-audio-fw.sh` and `mkadt.py --files-from research/apollo-audio/files-adsp.txt` for one boot |
 
 The other boot-args are described in their drivers' sources in `xnu/patches/` and in `NOTES.md`.
 
@@ -125,7 +125,7 @@ The other boot-args are described in their drivers' sources in `xnu/patches/` an
 | Path | What |
 | --- | --- |
 | `shim/` | Boot shim, packed as an Android boot image |
-| `xnu/patches/` | The kernel patches (0001–0138), applied in order by CI |
+| `xnu/patches/` | The kernel patches (0001–0139), applied in order by CI |
 | `wifi/` | HackiOS's Linux layer for the Wi-Fi driver; CI builds Linux's ath11k on it and links it into the kernel |
 | `userland/` | Programs and libraries for the phone: GPU tests, Mesa, the CoreAnimation bridge |
 | `tools/` | Device tree builder, payload packer, iOS root builder, log and crash tools |
@@ -137,6 +137,6 @@ Not in git: partition backups, device trees, recovery images, firmware, Apple's 
 
 ## Credits
 
-Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), [Mesa](https://mesa3d.org), [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel) (the Mesa and CoreAnimation approach, the Wi-Fi layer) and its [Xiaomi Mi 10 port](https://github.com/JopangJovan/hackios-xnu-kernel-umi) (the QCA6390 bring-up), Linux's ath11k driver and FreeBSD's LinuxKPI (fetched when CI builds the kernel, not kept here), Xiaomi's published kernel source and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
+Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), [Mesa](https://mesa3d.org), [hakios-apollo](https://github.com/enesuzun2002/hakios-apollo) (the Mi 10T's sound), [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel) (the Mesa and CoreAnimation approach, the Wi-Fi layer) and its [Xiaomi Mi 10 port](https://github.com/JopangJovan/hackios-xnu-kernel-umi) (the QCA6390 bring-up), Linux's ath11k driver and FreeBSD's LinuxKPI (fetched when CI builds the kernel, not kept here), Xiaomi's published kernel source and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
 
 MIT License, see [`LICENSE`](LICENSE).
