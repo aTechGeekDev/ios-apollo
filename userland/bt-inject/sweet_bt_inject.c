@@ -31,6 +31,7 @@
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
+#include <mach-o/loader.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -94,12 +95,33 @@ boot_arg(const char *arguments, const char *name, char *out, size_t size)
 	return NULL;
 }
 
+/*
+ * BlueTool's own Mach-O, not libsweet-bt.dylib's. dyld does NOT promise that
+ * image 0 is the main program once a library is inserted (boot 68: image 0 was
+ * our 69 KB dylib, so base + 0x1ba48 fell past it and read 0). The main program
+ * is the one MH_EXECUTE image; find it by scanning, slide included.
+ */
+static const struct mach_header *
+main_executable(void)
+{
+	uint32_t count = _dyld_image_count();
+
+	for (uint32_t i = 0; i < count; i++) {
+		const struct mach_header *h = _dyld_get_image_header(i);
+
+		if (h != NULL && h->magic == MH_MAGIC_64 && h->filetype == MH_EXECUTE) {
+			return h;
+		}
+	}
+	return NULL;
+}
+
 /* Make BlueTool's builtin boot/init script always succeed (see the header comment). */
 static void
 patch_bluetool(void)
 {
 	static const uint32_t patch[3] = { 0xf900003fu, 0x52800000u, 0xd65f03c0u };  /* str xzr,[x1]; mov w0,#0; ret */
-	const struct mach_header *base = _dyld_get_image_header(0);     /* image 0 is always the main program */
+	const struct mach_header *base = main_executable();
 	uint32_t *at, orig;
 	vm_address_t page;
 	vm_size_t span;
@@ -107,9 +129,10 @@ patch_bluetool(void)
 	uintptr_t ps = (uintptr_t)getpagesize();
 
 	if (base == NULL) {
-		say("sweet-bt: BlueTool: no image base; not patched\n");
+		say("sweet-bt: BlueTool: no MH_EXECUTE image found; not patched\n");
 		return;
 	}
+	say("sweet-bt: BlueTool: main executable at %p (%u images)\n", (const void *)base, _dyld_image_count());
 	at = (uint32_t *)((uintptr_t)base + BLUETOOL_EXEC_OFFSET);
 	orig = *at;
 	if (orig != BLUETOOL_EXEC_ORIG) {
