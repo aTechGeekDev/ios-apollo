@@ -171,14 +171,15 @@ patch_word(const char *who, uint32_t offset, uint32_t orig, uint32_t value)
 	say("sweet-bt: %s: patched %p (%#x -> %#x)\n", who, (void *)at, orig, value);
 }
 
-/* Power-on vocabulary, so the stderr mirror does not flood the console ring with every os_log. */
+/* Keep only power-on / transport / authorization lines, so the mirror does not flood the ring. */
 static int
-interesting(const char *s)
+keep(const char *s)
 {
 	static const char *const words[] = {
-		"ransport", "HCI", "ontroller", "ower", "Blue", "evice", "irmware", "eset",
-		"endor", "nit", "pen", "onnect", "ail", "rror", "ctl", "H4", "UART", "ACIPC",
-		"adio", "addr", "MAC", "tack", NULL
+		"transport", "Transport", "HCI", "ontroller", "power state", "PowerState",
+		"Power state chang", "power init", "TCC", "uthoriz", "onnectab", "Searching",
+		"H4", "ACIPC", "QCA", "eset", "endor", "socket", "Opening", "connect", "Connect",
+		"fail", "Fail", "error", "Error", "radio", "Radio", "nable", "managerState", NULL
 	};
 
 	for (int i = 0; words[i] != NULL; i++) {
@@ -189,24 +190,66 @@ interesting(const char *s)
 	return 0;
 }
 
-/* Our stand-in for bluetoothd's _os_log_impl: mirror the line to stderr, then call the real one. */
+/* Append os_log's encoded arguments after the format, so %d/%x/%s values are visible. */
+static void
+decode_args(char *out, size_t outsz, const char *fmt, const uint8_t *buf, uint32_t size)
+{
+	int n = snprintf(out, outsz, "%s", fmt);
+	size_t p = 2;
+
+	if (buf == NULL || size < 2 || n < 0) {
+		return;
+	}
+	for (uint8_t i = 0; i < buf[1] && p + 2 <= size && n < (int)outsz - 1; i++) {
+		uint8_t desc = buf[p];
+		uint8_t sz = buf[p + 1];
+
+		p += 2;
+		if ((size_t)sz > size - p) {
+			break;
+		}
+		if ((desc & 0x0f) == 2 && sz == 8) {       /* %s: a pointer to a string */
+			const char *s;
+
+			memcpy(&s, buf + p, sizeof(s));
+			if (s != NULL && (uintptr_t)s > 0x1000 && ((uintptr_t)s >> 47) == 0) {
+				n += snprintf(out + n, outsz - (size_t)n, " |%s", s);
+			}
+		} else if (sz >= 1 && sz <= 8) {            /* a scalar (%d/%x/%lld/...) */
+			unsigned long long v = 0;
+
+			for (uint8_t b = 0; b < sz; b++) {
+				v |= (unsigned long long)buf[p + b] << (8 * b);
+			}
+			n += snprintf(out + n, outsz - (size_t)n, " |%llu", v);
+		}
+		p += sz;
+	}
+}
+
+/* Our stand-in for bluetoothd's _os_log_impl: mirror interesting lines to stderr, then call real. */
 static void
 sweet_oslog(void *dso, void *log, unsigned int type, const char *format, uint8_t *buf, uint32_t size)
 {
-	const char *text = format;
+	static char last[1024];
+	char line[1024];
 
 	if (format != NULL) {
-		/* bluetoothd's debug helper logs the already-formatted string as a %{public}s arg. */
 		if (strcmp(format, "%{public}s") == 0 && buf != NULL && size >= 12 && buf[1] >= 1 && buf[3] == 8) {
 			const char *s;
 
 			memcpy(&s, buf + 4, sizeof(s));
 			if (s != NULL && (uintptr_t)s > 0x1000 && ((uintptr_t)s >> 47) == 0) {
-				text = s;
+				snprintf(line, sizeof(line), "%s", s);
+			} else {
+				snprintf(line, sizeof(line), "%s", format);
 			}
+		} else {
+			decode_args(line, sizeof(line), format, buf, size);
 		}
-		if (text != NULL && interesting(text)) {
-			say("btd: %s\n", text);
+		if (keep(line) && strcmp(line, last) != 0) {    /* skip the repeated power-state floods */
+			say("btd: %s\n", line);
+			strlcpy(last, line, sizeof(last));
 		}
 	}
 	if (real_os_log_impl != NULL) {

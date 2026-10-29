@@ -2,6 +2,17 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 71 (2026-10-29): os_log mirror WORKS -- bluetoothd reaches the transport + full startup, but the controller never powers on <<<
+
+**The os_log hook works** (`sweet-bt: bluetoothd: os_log hooked`; `btd:` lines appear). bluetoothd gets MUCH further than visible before:
+- `btd: Searching for transport: "H4"` -- **the transport lookup IS reached and H4 matched** (no FATAL ERROR). Then `Set HCI config...`, `Successfully stopped HCI tracing`, DeviceManager, keychain reads, `Bluetooth server started`, `Server attached, going into msg loop`.
+- `btd: Beginning asynchronous power init` then `exec BlueTool` (gate patched) -- so power init starts.
+- Then a FLOOD of `btd: PowerManager power state is %d` and `Power state changed. PowerState:%d managerState:%d fUserAuthorization: %d medicalDeviceorStateRestorationAppPendingTCC:%d`, `ReadyForTCC. TCC required:%d ...`, and the Settings toggle: `Session "..." wants connectability %{public}s`.
+- **But NO `SWEET BT: H4: connected`, no HCI, no transport OPEN.** The controller never powers on; the UI spins.
+**Read:** the blocker is NOT the transport lookup (reached) and NOT the BlueTool gate (patched, power init proceeds). It is the **power-on / authorization path** -- bluetoothd churns power-state + TCC/authorization and never opens the H4 kernel control. The `%d` values are hidden (my thunk only decoded `%{public}s`), so I could not see PowerState / fUserAuthorization / TCC-required. `SWEET Sandbox: bluetoothd privilege 12000 denied` and `1002 denied` happen here but bluetoothd continued PAST them to full startup, so they are probably not the startup gate (maybe still relevant to power-on; grant them if the values point there -- sweet_amfi.c `sweet_sandbox_priv_grant`, patch 0064, currently grants only PRIV_WORK_INTERVAL).
+**Enhancement (commit below):** the os_log thunk now **decodes the encoded args** (scalars as `|N`, strings as `|str`) and **dedupes consecutive identical lines** (kills the PowerManager flood), with a tighter keep-filter (power state / TCC / authorization / transport / HCI / connect). So boot 72's `btd:` lines show the real numbers: `Power state changed. ... |<PowerState> |<managerState> |<fUserAuthorization> |<PendingTCC>` and `power state is |<N>`. Those decide whether it is user-authorization (fUserAuthorization 0), TCC (TCC required 1 / pending), or a stuck managerState -- then the real fix. Host-tested the decode+filter. Rebuild = `bt.yml`.
+**Test (boot 72):** identical to boot 71 (sweetbtlog=1), fixed `sweet-bt`. Toggle BT on, pull the log, grep `^btd:`. Send the `btd:` lines, especially every `Power state changed` and `power state is` line WITH its `|` values, and anything mentioning transport/HCI/connect/TCC/authorization.
+
 ### >>> BOOT 70 (2026-10-29): bluetoothd gate PATCHED (loop 30x -> ~4x), but still no H4 connect; blind past here (bluetoothd logs to os_log) <<<
 
 **Log:** `sweet-bt: bluetoothd: BlueTool result gate: patched 0x102f3a580 (0x940fbb92 -> 0xd2800000)` -- the one-instruction bluetoothd patch applied (539 images, MH_EXECUTE scan right). The BlueTool **relaunch loop collapsed from ~30 to ~4** (log 1/4 the size, flush #104 vs #466), so forcing the RunBuiltinScript result to 0 clearly took effect. bluetoothd reached `Server attached, going into msg loop`. **But still NO `SWEET BT: H4: connected`** -- bluetoothd never opened the transport; a few `exec BlueTool` still appear then it goes quiet. MAC real (`6a:b1:af:61:a2:fd`).
