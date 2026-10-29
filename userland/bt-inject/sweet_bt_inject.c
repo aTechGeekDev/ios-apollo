@@ -1,32 +1,36 @@
 /*
- * libsweet-bt.dylib: what the kernel puts into bluetoothd and BlueTool so iOS's Bluetooth stack
- * talks to the QCA6390 the kernel brought up (sweet_bt.c, boot-arg sweetbt=6: the firmware runs,
- * the H4 kernel control "com.sweet.bluetooth" and the registry entry "bluetooth" are up). Inserted
- * with boot-arg
- *   sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool
+ * libsweet-bt.dylib: what the kernel inserts into bluetoothd so iOS's Bluetooth stack talks to the
+ * QCA6390 the kernel brought up (sweet_bt.c, boot-arg sweetbt=6: the firmware runs, the H4 kernel
+ * control "com.sweet.bluetooth" and the registry entry "bluetooth" are up). Inserted with boot-arg
+ *   sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd
  * (xnu 0114's sweetinject + AMFI dyld policy; launchd drops DYLD_ variables itself).
  *
- * Two jobs, dispatched on getprogname() like the CoreAnimation bridge's sweet_ca.c:
+ * Two jobs, both in bluetoothd, from the inserted library's constructor before main() runs:
  *
- * bluetoothd: its HCI transport is named by the environment variable BT_HCI_TRANSPORT, which
- *   launchd will not let us set in the job's plist (apollo boot 46), so this sets it from the
- *   inserted library's constructor before main() reads it. The value
- *     H4:POSIX:com.sweet.bluetooth,115200
- *   makes bluetoothd open the kernel's H4 endpoint (a stream kernel control of that name, to which
- *   sweet_bt.c answers "SWEET BT: H4: connected"). Boot-arg sweetbthci=STRING overrides it,
- *   sweetbthci=0 leaves bluetoothd's own environment alone.
+ * 1. Transport. bluetoothd's HCI transport is named by the environment variable BT_HCI_TRANSPORT,
+ *    which launchd will not let us set in the job's plist (apollo boot 46), so this sets it. The
+ *    value H4:POSIX:com.sweet.bluetooth,115200 makes bluetoothd open the kernel's H4 endpoint (a
+ *    stream kernel control of that name, to which sweet_bt.c answers "SWEET BT: H4: connected").
+ *    Boot-arg sweetbthci=STRING overrides it, sweetbthci=0 leaves bluetoothd's environment alone.
  *
- * BlueTool: bluetoothd will not power the controller on until BlueTool's boot script finishes
- *   (boot 66/67: `exec BlueTool` loops, Settings spins forever). BlueTool -R can only open Apple's
- *   own transports (PCIe AppleConvergedTransport, ACIPC) -- not our UART chip, which the kernel
- *   already brought up -- so every command fails "Device not open yet" and the script never
- *   completes. This makes BlueTool's per-command executor a no-op that returns success, so the
- *   whole builtin script "succeeds" (result 0) and bluetoothd powers on and opens the H4 transport
- *   itself; the chip is already running, and bluetoothd sends its own HCI reset next. This is the
- *   Mi 10 port's umi_bluetool.c idea, found anew in this 20H392 BlueTool by disassembly. Boot-arg
- *   sweetbtpatch=0 skips the patch (then BlueTool runs unchanged, for comparison).
+ * 2. The BlueTool gate. To power the controller on, bluetoothd sends RunBuiltinScript to BlueTool
+ *    (XPC, MachService com.apple.BlueTool) and will not proceed until the reply's "result" is 0.
+ *    BlueTool's -R boot script can only open Apple's own transports (PCIe/ACIPC), not our UART, so
+ *    every command fails "Device not open yet", the script's result is non-zero, and bluetoothd
+ *    relaunches BlueTool forever (boots 66-69: Settings spins). But the chip is ALREADY running
+ *    (the kernel loaded the firmware), so BlueTool's boot script is redundant -- bluetoothd just
+ *    needs the green light. In bluetoothd's reply handler (20H392, image offset 0x272580) the
+ *    result is read with
+ *        bl _xpc_dictionary_get_int64      ; 0x940fbb92
+ *        mov x20, x0
+ *        ...
+ *        cbz x0, <success>                 ; result == 0 -> "BlueTool finished running %s script"
+ *    Replacing that bl with `mov x0, #0` makes the read yield 0, so bluetoothd always takes the
+ *    success branch, stores status 0, and goes on to open the H4 transport and power on. (Found by
+ *    disassembling the user's 20H392 bluetoothd; boot 69 showed the earlier BlueTool-side patch was
+ *    the wrong lever -- bluetoothd is the gatekeeper.) Boot-arg sweetbtpatch=0 skips the patch.
  *
- * The output goes to stderr, the console log with bluetoothd/BlueTool in boot-arg sweetnull.
+ * Output goes to stderr, the console log with bluetoothd in boot-arg sweetnull.
  */
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
@@ -46,15 +50,15 @@ extern int *_NSGetArgc(void);
 #define BT_HCI_DEFAULT  "H4:POSIX:com.sweet.bluetooth,115200"
 
 /*
- * BlueTool (/usr/sbin/BlueTool, 20H392 build in bt-ios.tgz): the function at image offset 0x1ba48
- * (vmaddr 0x10001ba48) parses and runs one command line, writing its output to *x1 and returning a
- * status; the RunBuiltinScript handler loops it over the script's lines and replies with the last
- * status as "result". Replacing it with `str xzr, [x1]; mov w0, #0; ret` makes every line a
- * successful no-op (null output, status 0). If the first word is not the expected prologue the
- * build differs and the patch is refused.
+ * bluetoothd (/usr/sbin/bluetoothd, 20H392 in bt-ios.tgz): in the RunBuiltinScript reply handler,
+ * image offset 0x272580 is `bl _xpc_dictionary_get_int64` (0x940fbb92) which reads the reply's
+ * "result"; the next `cbz x0` takes the success path when it is 0. Overwrite that one instruction
+ * with `mov x0, #0` so the result is always read as 0. If the word is not the expected bl the build
+ * differs and the patch is refused.
  */
-#define BLUETOOL_EXEC_OFFSET 0x1ba48u
-#define BLUETOOL_EXEC_ORIG   0xa9bb6ffcu   /* stp x28, x27, [sp, #-0x50]! */
+#define BTD_RESULT_OFFSET 0x272580u
+#define BTD_RESULT_ORIG   0x940fbb92u   /* bl _xpc_dictionary_get_int64 */
+#define BTD_RESULT_PATCH  0xd2800000u   /* mov x0, #0 */
 
 static void
 say(const char *format, ...)
@@ -96,10 +100,9 @@ boot_arg(const char *arguments, const char *name, char *out, size_t size)
 }
 
 /*
- * BlueTool's own Mach-O, not libsweet-bt.dylib's. dyld does NOT promise that
- * image 0 is the main program once a library is inserted (boot 68: image 0 was
- * our 69 KB dylib, so base + 0x1ba48 fell past it and read 0). The main program
- * is the one MH_EXECUTE image; find it by scanning, slide included.
+ * The running program's own Mach-O, not libsweet-bt.dylib's. dyld does NOT promise image 0 is the
+ * main program once a library is inserted (boot 68: image 0 was our dylib), so find the one
+ * MH_EXECUTE image; its header is at the slid load address, so offsets add directly.
  */
 static const struct mach_header *
 main_executable(void)
@@ -116,44 +119,47 @@ main_executable(void)
 	return NULL;
 }
 
-/* Make BlueTool's builtin boot/init script always succeed (see the header comment). */
+/* Overwrite one instruction at OFFSET (expected to be ORIG) with VALUE in the main executable. */
 static void
-patch_bluetool(void)
+patch_word(const char *who, uint32_t offset, uint32_t orig, uint32_t value)
 {
-	static const uint32_t patch[3] = { 0xf900003fu, 0x52800000u, 0xd65f03c0u };  /* str xzr,[x1]; mov w0,#0; ret */
 	const struct mach_header *base = main_executable();
-	uint32_t *at, orig;
+	uint32_t *at;
 	vm_address_t page;
 	vm_size_t span;
 	kern_return_t kr;
 	uintptr_t ps = (uintptr_t)getpagesize();
 
 	if (base == NULL) {
-		say("sweet-bt: BlueTool: no MH_EXECUTE image found; not patched\n");
+		say("sweet-bt: %s: no MH_EXECUTE image found; not patched\n", who);
 		return;
 	}
-	say("sweet-bt: BlueTool: main executable at %p (%u images)\n", (const void *)base, _dyld_image_count());
-	at = (uint32_t *)((uintptr_t)base + BLUETOOL_EXEC_OFFSET);
-	orig = *at;
-	if (orig != BLUETOOL_EXEC_ORIG) {
-		say("sweet-bt: BlueTool: executor at %p is %#x, not %#x: NOT patched (different build?)\n",
-		    (void *)at, orig, BLUETOOL_EXEC_ORIG);
+	at = (uint32_t *)((uintptr_t)base + offset);
+	if (*at != orig) {
+		say("sweet-bt: %s: word at %p is %#x, not %#x: NOT patched (different build?)\n",
+		    who, (void *)at, *at, orig);
 		return;
 	}
 	page = (vm_address_t)((uintptr_t)at & ~(ps - 1));
-	span = (vm_size_t)((((uintptr_t)at + sizeof(patch)) - page + ps - 1) & ~(ps - 1));
+	span = (vm_size_t)((((uintptr_t)at + sizeof(*at)) - page + ps - 1) & ~(ps - 1));
 	kr = vm_protect(mach_task_self(), page, span, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
 	if (kr != KERN_SUCCESS) {
-		say("sweet-bt: BlueTool: vm_protect(rw) at %p failed (%d); not patched\n", (void *)page, kr);
+		say("sweet-bt: %s: vm_protect(rw) at %p failed (%d); not patched\n", who, (void *)page, kr);
 		return;
 	}
-	at[0] = patch[0];
-	at[1] = patch[1];
-	at[2] = patch[2];
+	*at = value;
 	(void)vm_protect(mach_task_self(), page, span, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-	sys_icache_invalidate(at, sizeof(patch));
-	say("sweet-bt: BlueTool: command executor no-op'd (%#x -> %#x); the builtin script now succeeds, "
-	    "so bluetoothd can power on\n", orig, *at);
+	sys_icache_invalidate(at, sizeof(*at));
+	say("sweet-bt: %s: patched %p (%#x -> %#x)\n", who, (void *)at, orig, value);
+}
+
+/* Make bluetoothd treat BlueTool's RunBuiltinScript as success (see the header comment). */
+static void
+patch_bluetoothd(void)
+{
+	say("sweet-bt: bluetoothd: main executable at %p (%u images)\n",
+	    (const void *)main_executable(), _dyld_image_count());
+	patch_word("bluetoothd: BlueTool result gate", BTD_RESULT_OFFSET, BTD_RESULT_ORIG, BTD_RESULT_PATCH);
 }
 
 __attribute__((constructor))
@@ -172,27 +178,35 @@ sweet_bt_init(void)
 
 	if (strcmp(name, "bluetoothd") == 0) {
 		const char *transport = BT_HCI_DEFAULT;
+		int set_transport = 1;
 
 		if (boot_arg(arguments, "sweetbthci", value, sizeof(value)) != NULL) {
 			if (strcmp(value, "0") == 0) {
+				set_transport = 0;
 				say("sweet-bt: bluetoothd: sweetbthci=0: leaving BT_HCI_TRANSPORT as it is\n");
-				return;
+			} else {
+				transport = value;
 			}
-			transport = value;
 		}
-		setenv("BT_HCI_TRANSPORT", transport, 1);
-		say("sweet-bt: bluetoothd: BT_HCI_TRANSPORT=%s (the kernel's H4 endpoint; sweetbt=6)\n", transport);
+		if (set_transport) {
+			setenv("BT_HCI_TRANSPORT", transport, 1);
+			say("sweet-bt: bluetoothd: BT_HCI_TRANSPORT=%s (the kernel's H4 endpoint; sweetbt=6)\n", transport);
+		}
+		if (boot_arg(arguments, "sweetbtpatch", value, sizeof(value)) != NULL && strcmp(value, "0") == 0) {
+			say("sweet-bt: bluetoothd: sweetbtpatch=0: not patching the BlueTool gate\n");
+			return;
+		}
+		patch_bluetoothd();
 	} else if (strcmp(name, "BlueTool") == 0) {
+		/*
+		 * Not needed any more (bluetoothd ignores BlueTool's result now); kept so injecting
+		 * BlueTool is harmless and its launches stay visible in the log.
+		 */
 		char **argv = _NSGetArgv() != NULL ? *_NSGetArgv() : NULL;
 		int argc = _NSGetArgc() != NULL ? *_NSGetArgc() : 0;
 
 		for (int i = 0; argv != NULL && i < argc && argv[i] != NULL; i++) {
 			say("sweet-bt: BlueTool argv[%d]=%s\n", i, argv[i]);
 		}
-		if (boot_arg(arguments, "sweetbtpatch", value, sizeof(value)) != NULL && strcmp(value, "0") == 0) {
-			say("sweet-bt: BlueTool: sweetbtpatch=0: not patching\n");
-			return;
-		}
-		patch_bluetool();
 	}
 }
