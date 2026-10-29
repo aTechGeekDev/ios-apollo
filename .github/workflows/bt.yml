@@ -1,0 +1,41 @@
+name: bt
+
+# libsweet-bt.dylib: the library the kernel inserts into bluetoothd (and later BlueTool) so iOS's
+# Bluetooth stack uses the QCA6390 the kernel brought up (sweet_bt.c, sweetbt=6). It sets
+# BT_HCI_TRANSPORT to the kernel's H4 endpoint. Built with Xcode's iPhoneOS SDK and ad-hoc signed,
+# apart from userland.yml so a change here does not rebuild Mesa. Artifact sweet-bt:
+# lib/libsweet-bt.dylib, SHA256SUMS; boot-arg sweetinject puts it in, no new root needed
+# (tools/sweet-root-add.sh installs lib/* into /usr/local/lib). See userland/README.md.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "userland/bt-inject/**"
+      - ".github/workflows/bt.yml"
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build libsweet-bt.dylib
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir -p out/lib
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" \
+            -O2 -Wall -Wextra -Werror -dynamiclib -install_name /usr/local/lib/libsweet-bt.dylib \
+            -o out/lib/libsweet-bt.dylib userland/bt-inject/sweet_bt_inject.c
+          codesign -s - -f out/lib/libsweet-bt.dylib
+          codesign -dv out/lib/libsweet-bt.dylib
+          file out/lib/libsweet-bt.dylib
+          otool -L out/lib/libsweet-bt.dylib
+      - name: Checksums
+        run: |
+          cd out && find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweet-bt
+          path: out/

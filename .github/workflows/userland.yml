@@ -12,6 +12,7 @@ on:
       - "userland/**"
       - "!userland/README.md"
       - "!userland/audio/**"
+      - "!userland/bt-inject/**"
       - ".github/workflows/userland.yml"
 
 jobs:
