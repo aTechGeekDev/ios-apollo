@@ -70,34 +70,30 @@
  #endif /* ARM64_BOARD_CONFIG_SWEET */
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -5568,6 +5568,54 @@
+@@ -5568,6 +5568,65 @@
   * Note:	The argument and environment vectors are user space pointers
   *		to arrays of user space pointers.
   */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +/*
-+ * SWEET: boot-arg sweetinject=LIBRARY:NAME[,NAME...] -- every program whose
-+ * file name is one of the NAMEs is started with DYLD_INSERT_LIBRARIES=LIBRARY
-+ * in its environment (the CoreAnimation bridge in backboardd). launchd drops
-+ * DYLD_ variables from job descriptions, so the kernel adds this one; dyld
-+ * honours it because sweet_amfi.c's "AMFI" policy allows it while sweetinject
-+ * is set. After HackiOS's kern.exec_inject (bsd/kern/kern_exec.c there).
++ * SWEET: boot-arg sweetinject=LIBRARY:NAME[,NAME...][;LIBRARY:NAME[,NAME...]]...
++ * -- every program whose file name is one of the NAMEs is started with
++ * DYLD_INSERT_LIBRARIES=LIBRARY (that group's library) in its environment, so
++ * one boot inserts the CoreAnimation bridge into backboardd and libsweet-bt
++ * into bluetoothd,BlueTool at once; the first group that names a program wins.
++ * launchd drops DYLD_ variables from job descriptions, so the kernel adds this
++ * one; dyld honours it because sweet_amfi.c's "AMFI" policy allows it while
++ * sweetinject is set. After HackiOS's kern.exec_inject (bsd/kern/kern_exec.c).
 + */
 +static bool
 +sweet_exec_inject(struct image_params *imgp, char *env, size_t size)
 +{
 +	char conf[200];
-+	const char *path = imgp->ip_strings + strlen(EXECUTABLE_KEY), *name = path, *word;
-+	size_t namelen, liblen = 0;
++	const char *path = imgp->ip_strings + strlen(EXECUTABLE_KEY), *name = path;
++	size_t namelen;
 +
 +	if (!PE_parse_boot_argn("sweetinject", conf, sizeof(conf)) ||
 +	    strncmp(imgp->ip_strings, EXECUTABLE_KEY, strlen(EXECUTABLE_KEY)) != 0) {
-+		return false;
-+	}
-+	while (conf[liblen] != 0 && conf[liblen] != ':') {
-+		liblen++;
-+	}
-+	if (conf[liblen] != ':' || liblen == 0) {
 +		return false;
 +	}
 +	for (const char *c = path; *c != 0; c++) {
@@ -106,17 +102,32 @@
 +		}
 +	}
 +	namelen = strlen(name);
-+	for (word = conf + liblen + 1; *word != 0;) {
-+		size_t len = 0;
++	if (namelen == 0) {
++		return false;
++	}
++	for (const char *group = conf; *group != 0;) {
++		const char *lib = group, *word;
++		size_t grouplen = 0, liblen = 0;
 +
-+		while (word[len] != 0 && word[len] != ',') {
-+			len++;
++		while (group[grouplen] != 0 && group[grouplen] != ';') {
++			grouplen++;
 +		}
-+		if (len == namelen && namelen != 0 && strncmp(word, name, len) == 0) {
-+			snprintf(env, size, "DYLD_INSERT_LIBRARIES=%.*s", (int)liblen, conf);
-+			return true;
++		while (liblen < grouplen && lib[liblen] != ':') {
++			liblen++;
 +		}
-+		word += len + (word[len] == ',');
++		for (word = lib + liblen + 1; liblen != 0 && liblen < grouplen && word < group + grouplen;) {
++			size_t len = 0;
++
++			while (word + len < group + grouplen && word[len] != ',') {
++				len++;
++			}
++			if (len == namelen && strncmp(word, name, len) == 0) {
++				snprintf(env, size, "DYLD_INSERT_LIBRARIES=%.*s", (int)liblen, lib);
++				return true;
++			}
++			word += len + (word + len < group + grouplen && word[len] == ',');
++		}
++		group += grouplen + (group[grouplen] == ';');
 +	}
 +	return false;
 +}
@@ -125,7 +136,7 @@
  __attribute__((noinline))
  static int
  exec_extract_strings(struct image_params *imgp)
-@@ -5741,6 +5789,26 @@
+@@ -5741,6 +5800,26 @@
  		imgp->ip_envc++;
  	}
  
