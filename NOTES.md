@@ -2,6 +2,15 @@
 
 ## Agent handoff / active work
 
+### >>> 🎉 BOOT 65 (2026-10-29, kernel 40708919069 = 0140, lib 40829413855, sweetbt=6 + sweetinject bluetoothd): bluetoothd RUNS AND SEES OUR CONTROLLER <<<
+
+**Log (user grep):** the dylib rode in the ADT (`SWEET FILES: /usr/local/lib/libsweet-bt.dylib: 68608 bytes written`, --file via /sweet-files) and injected (`|bluetoothd| sweet-bt: bluetoothd: BT_HCI_TRANSPORT=H4:POSIX:com.sweet.bluetooth,115200`). The kernel brought the radio up as before (`THE FIRMWARE RUNS ... THE RADIO IS UP for iOS: H4 at com.sweet.bluetooth, registry entry "bluetooth"`). **bluetoothd's first two launches died `No bluetooth on this device`** -- they ran during the chip's ~18 s firmware load, before the `bluetooth` registry entry existed (`Not a valid MAC address (all 00s)`). It is KeepAlive, so the **third launch found the entry (`bluetooth: Got local-mac-address: 00:00:00:00:5a:ad`) and entered its server loop (`com.apple.server.bluetooth: Server attached, going into msg loop`)** -- the stage-2a goal: the daemon is alive and sees our controller (it no longer says "No bluetooth on this device").
+**Open (what the log shows is left):**
+1. **bluetoothd is idle in its msg loop; it has NOT opened the H4 transport** (no `SWEET BT: H4: connected`). iOS opens the HCI transport only when Bluetooth is powered on (restored state / the Settings toggle). **Next: turn Bluetooth on** (Settings -> Bluetooth), pull the log, and watch for `SWEET BT: H4: connected` and whether a BlueTool/firmware handshake or the chip's answers then need the stage-2b/2c edits. No rebuild for this -- it is the same boot image.
+2. `SWEET Sandbox: bluetoothd privilege 12000 denied` and `1002 denied` -- our permissive sandbox denied two ops (bluetoothd went into its loop anyway; watch whether power-on needs them; sweet_sandbox.c).
+3. The MAC is `00:00:00:00:5a:ad` (the kernel's registry entry; no --wifi-fw so the chip kept its NVM/default and the ADT has no mac-address-bluetooth0). bluetoothd also logs `could not find BT_DEVICE_ADDRESS env variable` and falls back to it. A proper address is a later polish (set BT_DEVICE_ADDRESS in libsweet-bt, or give the ADT a BT MAC).
+**Timing race (cosmetic):** the two early "No bluetooth" exits are because bluetoothd starts before the 18 s firmware load finishes; KeepAlive covers it. Could be tidied later (start the BT thread earlier, or have the registry entry appear before the daemon's first try).
+
 ### >>> BLUETOOTH STAGE 2a (2026-10-29): the iOS side begins -- bluetoothd gets the kernel's H4 endpoint (built, NOT booted) <<<
 
 **Finding that makes the transport simple:** sweet_bt.c's own comment (0136, around its step 6) says bluetoothd's `H4:POSIX:com.sweet.bluetooth` transport **is a stream kernel control socket** -- Apple's bluetoothd connects to the kernel control of that name directly, so no userland bridging of the bytes is needed. The iOS side's first half is therefore just: give bluetoothd that transport, and let the daemon run.
