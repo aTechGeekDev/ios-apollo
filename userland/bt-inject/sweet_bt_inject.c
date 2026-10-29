@@ -179,7 +179,10 @@ keep(const char *s)
 		"transport", "Transport", "HCI", "ontroller", "power state", "PowerState",
 		"Power state chang", "power init", "TCC", "uthoriz", "onnectab", "Searching",
 		"H4", "ACIPC", "QCA", "eset", "endor", "socket", "Opening", "connect", "Connect",
-		"fail", "Fail", "error", "Error", "radio", "Radio", "nable", "managerState", NULL
+		"fail", "Fail", "error", "Error", "radio", "Radio", "nable", "managerState",
+		/* controller-init outcome (the async power-init gate) */
+		"chip", "Chip", "latform", "anufacturer", "restart", "booting", "timed",
+		"high power", "Turning", "modification", "Unknown", "result", "Init", NULL
 	};
 
 	for (int i = 0; words[i] != NULL; i++) {

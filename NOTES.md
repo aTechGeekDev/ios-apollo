@@ -2,6 +2,21 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 73 (2026-10-29): privs GRANTED but controller still off -- the real gate is bluetoothd's controller-init (HCI) failing <<<
+
+**Privileges now granted** (`SWEET Sandbox: bluetoothd privilege 12000 granted`, `1002 granted`) -- but NO change: `PowerState |2`, `managerState |0`, `fUserAuthorization |0`, still `0xCAFEBABE`, still no `SWEET BT: H4: connected`. So the priv denial was NOT the gate (wrong hypothesis).
+**RE found the real gate.** The async power-init function (0x1003a536c) logs `Beginning asynchronous power init`, then calls **0x1003a6128** and `tbz w0,#0 -> 0x1003a543c` (abort, sets state 3) -- so if that returns false, BT never turns on and we never reach the "Turning BT on" / "Bluetooth modification is/is not allowed" branch (none of which appear -> it aborted at this gate). **0x1003a6128 is the controller/HCI init:** it calls a vtable method that returns a status and branches:
+- status 0 -> success (0x1003a6324) -> gate true -> power-on continues.
+- status 2 -> `"Unknown platform/chipset/manufacturer combination, restarting"` (0x10072c0b0).
+- status 0xd5 -> `"timed out booting the chip, restarting"` (0x10072c0ee).
+- else -> `"Init failed, still in high power result=%d"` (0x10072c115).
+The gate returned non-zero (power-on aborted). **"Init failed" contains "fail" (my keep-filter would have shown it) and did NOT appear -> the status is 2 (unknown chipset) or 0xd5 (HCI timeout), BOTH of which keep() dropped.** That is the missing clue.
+**Change (commit below, `sweet_bt_inject.c` keep-filter only):** added controller-init vocabulary (chip/platform/manufacturer/restart/booting/timed/high power/Turning/modification/Unknown/result/Init) so boot 74 shows WHICH status. **No kernel change; same kernel 40955196688.** Rebuild = bt.yml.
+**Test (boot 74):** new `sweet-bt` + kernel 40955196688 + `sweetbtlog=1`, else identical. The decisive line will be one of:
+- `btd: Unknown platform/chipset/manufacturer combination` -> bluetoothd rejects the QCA6390 (manufacturer 29); fix = patch bluetoothd to accept it (umi inject_bluetooth.c "vendor-capability ranges", STAGE 2 PREP offsets). Note: this path implies it DID open the transport + do HCI, yet we saw no `H4: connected` -- so also check whether H4 connected.
+- `btd: timed out booting the chip` -> HCI sent but no response = transport not really carrying bytes; fix = the H4 kernel endpoint / connect (kernel side, sweet_bt.c / SweetBluetooth.cpp). No `H4: connected` fits this.
+Either way the message decides kernel-vs-bluetoothd for the next fix.
+
 ### >>> BOOT 72 (2026-10-29): DECODED log pins it -- the sandbox priv denial blocks bluetoothd's async power-on -> grant privileges (kernel) <<<
 
 **With args decoded, the blocker is clear:**
