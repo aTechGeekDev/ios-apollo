@@ -32,6 +32,8 @@
 #include <unistd.h>
 
 extern const char *getprogname(void);
+extern char ***_NSGetArgv(void);
+extern int *_NSGetArgc(void);
 
 #define BT_HCI_DEFAULT  "H4:POSIX:com.sweet.bluetooth,115200"
 
@@ -84,23 +86,32 @@ sweet_bt_init(void)
 	const char *name = getprogname();
 	const char *transport = BT_HCI_DEFAULT;
 
-	if (name == NULL) {
+	/*
+	 * Both bluetoothd and BlueTool must reach the chip through the kernel's H4 endpoint. bluetoothd
+	 * gates power-on on BlueTool's init (boot 66: BlueTool launched three times, Settings spun
+	 * forever), so BlueTool, with no transport of its own, could not run; give it the same one.
+	 */
+	if (strcmp(name, "bluetoothd") != 0 && strcmp(name, "BlueTool") != 0) {
 		return;
 	}
 	(void)sysctlbyname("kern.bootargs", arguments, &size, NULL, 0);
-
-	if (strcmp(name, "bluetoothd") == 0) {
-		if (boot_arg(arguments, "sweetbthci", value, sizeof(value)) != NULL) {
-			if (strcmp(value, "0") == 0) {
-				say("sweet-bt: bluetoothd: sweetbthci=0: leaving BT_HCI_TRANSPORT as it is\n");
-				return;
-			}
-			transport = value;
+	if (boot_arg(arguments, "sweetbthci", value, sizeof(value)) != NULL) {
+		if (strcmp(value, "0") == 0) {
+			say("sweet-bt: %s: sweetbthci=0: leaving BT_HCI_TRANSPORT as it is\n", name);
+			return;
 		}
-		setenv("BT_HCI_TRANSPORT", transport, 1);
-		say("sweet-bt: bluetoothd: BT_HCI_TRANSPORT=%s (the kernel's H4 endpoint; sweetbt=6)\n", transport);
-	} else if (strcmp(name, "BlueTool") == 0) {
-		/* stage 2b: answer its RunBuiltinScript boot request (the kernel already ran the firmware) */
-		say("sweet-bt: BlueTool started; observing (the chip is already up in the kernel)\n");
+		transport = value;
+	}
+	setenv("BT_HCI_TRANSPORT", transport, 1);
+	say("sweet-bt: %s: BT_HCI_TRANSPORT=%s (the kernel's H4 endpoint; sweetbt=6)\n", name, transport);
+
+	if (strcmp(name, "BlueTool") == 0) {
+		/* how bluetoothd invokes it (boot 66 showed only "exec BlueTool"): shows the script it runs */
+		char **argv = _NSGetArgv() != NULL ? *_NSGetArgv() : NULL;
+		int argc = _NSGetArgc() != NULL ? *_NSGetArgc() : 0;
+
+		for (int i = 0; argv != NULL && i < argc && argv[i] != NULL; i++) {
+			say("sweet-bt: BlueTool argv[%d]=%s\n", i, argv[i]);
+		}
 	}
 }
