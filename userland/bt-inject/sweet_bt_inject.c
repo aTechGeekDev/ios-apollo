@@ -32,11 +32,13 @@
  *
  * Output goes to stderr, the console log with bluetoothd in boot-arg sweetnull.
  */
+#include <dlfcn.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,6 +61,22 @@ extern int *_NSGetArgc(void);
 #define BTD_RESULT_OFFSET 0x272580u
 #define BTD_RESULT_ORIG   0x940fbb92u   /* bl _xpc_dictionary_get_int64 */
 #define BTD_RESULT_PATCH  0xd2800000u   /* mov x0, #0 */
+
+/*
+ * Observability (boot-arg sweetbtlog=1): bluetoothd logs its power-on steps through os_log, which
+ * sweetnull (stdout/stderr) never sees, so boots 68-70 were blind past the BlueTool gate. Redirect
+ * the _os_log_impl GOT slot (20H392 image offset 0x7f5438; the stub at 0x10065fe2c is
+ * `adrp x16,0x1007f5000; ldr x16,[x16,#0x438]; br x16`) to a thunk that mirrors each line to stderr
+ * and then calls the real one. os_log passes the format string in register x3; for the common
+ * "%{public}s" case (bluetoothd's printf-style debug helper formats into a string and logs that),
+ * the string pointer sits in the encoded arg buffer, so pull it out too. A keyword filter keeps the
+ * 4 MiB console ring from wrapping away the early power-on lines.
+ */
+#define BTD_OSLOG_GOT_OFFSET 0x7f5438u
+
+typedef void (*os_log_impl_fn)(void *dso, void *log, unsigned int type,
+    const char *format, uint8_t *buf, uint32_t size);
+static os_log_impl_fn real_os_log_impl;
 
 static void
 say(const char *format, ...)
@@ -153,6 +171,91 @@ patch_word(const char *who, uint32_t offset, uint32_t orig, uint32_t value)
 	say("sweet-bt: %s: patched %p (%#x -> %#x)\n", who, (void *)at, orig, value);
 }
 
+/* Power-on vocabulary, so the stderr mirror does not flood the console ring with every os_log. */
+static int
+interesting(const char *s)
+{
+	static const char *const words[] = {
+		"ransport", "HCI", "ontroller", "ower", "Blue", "evice", "irmware", "eset",
+		"endor", "nit", "pen", "onnect", "ail", "rror", "ctl", "H4", "UART", "ACIPC",
+		"adio", "addr", "MAC", "tack", NULL
+	};
+
+	for (int i = 0; words[i] != NULL; i++) {
+		if (strstr(s, words[i]) != NULL) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* Our stand-in for bluetoothd's _os_log_impl: mirror the line to stderr, then call the real one. */
+static void
+sweet_oslog(void *dso, void *log, unsigned int type, const char *format, uint8_t *buf, uint32_t size)
+{
+	const char *text = format;
+
+	if (format != NULL) {
+		/* bluetoothd's debug helper logs the already-formatted string as a %{public}s arg. */
+		if (strcmp(format, "%{public}s") == 0 && buf != NULL && size >= 12 && buf[1] >= 1 && buf[3] == 8) {
+			const char *s;
+
+			memcpy(&s, buf + 4, sizeof(s));
+			if (s != NULL && (uintptr_t)s > 0x1000 && ((uintptr_t)s >> 47) == 0) {
+				text = s;
+			}
+		}
+		if (text != NULL && interesting(text)) {
+			say("btd: %s\n", text);
+		}
+	}
+	if (real_os_log_impl != NULL) {
+		real_os_log_impl(dso, log, type, format, buf, size);
+	}
+}
+
+/* Redirect bluetoothd's _os_log_impl GOT slot to sweet_oslog (see the header comment). */
+static void
+hook_os_log(const struct mach_header *base)
+{
+	void **slot;
+	void *cur, *expected;
+	vm_address_t page;
+	vm_size_t span;
+	kern_return_t kr;
+	uintptr_t ps = (uintptr_t)getpagesize();
+
+	if (base == NULL) {
+		return;
+	}
+	slot = (void **)((uintptr_t)base + BTD_OSLOG_GOT_OFFSET);
+	cur = *slot;
+	if (cur == NULL) {
+		say("sweet-bt: bluetoothd: os_log GOT slot empty; not hooking\n");
+		return;
+	}
+	expected = dlsym(RTLD_DEFAULT, "_os_log_impl");
+	if (expected == NULL) {
+		expected = dlsym(RTLD_DEFAULT, "os_log_impl");
+	}
+	if (expected != NULL && cur != expected) {
+		say("sweet-bt: bluetoothd: os_log GOT %p != _os_log_impl %p; not hooking\n", cur, expected);
+		return;
+	}
+	real_os_log_impl = (os_log_impl_fn)cur;
+	page = (vm_address_t)((uintptr_t)slot & ~(ps - 1));
+	span = (vm_size_t)((((uintptr_t)slot + sizeof(*slot)) - page + ps - 1) & ~(ps - 1));
+	kr = vm_protect(mach_task_self(), page, span, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+	if (kr != KERN_SUCCESS) {
+		say("sweet-bt: bluetoothd: vm_protect os_log slot at %p failed (%d); not hooking\n", (void *)page, kr);
+		return;
+	}
+	*slot = (void *)&sweet_oslog;
+	(void)vm_protect(mach_task_self(), page, span, FALSE, VM_PROT_READ);
+	say("sweet-bt: bluetoothd: os_log hooked (real %p); power-on now mirrored to stderr (sweetbtlog=1)\n",
+	    (void *)real_os_log_impl);
+}
+
 /* Make bluetoothd treat BlueTool's RunBuiltinScript as success (see the header comment). */
 static void
 patch_bluetoothd(void)
@@ -191,6 +294,9 @@ sweet_bt_init(void)
 		if (set_transport) {
 			setenv("BT_HCI_TRANSPORT", transport, 1);
 			say("sweet-bt: bluetoothd: BT_HCI_TRANSPORT=%s (the kernel's H4 endpoint; sweetbt=6)\n", transport);
+		}
+		if (boot_arg(arguments, "sweetbtlog", value, sizeof(value)) != NULL && strcmp(value, "1") == 0) {
+			hook_os_log(main_executable());
 		}
 		if (boot_arg(arguments, "sweetbtpatch", value, sizeof(value)) != NULL && strcmp(value, "0") == 0) {
 			say("sweet-bt: bluetoothd: sweetbtpatch=0: not patching the BlueTool gate\n");
