@@ -8,7 +8,7 @@
  #include <sys/proc.h>
  #include <sys/systm.h>
  #include <sys/ubc_internal.h>
-@@ -308,8 +309,46 @@
+@@ -308,8 +309,48 @@
  	.mpo_vnode_check_signature = sweet_amfi_vnode_check_signature,
  };
  
@@ -16,8 +16,10 @@
 + * Privileges for non-root processes come from MAC policies (priv_check_cred
 + * -> mac_priv_grant); on iOS Sandbox/AMFI grant them. Without a grant UIKit
 + * apps die in CoreAnimation setup: work_interval_create(CA_CLIENT) needs
-+ * PRIV_WORK_INTERVAL ("Failed to create work interval", SpringBoard).
-+ * Grant that one; log the first denial of each other privilege per process.
++ * PRIV_WORK_INTERVAL ("Failed to create work interval", SpringBoard), and
++ * bluetoothd's async power-on needs priv 12000/1002 to open its HCI control
++ * socket (apollo boot 72). Grant every privilege on this permissive bring-up;
++ * log the first request of each privilege per process for the record.
 + */
 +#define SWEET_PRIV_LOG_MAX      64
 +static struct {
@@ -37,16 +39,16 @@
 +	for (int i = 0; i < sweet_priv_logged_count; i++) {
 +		if (sweet_priv_logged[i].priv == priv &&
 +		    strncmp(sweet_priv_logged[i].name, name, sizeof(name)) == 0) {
-+			return EPERM;
++			return 0;
 +		}
 +	}
 +	if (sweet_priv_logged_count < SWEET_PRIV_LOG_MAX) {
 +		sweet_priv_logged[sweet_priv_logged_count].priv = priv;
 +		strlcpy(sweet_priv_logged[sweet_priv_logged_count].name, name, sizeof(name));
 +		sweet_priv_logged_count++;
-+		printf("SWEET Sandbox: %s privilege %d denied\n", name, priv);
++		printf("SWEET Sandbox: %s privilege %d granted\n", name, priv);
 +	}
-+	return EPERM;
++	return 0;
 +}
 +
  static const struct mac_policy_ops sweet_sandbox_mac_ops = {

@@ -2,6 +2,16 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 72 (2026-10-29): DECODED log pins it -- the sandbox priv denial blocks bluetoothd's async power-on -> grant privileges (kernel) <<<
+
+**With args decoded, the blocker is clear:**
+- `btd: PowerManager power state is |2` (stuck at 2 forever); `Power state changed. ... |2 |0 |0 |0` = PowerState 2, **managerState 0**, fUserAuthorization 0, PendingTCC 0.
+- `btd: Returning bluetooth power state: |3405691582` = **0xCAFEBABE** -- the "controller state unknown / not up" sentinel; that is why Settings spins.
+- `btd: Searching for transport: "H4"` -> `Searching for driver: "POSIX"` -> **`Beginning asynchronous power init`**, and IMMEDIATELY `SWEET Sandbox: bluetoothd privilege 12000 denied` then `1002 denied`. After that the controller never initializes: no `SWEET BT: H4: connected`, no HCI. The toggle (`Session ... wants connectability |on`) is handled but power state stays 2.
+**Diagnosis:** the async power-on step that opens the H4 kernel-control socket (`socket(PF_SYSTEM, SYSPROTO_CONTROL)` needs a privilege) is blocked by our sandbox denying privileges 12000 and 1002. bluetoothd keeps serving XPC/sessions (main queue) while the async power init is stuck -- so earlier boots looked "alive" but the controller never came up. The denials land exactly at "Beginning asynchronous power init".
+**Fix (commit below, patch 0064 `sweet_sandbox_priv_grant`):** grant EVERY privilege on this permissive bring-up (was: grant only PRIV_WORK_INTERVAL, deny+log the rest). Still logs the first request of each privilege per process, now as "granted". Hunk counts re-verified (git apply strict; 8/48). **Kernel rebuild** (xnu.yml). The branch HEAD also carries the multi-group sweetinject (0114), so the rebuilt kernel has both.
+**Test (boot 73):** NEW kernel (xnu run from this push) + the SAME `sweet-bt` (run 40953708210, logging) + `sweetbtlog=1`. Replace `gh run download 40708919069 ... xnu-kernel` with the new xnu run id; cmdline unchanged. Toggle BT on. **Expect:** no `privilege ... denied` (now "granted"), then the async power init proceeds -> `SWEET BT: H4: connected` (kernel), HCI traffic, `Power state changed ... managerState` advancing off 0 / PowerState leaving 2, `Returning bluetooth power state` no longer 0xCAFEBABE, and the Settings toggle resolving. If it still stalls, the `btd:` lines show the next step (likely HCI reset/version, then the vendor-cap compat from STAGE 2 PREP).
+
 ### >>> BOOT 71 (2026-10-29): os_log mirror WORKS -- bluetoothd reaches the transport + full startup, but the controller never powers on <<<
 
 **The os_log hook works** (`sweet-bt: bluetoothd: os_log hooked`; `btd:` lines appear). bluetoothd gets MUCH further than visible before:
