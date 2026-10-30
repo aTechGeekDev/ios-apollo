@@ -111,6 +111,9 @@ adb reboot bootloader
 | `sweettouch=0`, `sweetkeys=0` | Turn off touch or buttons |
 | `sweetcpufreq=N` | Cap the CPU clock at N MHz (0 = leave as the bootloader set it) |
 | `sweetgpu=22 sweetgpukeep=1` | Bring up the GPU and keep it on for programs |
+| `sweetgpulevel=N` | The GPU's speed: 1 = 305 MHz (the default) .. 6 = 587 MHz (its top; for the UI's frame rate) |
+| `sweetddr=0` | (xnu 0148) Leave the memory bus where the boot chain put it; by default it is voted to its top (`SWEET RPMH: THE MEMORY BUS IS VOTED TO ITS TOP: a core copies N MB/s (it was M)`) |
+| `sweetfb_stats=N` | (xnu 0148) Every N seconds (10; 0 never) `SWEET FB:` says how many frames iOS gave and how many reached the panel a second, the copy's time, and late or skipped vsyncs |
 | `sweetnull=A,B,...` | Copy what these programs print into the kernel log |
 | `sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd` | Load the CoreAnimation bridge (GPU drawing) into the window server |
 | `sweetgl=0` | Keep CoreAnimation's software renderer |
@@ -129,7 +132,7 @@ The other boot-args are described in their drivers' sources in `xnu/patches/` an
 | Path | What |
 | --- | --- |
 | `shim/` | Boot shim, packed as an Android boot image |
-| `xnu/patches/` | The kernel patches (0001–0147), applied in order by CI |
+| `xnu/patches/` | The kernel patches (0001–0148), applied in order by CI |
 | `wifi/` | HackiOS's Linux layer for the Wi-Fi driver; CI builds Linux's ath11k on it and links it into the kernel |
 | `userland/` | Programs and libraries for the phone: GPU tests, Mesa, the CoreAnimation bridge |
 | `tools/` | Device tree builder, payload packer, iOS root builder, log and crash tools |

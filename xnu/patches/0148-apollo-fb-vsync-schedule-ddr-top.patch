@@ -1,0 +1,310 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -60,6 +60,7 @@
+ extern void apollo_audio_init(void);
+ extern void apollo_adsp_init(void);
+ extern void apollo_haptic_init(void);
++extern void sweet_rpmh_ddr_top(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -671,6 +672,8 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	/* the memory bus to its top (xnu 0148, sweet_rpmh.c; boot-arg sweetddr=0: left as the boot chain set it) */
++	sweet_rpmh_ddr_top();
+ 	/* QCA6390 Wi-Fi bring-up; does nothing without boot-arg sweetwifi=N (sweet_wifi.c). */
+ 	sweet_wifi_init();
+ 	/* QCA6390 Bluetooth bring-up; does nothing without boot-arg sweetbt=N (sweet_bt.c, xnu 0136). */
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -13,12 +13,20 @@
+  * (xnu 0146) Also one bus clock manager (BCM) vote, sweet_rpmh_bcm_vote(), through the same
+  * request path: the QUP wrappers' core clocks ("QUP0") for the vibration motor's I2C engine
+  * (sweet_haptic.c, after hakios-apollo's apollo_rpmh_bcm_vote() in hakios.apollo_cpufreq.c).
++ *
++ * (xnu 0148) The memory bus to its top, sweet_rpmh_ddr_top() (boot-arg sweetddr, default 1): the BCMs of
++ * the memory controller (MC0) and its shared cache (SH0) at their top and ACV with the application
++ * processor's bit, as hakios-apollo's apollo_ddr=1 (hakios.apollo_cpufreq.c memory_bandwidth()) and
++ * Linux's interconnect votes do. Left alone the bus stays where the boot chain put it: the GPU's own
++ * bus table (sweet_gpu.c) has only its lowest level, and every frame is copied by a core.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/errno.h>
+ #include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <pexpert/pexpert.h>
+ #include <machine/machine_routines.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -26,6 +34,7 @@
+ int sweet_rpmh_wifi_power(void);
+ int sweet_rpmh_bt_power(void);
+ int sweet_rpmh_bcm_vote(const char *name, uint32_t ab, uint32_t ib);
++void sweet_rpmh_ddr_top(void);
+ void sweet_rpmh_hold(bool hold);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+@@ -549,4 +558,52 @@
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/* (xnu 0148) How fast one core copies 16 MiB (far more than any cache), in MB a second; 0 if it cannot be said. */
++static uint64_t
++rh_copy_speed(void)
++{
++	const vm_size_t size = 16u << 20;
++	uint8_t *buf = kalloc_data(2 * size, Z_WAITOK);
++	uint64_t t0, ns = 0;
++
++	if (buf == NULL) {
++		return 0;
++	}
++	memset(buf, 1, 2 * size);       /* (the pages are touched before the copy is timed) */
++	t0 = mach_absolute_time();
++	memcpy(buf + size, buf, size);
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	kfree_data(buf, 2 * size);
++	return ns ? (uint64_t)size * 1000 / ns : 0;
++}
++
++/* (xnu 0148) The memory bus to its top (see the top of this file); nothing with boot-arg sweetddr=0. */
++void
++sweet_rpmh_ddr_top(void)
++{
++	uint32_t enabled = 1;
++	uint64_t before, after;
++	int error;
++
++	(void)PE_parse_boot_argn("sweetddr", &enabled, sizeof(enabled));
++	if (!enabled) {
++		return;
++	}
++	before = rh_copy_speed();
++	error = sweet_rpmh_bcm_vote("MC0", 0x3fff, 0x3fff);
++	if (!error) {
++		error = sweet_rpmh_bcm_vote("SH0", 0x3fff, 0x3fff);
++	}
++	if (!error) {
++		error = sweet_rpmh_bcm_vote("ACV", 0, 8);      /* (the application processor's bit) */
++	}
++	if (error) {
++		printf("SWEET RPMH: the memory bus vote failed (errno %d); a core copied %llu MB/s\n", error, before);
++		return;
++	}
++	delay(20000);
++	after = rh_copy_speed();
++	printf("SWEET RPMH: THE MEMORY BUS IS VOTED TO ITS TOP: a core copies %llu MB/s (it was %llu MB/s)\n", after, before);
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -29,6 +29,15 @@
+  * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
+  * enabled it, through the port they registered (IOConnectSetNotificationPort).
+  *
++ * (xnu 0148) The vsync timer runs on its own schedule (every tick due one
++ * period after the last was due), and the copy into the panel is a thread
++ * of its own that the tick wakes. Before, the copy ran inside the tick and
++ * the next tick was armed 16.7 ms after it ended: every millisecond of copy
++ * stretched the period of the vsyncs CoreAnimation draws by, and with them
++ * the user interface's frame rate. Every sweetfb_stats seconds (10; 0: never)
++ * a line says how many frames iOS gave and how many reached the panel, the
++ * copy's time, and whether ticks came late or were skipped.
++ *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+@@ -51,6 +60,7 @@
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
+ #include <sys/proc.h>
+ 
+ enum {
+@@ -100,6 +110,8 @@
+ 	uint64_t            fVsyncCount;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	static void presentThread(void *arg, wait_result_t result);     /* (0148) */
++	void presentLoop(void);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -118,6 +130,11 @@
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	/* (xnu 0148) the vsync schedule, the present thread, and what is said every fStatsAbs */
++	uint64_t      fPeriodAbs, fNextVsync, fStatsAbs, fStatSince;
++	bool          fPresentWanted;
++	uint64_t      fStatCopy, fStatCopyMost, fStatLateMost;
++	uint32_t      fStatSwaps, fStatShown, fStatBusy, fStatTicks, fStatSkipped;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -274,7 +291,20 @@
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	/* (xnu 0148) the copy on a thread of its own; the ticks on their own schedule */
++	uint32_t stats = 10;
++	PE_parse_boot_argn("sweetfb_stats", &stats, sizeof(stats));
++	nanoseconds_to_absolutetime((uint64_t)stats * NSEC_PER_SEC, &fStatsAbs);
++	nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * NSEC_PER_USEC, &fPeriodAbs);
++	thread_t presenter = THREAD_NULL;
++	if (kernel_thread_start(&AppleCLCD::presentThread, this, &presenter) != KERN_SUCCESS) {
++		IOLog("SWEET FB: no present thread\n");
++		return false;
++	}
++	thread_deallocate(presenter);
++	fStatSince = mach_absolute_time();
++	fNextVsync = fStatSince + fPeriodAbs;
++	fVsync->wakeAtTime(fNextVsync);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+@@ -299,6 +329,16 @@
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	/* (xnu 0148) the next tick one period after this one was due (ticks already missed are skipped), armed first */
++	uint64_t late = now > fb->fNextVsync ? now - fb->fNextVsync : 0;
++	uint64_t next = fb->fNextVsync + fb->fPeriodAbs;
++	uint32_t skipped = 0;
++	while (next <= now) {
++		next += fb->fPeriodAbs;
++		skipped++;
++	}
++	fb->fNextVsync = next;
++	sender->wakeAtTime(next);
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -326,29 +366,95 @@
+ 				}
+ 			}
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+ 	}
+-	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+-	uint8_t *rec = NULL;
+-	if (flush) {
+-		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+-		if (rec != NULL) {
+-			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+-			fb->fDirty = false;
+-		}
++	/* (xnu 0148) the copy is the present thread's: woken here */
++	if (fb->fDirty && (count % fb->fFlushTicks) == 0) {
++		fb->fPresentWanted = true;
++		IOLockWakeup(fb->fLock, &fb->fPresentWanted, true);
++	}
++	fb->fStatTicks++;
++	fb->fStatSkipped += skipped;
++	if (late > fb->fStatLateMost) {
++		fb->fStatLateMost = late;
++	}
++	if (fb->fStatsAbs != 0 && now - fb->fStatSince >= fb->fStatsAbs) {
++		uint64_t span = 0, copy = 0, most = 0, lateMost = 0;
++		uint32_t shown = fb->fStatShown;
++
++		absolutetime_to_nanoseconds(now - fb->fStatSince, &span);
++		absolutetime_to_nanoseconds(shown ? fb->fStatCopy / shown : 0, &copy);
++		absolutetime_to_nanoseconds(fb->fStatCopyMost, &most);
++		absolutetime_to_nanoseconds(fb->fStatLateMost, &lateMost);
++		span = span / NSEC_PER_MSEC ? span / NSEC_PER_MSEC : 1;
++		IOLog("SWEET FB: %llu.%llu s: iOS gave %u frames (%llu.%llu a second), %u reached the panel (%llu.%llu a second), %u "
++		    "waited for the GPU; the copy %llu.%llu ms on average, %llu.%llu at most; %u vsyncs, %u skipped, the latest %llu.%llu "
++		    "ms late\n", span / 1000, span % 1000 / 100, fb->fStatSwaps, (uint64_t)fb->fStatSwaps * 1000 / span,
++		    (uint64_t)fb->fStatSwaps * 10000 / span % 10, shown, (uint64_t)shown * 1000 / span,
++		    (uint64_t)shown * 10000 / span % 10, fb->fStatBusy, copy / NSEC_PER_MSEC, copy % NSEC_PER_MSEC / 100000,
++		    most / NSEC_PER_MSEC, most % NSEC_PER_MSEC / 100000, fb->fStatTicks, fb->fStatSkipped,
++		    lateMost / NSEC_PER_MSEC, lateMost % NSEC_PER_MSEC / 100000);
++		fb->fStatSince = now;
++		fb->fStatSwaps = fb->fStatShown = fb->fStatBusy = fb->fStatTicks = fb->fStatSkipped = 0;
++		fb->fStatCopy = fb->fStatCopyMost = fb->fStatLateMost = 0;
+ 	}
+ 	IOLockUnlock(fb->fLock);
+-	if (rec != NULL) {
+-		if (!fb->present(rec)) {
+-			/* the GPU is still drawing a surface of this frame: show it at the next tick (unless a newer one comes) */
+-			IOLockLock(fb->fLock);
+-			fb->fDirty = true;
+-			IOLockUnlock(fb->fLock);
++}
++
++/*
++ * (xnu 0148) The copy into the panel, woken by a vsync tick with a frame to show: the latest swap, taken under
++ * the lock; if the GPU is still drawing a surface of it, tried again 2 ms later (unless a newer frame came).
++ */
++void
++AppleCLCD::presentThread(void *arg, __unused wait_result_t result)
++{
++	((AppleCLCD *)arg)->presentLoop();
++}
++
++void
++AppleCLCD::presentLoop(void)
++{
++	uint8_t *rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++
++	if (rec == NULL) {
++		IOLog("SWEET FB: no memory for the present thread\n");
++		return;
++	}
++	IOLockLock(fLock);
++	for (;;) {
++		while (!fPresentWanted) {
++			IOLockSleep(fLock, &fPresentWanted, THREAD_UNINT);
++		}
++		fPresentWanted = false;
++		if (!fDirty || fPowerOff) {
++			continue;
++		}
++		memcpy(rec, fPending, SWEET_FB_SWAP_REC_SIZE);
++		fDirty = false;
++		IOLockUnlock(fLock);
++		uint64_t began = mach_absolute_time();
++		bool shown = present(rec);
++		uint64_t spent = mach_absolute_time() - began;
++		if (!shown) {
++			IOSleep(2);
++		}
++		IOLockLock(fLock);
++		if (shown) {
++			fStatShown++;
++			fStatCopy += spent;
++			if (spent > fStatCopyMost) {
++				fStatCopyMost = spent;
++			}
++		} else {
++			/* the GPU is still drawing a surface of this frame: again, unless a newer one has come meanwhile */
++			fStatBusy++;
++			if (!fDirty) {
++				memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++				fDirty = true;
++			}
++			fPresentWanted = true;
+ 		}
+-		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
+ void
+@@ -394,6 +500,7 @@
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
++	fStatSwaps++;                   /* (xnu 0148) */
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
