@@ -12,7 +12,9 @@
  *   that name; sweet_bt.c logs "SWEET BT: H4: connected"). It also sets BT_BAUDRATE=115200: without it bluetoothd
  *   reads the registry entry's "transport-speed" with CFDataGetBytes, and kernels before xnu 0142 publish that as
  *   a number, so bluetoothd died there (-[__NSCFNumber getBytes:range:], apollo boot 74). Boot-arg
- *   sweetbthci=STRING overrides the transport, sweetbthci=0 leaves bluetoothd's environment alone.
+ *   sweetbthci=STRING overrides the transport, sweetbthci=0 leaves bluetoothd's environment alone. And it gives the
+ *   H4 transport the stack-stopped handler Apple never wrote for it (fix_h4_transport): turning Bluetooth off
+ *   crashed bluetoothd without one (apollo boot 76).
  *
  * BlueTool -- a stand-in. To power the controller on, bluetoothd asks BlueTool (XPC, MachService
  *   com.apple.BlueTool) to RunBuiltinScript "boot"/"init" and waits for the reply's "result" to be 0. Apple's
@@ -106,6 +108,16 @@ struct sweet_ctl_info {
 #define BTD_RESULT_OFFSET 0x272580u
 #define BTD_RESULT_ORIG   0x940fbb92u   /* bl _xpc_dictionary_get_int64 */
 #define BTD_RESULT_PATCH  0xd2800000u   /* mov x0, #0 */
+
+/*
+ * bluetoothd's transports are tables of functions; the one BT_HCI_TRANSPORT names is kept at 0x100844850. H4's (20H392:
+ * __DATA,__data at image offset 0x844228: id 1, name "H4", functions from +0x10) has nothing in slot +0x60, and
+ * 0x1000e6aac calls that slot without a null check when the stack stops -- only Apple's own transports, whose handler
+ * just notes that the stack stopped (APPLEBT: strb #1), were ever used on an iPhone. Turning Bluetooth off crashed
+ * bluetoothd at pc 0 (apollo boot 76). Fill the slot with a handler that does nothing, if the table is the expected one.
+ */
+#define BTD_H4_TRANSPORT_OFFSET 0x844228u
+#define BTD_H4_STOPPED_SLOT     0x60u
 
 /*
  * Observability (boot-arg sweetbtlog=1): bluetoothd logs its power-on steps through os_log, which
@@ -359,6 +371,30 @@ hook_os_log(const struct mach_header *base)
 	    (void *)real_os_log_impl);
 }
 
+static void
+h4_stack_stopped(void)
+{
+}
+
+static void
+fix_h4_transport(const struct mach_header *header)
+{
+	uintptr_t table = (uintptr_t)header + BTD_H4_TRANSPORT_OFFSET;
+	const char *name;
+	void **slot = (void **)(table + BTD_H4_STOPPED_SLOT);
+
+	if (header == NULL) {
+		return;
+	}
+	name = *(const char *const *)(table + 8);
+	if (*(const uint32_t *)table != 1 || name == NULL || strcmp(name, "H4") != 0 || *slot != NULL) {
+		say("sweet-bt: bluetoothd: no empty H4 transport table at %p (different build?); not filled\n", (void *)table);
+		return;
+	}
+	*slot = (void *)h4_stack_stopped;
+	say("sweet-bt: bluetoothd: H4 transport's stack-stopped handler filled; turning Bluetooth off no longer crashes\n");
+}
+
 /* Make bluetoothd treat BlueTool's RunBuiltinScript as success (see the header comment). */
 static void
 patch_bluetoothd(void)
@@ -549,6 +585,7 @@ sweet_bt_init(void)
 			say("sweet-bt: bluetoothd: BT_HCI_TRANSPORT=%s BT_BAUDRATE=%s (the kernel's H4 endpoint; sweetbt=6)\n",
 			    transport, getenv("BT_BAUDRATE"));
 		}
+		fix_h4_transport(main_executable());
 		if (boot_arg(arguments, "sweetbtlog", value, sizeof(value)) != NULL && strcmp(value, "1") == 0) {
 			hook_os_log(main_executable());
 		}
