@@ -7,7 +7,8 @@
 #
 # - /vendor/firmware/aw8697_haptic.bin: Android's waveforms for the AW8697 motor driver (needed for
 #   apollo_haptic=3 and up) -> research/apollo-haptic/
-# - /vendor/etc/acdbdata/Tutu/Tutu_{Handset,Global}_cal.acdb: Xiaomi's audio calibration; out of it
+# - /vendor/etc/acdbdata/<board>/<board>_{Handset,Global}_cal.acdb: Xiaomi's audio calibration (the board
+#   folder is Tutu on hakios-apollo's phone, Forte on ours: whichever there is); out of it
 #   tools/acdb-mic.py (hakios-apollo's) writes the microphone's device-path topology and calibration
 #   (mic_topology_v2/v1/legacy.bin, mic_audproc.bin) -> research/apollo-mic/. Without them the
 #   microphone keeps to its plain path (apollo_mic_path=0): it works, without Xiaomi's processing.
@@ -43,14 +44,17 @@ else
 fi
 
 acdb_ok=1
-for f in Tutu_Handset_cal.acdb Tutu_Global_cal.acdb; do
-	if ! adb pull "/vendor/etc/acdbdata/Tutu/$f" "$mic/acdb/$f" >/dev/null 2>&1 || [ ! -s "$mic/acdb/$f" ]; then
-		echo "pull-mic-haptic-fw.sh: no /vendor/etc/acdbdata/Tutu/$f (what there is: adb shell ls -R /vendor/etc/acdbdata)" >&2
+rm -f "$mic"/acdb/*.acdb
+for kind in Handset Global; do
+	src=$(adb shell "ls /vendor/etc/acdbdata/*/*_${kind}_cal.acdb 2>/dev/null | head -1" | tr -d '\r')
+	if [ -z "$src" ] || ! adb pull "$src" "$mic/acdb/$kind.acdb" >/dev/null 2>&1 || [ ! -s "$mic/acdb/$kind.acdb" ]; then
+		echo "pull-mic-haptic-fw.sh: no /vendor/etc/acdbdata/*/*_${kind}_cal.acdb (what there is: adb shell ls -R /vendor/etc/acdbdata)" >&2
 		acdb_ok=0
+	else
+		echo "${kind} calibration: $src"
 	fi
 done
-if [ "$acdb_ok" = 1 ] && python3 -I "$here/tools/acdb-mic.py" "$mic/acdb/Tutu_Handset_cal.acdb" \
-	"$mic/acdb/Tutu_Global_cal.acdb" "$mic"; then
+if [ "$acdb_ok" = 1 ] && python3 -I "$here/tools/acdb-mic.py" "$mic/acdb/Handset.acdb" "$mic/acdb/Global.acdb" "$mic"; then
 	:
 else
 	rm -f "$mic"/mic_*.bin
