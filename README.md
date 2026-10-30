@@ -121,6 +121,7 @@ adb reboot bootloader
 | `sweetfb_fit=0` | (xnu 0150) Show the centre 1080x2400 of iOS's 1125x2436 picture 1:1 (cropped, as before) instead of the whole picture scaled by 24/25 with 31 black lines above and below; touch follows either way |
 | `sweetfb_height=N` | (xnu 0152) Present 1125xN instead of 1125x2436 (2400-2600). `2502` = 375x834 points, scaled by 24/25 onto the whole panel (no bars, one scale both ways); build the ADT with `mkadt.py --display-height N` and reset MobileGestalt's cache once (`tools/root-files/mgcache-reset.txt`) |
 | `apollo_backlight=P` | (xnu 0151) The panel's light (PM8150L WLED, hakios's driver; on by default): `0` leaves it alone (display off blanks at once), `P` 1-100 sets P%, absent keeps the firmware's level. Display off/on fades it out/in over `apollo_backlight_fade_ms` (default 300) |
+| `sweetbacklight=0` | (xnu 0154) No AppleARMBacklight service: iOS's brightness slider does not reach the WLED |
 | `sweetfb_stats=N` | (xnu 0148) Every N seconds (10; 0 never) `SWEET FB:` says how many frames iOS gave and how many reached the panel a second, the copy's time, and late or skipped vsyncs |
 | `sweetnull=A,B,...` | Copy what these programs print into the kernel log |
 | `sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd` | Load the CoreAnimation bridge (GPU drawing) into the window server |
@@ -140,7 +141,7 @@ The other boot-args are described in their drivers' sources in `xnu/patches/` an
 | Path | What |
 | --- | --- |
 | `shim/` | Boot shim, packed as an Android boot image |
-| `xnu/patches/` | The kernel patches (0001–0153), applied in order by CI |
+| `xnu/patches/` | The kernel patches (0001–0154), applied in order by CI |
 | `wifi/` | HackiOS's Linux layer for the Wi-Fi driver; CI builds Linux's ath11k on it and links it into the kernel |
 | `userland/` | Programs and libraries for the phone: GPU tests, Mesa, the CoreAnimation bridge |
 | `tools/` | Device tree builder, payload packer, iOS root builder, log and crash tools |

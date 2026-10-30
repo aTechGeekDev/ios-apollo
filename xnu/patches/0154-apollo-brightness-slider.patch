@@ -1,0 +1,223 @@
+--- a/bsd/dev/sweet_backlight.c
++++ b/bsd/dev/sweet_backlight.c
+@@ -4,6 +4,8 @@
+  * light out and in (apollo_backlight_fade(), from SweetFramebuffer.cpp; apollo_backlight_fade_ms, default 300) instead of switching
+  * it; the touch and cpufreq calls and the sysctls are not here (this tree has its own touch; nothing sets the brightness yet); the
+  * arbiter's lock is this file's own (the other SPMI users of this tree read through other channels).
++ * (xnu 0154) iOS's brightness slider: apollo_backlight_brightness() from SweetFramebuffer.cpp's AppleARMBacklight
++ * (CoreBrightness's 0..255 and fade period), on the same fade thread as the display's power.
+  */
+ #pragma clang diagnostic ignored "-Weverything"
+ /*
+@@ -211,6 +213,7 @@
+ static uint32_t level;                  /* the brightness register's value now */
+ static bool lit = true;                 /* the module is enabled */
+ static uint32_t on_level;               /* apollo: the register's value while the display is on (what a fade in goes to) */
++static bool display_on = true;          /* (0154) the display's power as the framebuffer last said */
+ 
+ static void
+ log_registers(void)
+@@ -404,18 +407,15 @@
+  * (SweetFramebuffer.cpp: RequestPowerChange). wait: return once the light is there (or another fade has been asked for
+  * meanwhile). false: there is no light of ours to fade (the caller blanks the panel as before).
+  */
+-bool
+-apollo_backlight_fade(bool on, bool wait)
++/* (0154) a fade from where the light is to `to` over `ms` (0: one step), in the lock; its number */
++static uint32_t
++fade_start(uint32_t to, uint32_t ms)
+ {
+ 	uint32_t number;
+ 
+-	if (!ready) {
+-		return false;
+-	}
+-	lck_mtx_lock(&apollo_backlight_state_lock);
+ 	fade_from = lit ? level : 0;
+-	fade_to = on ? on_level : 0;
+-	fade_steps = fade_ms / FADE_STEP_MS ? fade_ms / FADE_STEP_MS : 1;
++	fade_to = to;
++	fade_steps = ms / FADE_STEP_MS ? ms / FADE_STEP_MS : 1;
+ 	fade_done = 0;
+ 	number = ++fade_number;
+ 	if (fade_from == fade_to) {
+@@ -425,6 +425,20 @@
+ 		fading = true;
+ 		wakeup(&fading);
+ 	}
++	return number;
++}
++
++bool
++apollo_backlight_fade(bool on, bool wait)
++{
++	uint32_t number;
++
++	if (!ready) {
++		return false;
++	}
++	lck_mtx_lock(&apollo_backlight_state_lock);
++	display_on = on;
++	number = fade_start(on ? on_level : 0, fade_ms);
+ 	while (wait && fade_ended != number && fade_number == number) {
+ 		lck_mtx_sleep(&apollo_backlight_state_lock, LCK_SLEEP_DEFAULT, (event_t)&fade_ended, THREAD_UNINT);
+ 	}
+@@ -449,6 +463,46 @@
+ 	lck_mtx_unlock(&apollo_backlight_state_lock);
+ }
+ 
++/*
++ * (xnu 0154) iOS's brightness: CoreBrightness sets AppleARMBacklight's "brightness" (0..255, perceived; the
++ * register as level_for() has it) with a "FadePeriod" (ms here). 0 is dark (iOS's own fade before the display
++ * goes off): the light goes out but the level a power-on gives back stays the last one that was not 0. While
++ * the display is off only that level is kept.
++ */
++void
++apollo_backlight_brightness(uint32_t value, uint32_t ms)
++{
++	if (!ready) {
++		return;
++	}
++	if (value > 255) {
++		value = 255;
++	}
++	lck_mtx_lock(&apollo_backlight_state_lock);
++	if (value != 0) {
++		on_level = level_for(value * 0x10000 / 255);
++	}
++	if (display_on) {
++		fade_start(value != 0 ? on_level : 0, ms > 5000 ? 5000 : ms);
++	}
++	lck_mtx_unlock(&apollo_backlight_state_lock);
++}
++
++/* (0154) the brightness a power-on gives back, as iOS's 0..255 (the inverse of level_for()); 128 before the WLED is known */
++uint32_t
++apollo_backlight_value(void)
++{
++	uint32_t value;
++
++	if (!ready) {
++		return 128;
++	}
++	lck_mtx_lock(&apollo_backlight_state_lock);
++	value = isqrt((uint64_t)on_level * 255 * 255 / maximum);
++	lck_mtx_unlock(&apollo_backlight_state_lock);
++	return value > 255 ? 255 : value;
++}
++
+ /* the display is switched off or on again (apollo: faded, without waiting) */
+ void
+ apollo_backlight_power(bool on)
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -58,6 +58,14 @@
+  * 375 points, so iOS keeps the iPhone X's layouts across (status bar, Control
+  * Center); only the height is the panel's.
+  *
++ * (xnu 0154) The brightness slider: an AppleARMBacklight service under AppleCLCD,
++ * as ios-sailfish 0168 / ios-spes 0145 (same iOS 16.7 and iPhone X identity;
++ * their slider works with it): CoreBrightness (backboardd) takes the service
++ * with backlight-control = true of that class, reads IODisplayParameters
++ * brightness {min 0, max 255, value} and sets {brightness, FadePeriod (s, 16.16),
++ * backlight-level}; those go to sweet_backlight.c's WLED (perceived scale, its
++ * own fade). Boot-arg sweetbacklight=0 leaves the service out (slider inert).
++ *
+  * (xnu 0151) Display off fades the panel's light out (the PM8150L's WLED,
+  * bsd/dev/sweet_backlight.c: apollo_backlight_fade_ms, default 300) and only
+  * then blanks the panel; display on draws the latest frame first and fades the
+@@ -76,6 +84,8 @@
+ extern "C" bool sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size);     /* SweetGPU.cpp */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" bool apollo_backlight_fade(bool on, bool wait);      /* bsd/dev/sweet_backlight.c (xnu 0151) */
++extern "C" void apollo_backlight_brightness(uint32_t value, uint32_t ms);       /* (xnu 0154) */
++extern "C" uint32_t apollo_backlight_value(void);                               /* (xnu 0154) */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -183,6 +193,67 @@
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
++/* (xnu 0154) the backlight CoreBrightness drives: see the top of this file */
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++
++	uint32_t fLogged;
++
++public:
++	void publish(uint32_t value);
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++void
++AppleARMBacklight::publish(uint32_t value)
++{
++	OSDictionary *brightness = OSDictionary::withCapacity(3);
++	OSDictionary *parameters = OSDictionary::withCapacity(1);
++	OSNumber *min = OSNumber::withNumber(0ULL, 32), *max = OSNumber::withNumber(255ULL, 32);
++	OSNumber *now = OSNumber::withNumber(value, 32);
++
++	if (brightness != NULL && parameters != NULL && min != NULL && max != NULL && now != NULL) {
++		brightness->setObject("min", min);
++		brightness->setObject("max", max);
++		brightness->setObject("value", now);
++		parameters->setObject("brightness", brightness);
++		setProperty("IODisplayParameters", parameters);
++	}
++	OSSafeReleaseNULL(min);
++	OSSafeReleaseNULL(max);
++	OSSafeReleaseNULL(now);
++	OSSafeReleaseNULL(brightness);
++	OSSafeReleaseNULL(parameters);
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (d == NULL) {
++		return kIOReturnBadArgument;
++	}
++	OSNumber *b = OSDynamicCast(OSNumber, d->getObject("brightness"));
++	OSNumber *f = OSDynamicCast(OSNumber, d->getObject("FadePeriod"));
++	if (b == NULL) {
++		return kIOReturnSuccess;
++	}
++	int32_t v = (int32_t)b->unsigned32BitValue();
++	uint32_t value = v < 0 ? 0 : v > 255 ? 255 : (uint32_t)v;
++	uint32_t ms = f != NULL ? (uint32_t)(((uint64_t)f->unsigned32BitValue() * 1000) >> 16) : 0;
++	if (fLogged < 30) {
++		char name[32];
++		fLogged++;
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET BL: %s sets brightness %u (fade %u ms)\n", name, value, ms);
++	}
++	apollo_backlight_brightness(value, ms);
++	publish(value);
++	return kIOReturnSuccess;
++}
++
+ class IOMobileFramebufferUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+ 
+@@ -375,6 +446,17 @@
+ 	 */
+ 	setProperty("SweetWaitsForGPU", true);
+ 	registerService();
++	/* (xnu 0154) the backlight service for CoreBrightness; sweetbacklight=0: none */
++	int backlight = 1;
++	(void)PE_parse_boot_argn("sweetbacklight", &backlight, sizeof(backlight));
++	AppleARMBacklight *bl = backlight ? OSTypeAlloc(AppleARMBacklight) : NULL;
++	if (bl != NULL && bl->init() && bl->attach(this)) {
++		bl->setProperty("backlight-control", true);
++		bl->publish(apollo_backlight_value());
++		bl->registerService();
++		IOLog("SWEET BL: AppleARMBacklight published (brightness %u of 255)\n", apollo_backlight_value());
++	}
++	OSSafeReleaseNULL(bl);
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
+ 	sweet_fb_probe(fPhys);
