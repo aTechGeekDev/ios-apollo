@@ -2,6 +2,10 @@
 
 ## Agent handoff / active work
 
+### >>> README rewritten (2026-10-30, commit 6ceff1d; user: "rework the readme.md from scratch, make it simple organized and detailed with progress bars") <<<
+
+Per-area progress bars (my estimates: see the table; overall 63%), "being worked on now" (0152-0154 built, not booted), getting started, boot options grouped by subsystem, firmware table. Keep its Progress table and "Being worked on now" current with each boot.
+
 ### >>> xnu 0154 (2026-10-30; user: "also work on the brightness"): the brightness slider drives the WLED <<<
 
 **Before:** 0151's driver kept the firmware's level (409 of 4095, boot 83); nothing from iOS reached it (CoreBrightness talks only to a backlight service it recognises; hakios-apollo instead hooks backboardd's BrightnessSystem and writes a sysctl).
