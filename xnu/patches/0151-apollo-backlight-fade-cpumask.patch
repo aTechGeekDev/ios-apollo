@@ -1,0 +1,683 @@
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -955,8 +955,11 @@
+ 	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
+ 
+ #if defined(SWEET)
+-	/* Opt in to SMP: cpus=N (N <= SWEET_SMP_MAX_CPUS; cores 6-7 are the A76s). */
+-	if (!cpus_boot_arg_present || cpu_boot_arg == 0) {
++	/*
++	 * Opt in to SMP: cpus=N (N <= SWEET_SMP_MAX_CPUS; cores 6-7 are the A76s), or (xnu 0151) cpumask=M alone,
++	 * which picks the cores itself (M's bit n: the device tree's cpu n); before, cpumask without cpus left one core.
++	 */
++	if ((!cpus_boot_arg_present && !cpumask_boot_arg_present) || cpu_boot_arg == 0) {
+ 		cpu_boot_arg = 1;
+ 	}
+ 	if (cpu_boot_arg > SWEET_SMP_MAX_CPUS) {
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -132,6 +132,7 @@
+ bsd/dev/sweet_guard.c			standard
+ bsd/dev/sweet_mic.c			standard
+ bsd/dev/sweet_haptic.c			standard
++bsd/dev/sweet_backlight.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -61,6 +61,7 @@
+ extern void apollo_adsp_init(void);
+ extern void apollo_haptic_init(void);
+ extern void sweet_rpmh_ddr_top(void);
++extern void apollo_backlight_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -685,6 +686,8 @@
+ 	/* the vibration motor (xnu 0146, sweet_haptic.c): nothing without boot-arg apollo_haptic=N; the microphone (sweet_mic.c)
+ 	 * starts with the DSP's audio services, with apollo_mic=N */
+ 	apollo_haptic_init();
++	/* the backlight (xnu 0151, sweet_backlight.c): faded out and in with the display (boot-arg apollo_backlight=0: left alone) */
++	apollo_backlight_init();
+ 	return 0;
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/sweet_backlight.c
+@@ -0,0 +1,531 @@
++/* apollo (xnu 0151): the panel's light, the PM8150L's WLED -- the Mi 10T port github.com/enesuzun2002/hakios-apollo (HackiOS for
++ * apollo; devices/mi-10t/xnu/files/bsd/dev/hakios.apollo_backlight.c; APSL 2.0). Changed here, each marked "apollo:": on by default
++ * (boot-arg apollo_backlight=0: left alone; =P: P percent; absent: the level the firmware left); the display's power fades the
++ * light out and in (apollo_backlight_fade(), from SweetFramebuffer.cpp; apollo_backlight_fade_ms, default 300) instead of switching
++ * it; the touch and cpufreq calls and the sysctls are not here (this tree has its own touch; nothing sets the brightness yet); the
++ * arbiter's lock is this file's own (the other SPMI users of this tree read through other channels).
++ */
++#pragma clang diagnostic ignored "-Weverything"
++/*
++ * The Mi 10T's panel is an LCD whose light is the PM8150L's WLED (the device tree's panel mdss_dsi_j3s_37_02_0a_dsc_video:
++ * qcom,mdss-dsi-bl-pmic-control-type "bl_ctrl_wled", levels 2 to 0xfff; the node qcom,wled@d800 of the pmic at SPMI
++ * slave 5, "qcom,pm8150l-spmi-wled": the control block at 0xd800 and the sink block at 0xd900, strings 0 to 2). It is a
++ * WLED of the fifth kind, whose registers are those of Linux's drivers/video/backlight/qcom-wled.c (WLED5): the
++ * brightness of module A (or B, whichever the first string takes its current from) is a 12-bit (or 15-bit) value at
++ * sink +0x53/+0x54 (+0x63/+0x64), taken over when the sync register (+0x65) is toggled; the module's enable is bit 7
++ * of the control block's register 0x46. The firmware has set all of that up, because it had the panel lit: only the
++ * brightness and the enable are written here, and the registers are read and logged first, so that a run says what
++ * it found.
++ *
++ * The SPMI arbiter (version 5, 0xc440000): writes go through the channel region (the device tree's "chnls", 0xc600000: in
++ * version 5 a page of 0x10000 for each channel, pmic_arb_offset_v5; hakios-apollo's first tries wrote elsewhere and hung
++ * the phone), reads through the observer (0xe600000): Linux's drivers/spmi/spmi-pmic-arb.c.
++ */
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <sys/systm.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++/* into the loader's log as well (as the other apollo drivers) */
++extern void loader_log_putc(char c);
++
++static int say(const char *format, ...) __printflike(1, 2);
++
++static int
++say(const char *format, ...)
++{
++	char line[300];
++	va_list list;
++
++	va_start(list, format);
++	vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	for (const char *c = line; *c != 0; c++) {
++		loader_log_putc(*c);
++	}
++	return printf("%s", line);
++}
++
++static inline uint32_t
++rd(vm_offset_t address)
++{
++	return *(volatile uint32_t *)address;
++}
++
++static inline void
++wr(vm_offset_t address, uint32_t value)
++{
++	*(volatile uint32_t *)address = value;
++}
++
++/* ---- the SPMI arbiter ------------------------------------------------------------------------------- */
++
++#define ARB_CORE_PHYS           0x0c440000UL
++#define ARB_CORE_SIZE           0x1100UL
++#define ARB_CNFG_PHYS           0x0c40a000UL
++#define ARB_CNFG_SIZE           0x1000UL
++#define ARB_CHANNELS_PHYS       0x0c600000UL    /* the device tree's "chnls": 0x10000 per channel (v5: not per system) */
++#define ARB_OBSERVER_PHYS       0x0e600000UL    /* reads only: 0x10000 per system, 0x80 per channel */
++#define ARB_REGION_SIZE         0x10000UL
++#define ARB_SYSTEM              0
++#define ARB_FEATURES            0x004           /* [10:0] channels */
++#define ARB_CHANNEL(n)          (0x900 + 4 * (n))       /* [19:8] slave << 8 | peripheral */
++#define ARB_OWNER(n)            (0x700 + 4 * (n))       /* [2:0] the system that owns channel n */
++#define ARB_MAX_CHANNELS        512
++
++#define CHANNEL_COMMAND         0x00
++#define CHANNEL_STATUS          0x08
++#define CHANNEL_RDATA0          0x18
++#define CHANNEL_WDATA0          0x10
++#define STATUS_DONE             0x1
++#define STATUS_FAILURE          0x2
++#define STATUS_DENIED           0x4
++#define STATUS_DROPPED          0x8
++#define OP_EXT_WRITEL           0u              /* a register of 8 bits of address, 1 to 8 bytes */
++#define OP_EXT_READL            1u
++#define TRANSFER_TIMEOUT_US     2000
++
++static vm_offset_t arb_core, arb_cnfg, arb_observer;
++static LCK_GRP_DECLARE(apollo_backlight_grp, "apollo-backlight");
++/*
++ * The brightness's state (level, lit, on_level, the fade) and the writes that change it: the display's power (the
++ * framebuffer's user client), the fade's thread and the bring-up come from different threads, each through write_level()
++ * under this. (apollo_spmi_bus_lock, the arbiter's, is only around one transfer.)
++ */
++static LCK_MTX_DECLARE(apollo_backlight_state_lock, &apollo_backlight_grp);
++static LCK_SPIN_DECLARE(apollo_spmi_bus_lock, &apollo_backlight_grp);  /* apollo: this file's own */
++
++struct peripheral {
++	const char *name;
++	uint16_t id;                    /* slave << 8 | peripheral */
++	uint16_t channel;
++	bool found;
++	vm_offset_t writes;             /* its page of the channel region */
++};
++static struct peripheral ctrl = { .name = "the WLED's control block", .id = 0x5d8 };    /* slave 5, registers 0xd800 */
++static struct peripheral sink = { .name = "the WLED's sink block", .id = 0x5d9 };       /* slave 5, registers 0xd900 */
++
++static const char *
++spmi_status_text(uint32_t status)
++{
++	return !(status & STATUS_DONE) ? "no answer from the arbiter" : (status & STATUS_DENIED) ? "the arbiter refuses" :
++	       (status & STATUS_FAILURE) ? "the transfer failed" : "the transfer was dropped";
++}
++
++/* `count` (1 to 4) registers from `reg` on; NULL, or what went wrong */
++static const char *
++spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t count)
++{
++	vm_offset_t channel = arb_observer + 0x10000UL * ARB_SYSTEM + 0x80UL * p->channel;
++	uint64_t start = mach_absolute_time(), interval;
++	uint32_t status, data;
++
++	nanoseconds_to_absolutetime(TRANSFER_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
++	lck_spin_lock(&apollo_spmi_bus_lock);
++	wr(channel + CHANNEL_COMMAND, OP_EXT_READL << 27 | (uint32_t)reg << 4 | (count - 1));
++	do {
++		status = rd(channel + CHANNEL_STATUS);
++	} while (!(status & STATUS_DONE) && mach_absolute_time() - start < interval);
++	data = rd(channel + CHANNEL_RDATA0);
++	lck_spin_unlock(&apollo_spmi_bus_lock);
++	if (!(status & STATUS_DONE) || (status & (STATUS_DENIED | STATUS_FAILURE | STATUS_DROPPED))) {
++		return spmi_status_text(status);
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		bytes[i] = (uint8_t)(data >> (8 * i));
++	}
++	return NULL;
++}
++
++/* `count` (1 to 4) bytes into the registers from `reg` on; NULL, or what went wrong */
++static const char *
++spmi_write(const struct peripheral *p, uint8_t reg, const uint8_t *bytes, uint32_t count)
++{
++	vm_offset_t channel = p->writes;
++	uint64_t start = mach_absolute_time(), interval;
++	uint32_t status, data = 0;
++
++	for (uint32_t i = 0; i < count; i++) {
++		data |= (uint32_t)bytes[i] << (8 * i);
++	}
++	nanoseconds_to_absolutetime(TRANSFER_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &interval);
++	lck_spin_lock(&apollo_spmi_bus_lock);
++	wr(channel + CHANNEL_WDATA0, data);
++	wr(channel + CHANNEL_COMMAND, OP_EXT_WRITEL << 27 | (uint32_t)reg << 4 | (count - 1));
++	do {
++		status = rd(channel + CHANNEL_STATUS);
++	} while (!(status & STATUS_DONE) && mach_absolute_time() - start < interval);
++	lck_spin_unlock(&apollo_spmi_bus_lock);
++	if (!(status & STATUS_DONE) || (status & (STATUS_DENIED | STATUS_FAILURE | STATUS_DROPPED))) {
++		return spmi_status_text(status);
++	}
++	return NULL;
++}
++
++/* the peripheral's channel: the first, unless a later one is this system's (as Linux chooses) */
++static bool
++find_channel(struct peripheral *p, uint32_t channels)
++{
++	for (uint32_t n = 0; n < channels; n++) {
++		uint32_t map = rd(arb_core + ARB_CHANNEL(n));
++
++		if (map == 0 || ((map >> 8) & 0xfff) != p->id) {
++			continue;
++		}
++		if (!p->found || (rd(arb_cnfg + ARB_OWNER(n)) & 7) == ARB_SYSTEM) {
++			p->found = true;
++			p->channel = (uint16_t)n;
++		}
++	}
++	if (p->found) {
++		say("apollo backlight: %s is channel %u (owned by system %u)\n", p->name, p->channel,
++		    rd(arb_cnfg + ARB_OWNER(p->channel)) & 7);
++	} else {
++		say("apollo backlight: no channel is %s\n", p->name);
++	}
++	return p->found;
++}
++
++/* ---- the WLED (Linux's qcom-wled.c, WLED5) ---------------------------------------------------------- */
++
++#define WLED_CTRL_TYPE          0x04
++#define WLED_CTRL_SUBTYPE       0x05
++#define WLED_CTRL_MOD_EN        0x46            /* bit 7: the module on */
++#define WLED_CTRL_MOD_EN_BIT    0x80
++#define WLED5_SINK_MOD_EN(m)    ((m) ? 0x60 : 0x50)             /* bit 7 */
++#define WLED5_SINK_SRC_SEL(m)   ((m) ? 0x61 : 0x51)
++#define WLED5_SINK_WIDTH(m)     ((m) ? 0x62 : 0x52)             /* 0: 12 bits, 1: 15 bits */
++#define WLED5_SINK_BRIGHT(m)    ((m) ? 0x63 : 0x53)             /* low byte; the high byte follows */
++#define WLED5_SINK_SYNC         0x65                            /* bit 0: module A, bit 1: module B */
++#define WLED5_SINK_STR_SRC(n)   (0x73 + 0x10 * (n))             /* 0: module A, 1: module B */
++#define WLED5_LOW_LIMIT_PERMILLE 1                              /* the lower limit of a lit WLED5: 0.1% */
++
++static bool ready;                      /* the WLED was read and is as expected: brightness may be written */
++static uint32_t module;                 /* 0: A, 1: B: the module the first string takes its current from */
++static uint32_t maximum = 0xfff;        /* the brightness register's top: 12 or 15 bits */
++static uint32_t level;                  /* the brightness register's value now */
++static bool lit = true;                 /* the module is enabled */
++static uint32_t on_level;               /* apollo: the register's value while the display is on (what a fade in goes to) */
++
++static void
++log_registers(void)
++{
++	static const uint8_t ctrl_regs[] = { 0x04, 0x05, 0x08, 0x10, 0x46, 0x48, 0x4c, 0x4d, 0x4e, 0x5f };
++	static const uint8_t sink_regs[] = { 0x46, 0x47, 0x4f, 0x50, 0x51, 0x52, 0x53, 0x54, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65,
++		0x72, 0x73, 0x82, 0x83, 0x92, 0x93, 0xa2, 0xa3 };
++	char line[200];
++	int at;
++	uint8_t value;
++
++	at = snprintf(line, sizeof(line), "apollo backlight: control block:");
++	for (unsigned i = 0; i < sizeof(ctrl_regs); i++) {
++		at += snprintf(line + at, sizeof(line) - (size_t)at, " %02x=", ctrl_regs[i]);
++		if (spmi_read(&ctrl, ctrl_regs[i], &value, 1) == NULL) {
++			at += snprintf(line + at, sizeof(line) - (size_t)at, "%02x", value);
++		} else {
++			at += snprintf(line + at, sizeof(line) - (size_t)at, "??");
++		}
++	}
++	say("%s\n", line);
++	at = snprintf(line, sizeof(line), "apollo backlight: sink block:");
++	for (unsigned i = 0; i < sizeof(sink_regs); i++) {
++		at += snprintf(line + at, sizeof(line) - (size_t)at, " %02x=", sink_regs[i]);
++		if (spmi_read(&sink, sink_regs[i], &value, 1) == NULL) {
++			at += snprintf(line + at, sizeof(line) - (size_t)at, "%02x", value);
++		} else {
++			at += snprintf(line + at, sizeof(line) - (size_t)at, "??");
++		}
++	}
++	say("%s\n", line);
++}
++
++/* the brightness register as the hardware has it */
++static bool
++read_level(uint32_t *value)
++{
++	uint8_t bytes[2];
++
++	if (spmi_read(&sink, WLED5_SINK_BRIGHT(module), bytes, 2) != NULL) {
++		return false;
++	}
++	*value = (uint32_t)bytes[0] | (uint32_t)bytes[1] << 8;
++	return true;
++}
++
++/* Linux's wled5_set_brightness, wled5_mod_sync_toggle and wled_module_enable, in the order wled_update_status has them */
++static bool
++write_level(uint32_t brightness)
++{
++	uint8_t bytes[2], sync;
++	const char *problem;
++	uint32_t low = maximum * WLED5_LOW_LIMIT_PERMILLE / 1000;
++
++	if (brightness > maximum) {
++		brightness = maximum;
++	}
++	if (brightness != 0 && brightness < low) {
++		brightness = low;
++	}
++	if (brightness != 0) {
++		bytes[0] = (uint8_t)brightness;
++		bytes[1] = (uint8_t)(brightness >> 8);
++		if ((problem = spmi_write(&sink, WLED5_SINK_BRIGHT(module), bytes, 2)) != NULL) {
++			say("apollo backlight: the brightness is not taken: %s\n", problem);
++			return false;
++		}
++		sync = (uint8_t)(1u << module);
++		if ((problem = spmi_write(&sink, WLED5_SINK_SYNC, &sync, 1)) != NULL) {
++			say("apollo backlight: the sync is not taken: %s\n", problem);
++			return false;
++		}
++		sync = 0;
++		spmi_write(&sink, WLED5_SINK_SYNC, &sync, 1);
++		level = brightness;
++	}
++	if ((brightness != 0) != lit) {
++		uint8_t enable;
++
++		if (spmi_read(&ctrl, WLED_CTRL_MOD_EN, &enable, 1) != NULL) {
++			return false;
++		}
++		enable = (uint8_t)((enable & ~WLED_CTRL_MOD_EN_BIT) | (brightness != 0 ? WLED_CTRL_MOD_EN_BIT : 0));
++		if ((problem = spmi_write(&ctrl, WLED_CTRL_MOD_EN, &enable, 1)) != NULL) {
++			say("apollo backlight: the module's enable is not taken: %s\n", problem);
++			return false;
++		}
++		lit = brightness != 0;
++	}
++	return true;
++}
++
++/*
++ * iOS's brightness is 0 to 1 (16.16 fixed point) and perceived, the register's value is a current: the register is
++ * taken as the square of the brightness (a power of 2.0 for 2.2), never under 8 of 4095 so that the lowest setting
++ * still shows something.
++ */
++static uint32_t
++level_for(uint32_t fraction)
++{
++	uint64_t square;
++	uint32_t floor = maximum * 8 / 0xfff;
++
++	if (fraction > 0x10000) {
++		fraction = 0x10000;
++	}
++	square = ((uint64_t)fraction * fraction) >> 16;
++	square = square * maximum >> 16;
++	return square < floor ? floor : (uint32_t)square;
++}
++
++/* ---- apollo: the fade ---------------------------------------------------------------------------------- */
++
++/*
++ * The display's power fades the light (apollo_backlight_fade_ms, default 300; 0: at once) in steps of FADE_STEP_MS, on a
++ * thread of its own. The steps are even in perceived brightness (the square root of the register's current, as
++ * level_for() has it): the register goes as the square of a straight line from the square root of where the fade began to
++ * that of where it ends. A new fade (the display switched back before the last had ended) starts where the light is.
++ */
++#define FADE_STEP_MS            16
++
++static uint32_t fade_ms = 300;
++static bool fading;                     /* the fade's thread has steps to take */
++static uint32_t fade_from, fade_to;     /* the register's values at the fade's start and end (0: off) */
++static uint32_t fade_steps, fade_done;
++static uint32_t fade_number;            /* counts the fades asked for: a waiter's fade has ended, or another took its place */
++static uint32_t fade_ended;             /* the last fade that ran to its end */
++
++static uint32_t
++isqrt(uint64_t value)
++{
++	uint64_t root = 0, bit = 1ULL << 62;
++
++	while (bit > value) {
++		bit >>= 2;
++	}
++	while (bit != 0) {
++		if (value >= root + bit) {
++			value -= root + bit;
++			root = (root >> 1) + bit;
++		} else {
++			root >>= 1;
++		}
++		bit >>= 2;
++	}
++	return (uint32_t)root;
++}
++
++/* the register's value after step `done` of `steps` (in the lock) */
++static uint32_t
++fade_level(uint32_t done)
++{
++	uint64_t a = isqrt((uint64_t)fade_from << 16), b = isqrt((uint64_t)fade_to << 16);     /* 256 times the roots */
++	uint64_t mix = (a * (fade_steps - done) + b * done);
++
++	if (done >= fade_steps) {
++		return fade_to;
++	}
++	return (uint32_t)(mix * mix / ((uint64_t)fade_steps * fade_steps << 16));
++}
++
++static void
++fade_thread(__unused void *arg, __unused wait_result_t result)
++{
++	lck_mtx_lock(&apollo_backlight_state_lock);
++	for (;;) {
++		while (!fading) {
++			lck_mtx_sleep(&apollo_backlight_state_lock, LCK_SLEEP_DEFAULT, (event_t)&fading, THREAD_UNINT);
++		}
++		fade_done++;
++		uint32_t next = fade_level(fade_done);
++		/* (a step that would end lit at 0 is the fade's end, that writes 0: off) */
++		if (next == 0 && fade_done < fade_steps) {
++			next = 1;
++		}
++		write_level(next);
++		if (fade_done >= fade_steps) {
++			fading = false;
++			fade_ended = fade_number;
++			wakeup(&fade_ended);
++			continue;
++		}
++		lck_mtx_unlock(&apollo_backlight_state_lock);
++		delay_for_interval(FADE_STEP_MS, NSEC_PER_MSEC);
++		lck_mtx_lock(&apollo_backlight_state_lock);
++	}
++}
++
++/*
++ * The display's light faded out (on false) or back in to the level it had (on true), from the framebuffer
++ * (SweetFramebuffer.cpp: RequestPowerChange). wait: return once the light is there (or another fade has been asked for
++ * meanwhile). false: there is no light of ours to fade (the caller blanks the panel as before).
++ */
++bool
++apollo_backlight_fade(bool on, bool wait)
++{
++	uint32_t number;
++
++	if (!ready) {
++		return false;
++	}
++	lck_mtx_lock(&apollo_backlight_state_lock);
++	fade_from = lit ? level : 0;
++	fade_to = on ? on_level : 0;
++	fade_steps = fade_ms / FADE_STEP_MS ? fade_ms / FADE_STEP_MS : 1;
++	fade_done = 0;
++	number = ++fade_number;
++	if (fade_from == fade_to) {
++		fading = false;
++		fade_ended = number;
++	} else {
++		fading = true;
++		wakeup(&fading);
++	}
++	while (wait && fade_ended != number && fade_number == number) {
++		lck_mtx_sleep(&apollo_backlight_state_lock, LCK_SLEEP_DEFAULT, (event_t)&fade_ended, THREAD_UNINT);
++	}
++	lck_mtx_unlock(&apollo_backlight_state_lock);
++	return true;
++}
++
++/* iOS asks for a brightness: 0 (dark) to 0x10000 (full), as IOMFBBrightnessLevel has it (apollo: nothing calls it yet) */
++void
++apollo_backlight_set(uint32_t fraction)
++{
++	if (!ready) {
++		return;
++	}
++	lck_mtx_lock(&apollo_backlight_state_lock);
++	on_level = level_for(fraction);
++	if (lit && !fading) {
++		write_level(on_level);
++	} else if (fading && fade_to != 0) {
++		fade_to = on_level;
++	}
++	lck_mtx_unlock(&apollo_backlight_state_lock);
++}
++
++/* the display is switched off or on again (apollo: faded, without waiting) */
++void
++apollo_backlight_power(bool on)
++{
++	apollo_backlight_fade(on, false);
++}
++
++/* ---- start ------------------------------------------------------------------------------------------- */
++
++void
++apollo_backlight_init(void)
++{
++	uint32_t percent = 0, channels;
++	uint8_t id[2], enable, source;
++	uint32_t now = 0;
++	const char *problem;
++	thread_t thread;
++
++	/* apollo: on unless apollo_backlight=0; P (1 to 100) sets the brightness, without it the firmware's stays */
++	if (PE_parse_boot_argn("apollo_backlight", &percent, sizeof(percent)) && percent == 0) {
++		say("apollo backlight: apollo_backlight=0: left alone\n");
++		return;
++	}
++	PE_parse_boot_argn("apollo_backlight_fade_ms", &fade_ms, sizeof(fade_ms));
++	if (fade_ms > 2000) {
++		fade_ms = 2000;
++	}
++	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
++	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
++	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_REGION_SIZE);
++	channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
++	if (channels > ARB_MAX_CHANNELS) {
++		channels = ARB_MAX_CHANNELS;
++	}
++	if (!find_channel(&ctrl, channels) || !find_channel(&sink, channels)) {
++		return;
++	}
++	ctrl.writes = ml_io_map(ARB_CHANNELS_PHYS + 0x10000UL * ctrl.channel, 0x1000);
++	sink.writes = ml_io_map(ARB_CHANNELS_PHYS + 0x10000UL * sink.channel, 0x1000);
++	if ((problem = spmi_read(&ctrl, WLED_CTRL_TYPE, id, 2)) != NULL) {
++		say("apollo backlight: cannot read the WLED: %s\n", problem);
++		return;
++	}
++	say("apollo backlight: the WLED's control block is type %#x, subtype %#x\n", id[0], id[1]);
++	log_registers();
++
++	/* the module the first string takes its current from, and how wide its brightness is */
++	if (spmi_read(&sink, WLED5_SINK_STR_SRC(0), &source, 1) != NULL) {
++		return;
++	}
++	module = (source & 1) ? 1 : 0;
++	if (spmi_read(&sink, WLED5_SINK_WIDTH(module), &source, 1) != NULL) {
++		return;
++	}
++	maximum = (source & 1) ? 0x7fff : 0xfff;
++	if (!read_level(&level) || spmi_read(&ctrl, WLED_CTRL_MOD_EN, &enable, 1) != NULL) {
++		return;
++	}
++	lit = (enable & WLED_CTRL_MOD_EN_BIT) != 0;
++	say("apollo backlight: module %c, %u bits: the firmware left it %s at %u of %u (%u%%)\n", 'A' + module,
++	    maximum == 0x7fff ? 15 : 12, lit ? "on" : "OFF", level, maximum, (uint32_t)((uint64_t)level * 100 / maximum));
++	if (!lit || level == 0) {
++		say("apollo backlight: the WLED is off: left alone\n");
++		return;
++	}
++	on_level = level;
++	if (kernel_thread_start(fade_thread, NULL, &thread) != KERN_SUCCESS) {
++		say("apollo backlight: no thread for the fade: left alone\n");
++		return;
++	}
++	thread_deallocate(thread);
++	ready = true;
++	if (percent != 0) {
++		/* P percent of perceived brightness */
++		apollo_backlight_set((percent > 100 ? 100 : percent) * 0x10000 / 100);
++		say("apollo backlight: set to %u%%: the register reads %u now (wrote %u)\n", percent > 100 ? 100 : percent,
++		    read_level(&now) ? now : 0, level);
++	}
++	say("apollo backlight: the display's power fades the light over %u ms\n", fade_ms);
++}
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -17,9 +17,8 @@
+  *      +0x104 enabled layer mask
+  *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h],
+  *   12 RequestPowerChange [state]: 0 = display off (backboardd, power
+- *      button / auto-lock), else on. Off fades the panel out over a few
+- *      vsyncs (halving each pixel) and keeps it black until on again;
+- *      the panel itself stays powered (AMOLED black pixels are off).
++ *      button / auto-lock), else on. Off fades the light out and keeps
++ *      the panel black until on again (0149, 0151 below).
+  *   18 IsMainDisplay,
+  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
+  * Everything else is accepted and logged once.
+@@ -51,6 +50,13 @@
+  * looked zoomed in). Boot-arg sweetfb_fit=0: the crop as before. SweetHID.cpp
+  * maps the touches the same way.
+  *
++ * (xnu 0151) Display off fades the panel's light out (the PM8150L's WLED,
++ * bsd/dev/sweet_backlight.c: apollo_backlight_fade_ms, default 300) and only
++ * then blanks the panel; display on draws the latest frame first and fades the
++ * light back in. The picture itself is not touched by the fade: a dimmer light,
++ * a few register writes every 16 ms. Without the backlight (apollo_backlight=0,
++ * or a WLED that is not as expected) the panel is blanked at once, as in 0149.
++ *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+@@ -61,6 +67,7 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" bool sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size);     /* SweetGPU.cpp */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern "C" bool apollo_backlight_fade(bool on, bool wait);      /* bsd/dev/sweet_backlight.c (xnu 0151) */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -146,6 +153,7 @@
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* while off: 0 the panel still shows the last frame, 1 to be blacked out, 2 black (0149) */
++	bool          fLightWanted;   /* on again: the light faded in once a frame is drawn (0151) */
+ 	/* (xnu 0148) the vsync schedule, the present thread, and what is said every fStatsAbs */
+ 	uint64_t      fPeriodAbs, fNextVsync, fStatsAbs, fStatSince;
+ 	bool          fPresentWanted;
+@@ -454,6 +462,16 @@
+ 			/* (xnu 0149) the display off: the panel black, with writes only (its memory is write-combining) */
+ 			fFadeStep = 2;
+ 			IOLockUnlock(fLock);
++			/* (xnu 0151) after the light has faded out; switched on again meanwhile: not blanked */
++			if (apollo_backlight_fade(false, true)) {
++				IOLockLock(fLock);
++				bool still = fPowerOff && fFadeStep == 2;
++				IOLockUnlock(fLock);
++				if (!still) {
++					IOLockLock(fLock);
++					continue;
++				}
++			}
+ 			for (uint32_t y = 0; y < fHeight; y++) {
+ 				volatile uint64_t *row = (volatile uint64_t *)(fPixels + (uint64_t)y * fRowBytes);
+ 				for (uint32_t x = 0; x < fWidth / 2; x++) {
+@@ -463,7 +481,17 @@
+ 			IOLockLock(fLock);
+ 			continue;
+ 		}
+-		if (!fDirty || fPowerOff) {
++		if (fPowerOff) {
++			continue;
++		}
++		if (!fDirty) {
++			if (fLightWanted) {
++				/* (xnu 0151) on again with nothing new to draw: the light back */
++				fLightWanted = false;
++				IOLockUnlock(fLock);
++				apollo_backlight_fade(true, false);
++				IOLockLock(fLock);
++			}
+ 			continue;
+ 		}
+ 		memcpy(rec, fPending, SWEET_FB_SWAP_REC_SIZE);
+@@ -482,6 +510,13 @@
+ 			if (spent > fStatCopyMost) {
+ 				fStatCopyMost = spent;
+ 			}
++			if (fLightWanted && !fPowerOff) {
++				/* (xnu 0151) on again: the frame is on the panel, the light faded back in */
++				fLightWanted = false;
++				IOLockUnlock(fLock);
++				apollo_backlight_fade(true, false);
++				IOLockLock(fLock);
++			}
+ 		} else {
+ 			/* the GPU is still drawing a surface of this frame: again, unless a newer one has come meanwhile */
+ 			fStatBusy++;
+@@ -861,6 +896,9 @@
+ 				fFB->fPowerOff = off;
+ 				fFB->fFadeStep = 0;
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
++				fFB->fLightWanted = !off;       /* (0151) and then the light */
++				fFB->fPresentWanted = true;
++				IOLockWakeup(fFB->fLock, &fFB->fPresentWanted, true);
+ 			}
+ 			IOLockUnlock(fFB->fLock);
+ 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
