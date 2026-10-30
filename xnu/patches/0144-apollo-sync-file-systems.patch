@@ -1,0 +1,47 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -804,12 +804,44 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++/*
++ * File data written without fsync stays in memory until something syncs it, and nothing here
++ * did: whatever a daemon had written since was lost when the phone was forced off. bluetoothd's
++ * paired-device list (a preferences plist) did not survive from apollo boot 76 to 77, while the
++ * keychain (SQLite, which fsyncs) did. So sync_internal() -- what power management calls before
++ * sleep: VFS_SYNC(MNT_NOWAIT) on every writable mount -- runs every sweetsync seconds (default
++ * 10; 0 = never), from its own thread, since the log thread holds sweet_ufs_lock while it writes.
++ */
++#define SWEET_SYNC_SECS         10u
++
++static uint32_t sweet_sync_secs = SWEET_SYNC_SECS;
++
++extern int sync_internal(void);
++
++static void
++sweet_sync_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	printf("SWEET UFS: file systems synced every %u s (sweetsync)\n", sweet_sync_secs);
++	for (;;) {
++		(void)tsleep(&sweet_sync_secs, PZERO, "sweetsync", hz * (int)sweet_sync_secs);
++		(void)sync_internal();
++	}
++}
++
+ static void
+ sweet_log_start(void)
+ {
+ 	uint32_t on = 1;
+ 	thread_t thread;
+ 
++	PE_parse_boot_argn("sweetsync", &sweet_sync_secs, sizeof(sweet_sync_secs));
++	if (sweet_sync_secs > 3600) {
++		sweet_sync_secs = SWEET_SYNC_SECS;
++	}
++	if (su.writable && sweet_sync_secs != 0 &&
++	    kernel_thread_start(sweet_sync_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
+ 	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
+ 	if (!on || !su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
+ 		return;

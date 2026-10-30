@@ -26,8 +26,10 @@
  *   our own XPC responder instead (take_over_main), so Apple's code never runs and nothing on the root changes. It
  *   answers boot/init with 0 once the controller is ready -- the registry entry "bluetooth" says SweetBluetoothReady
  *   and com.sweet.bluetooth resolves -- as the Mi 10 port's helper does (the kernel loaded the firmware and NVM
- *   before launchd started), with an errno otherwise; anything else gets ENOTSUP. Boot-arg sweetbtool=0 lets
- *   Apple's BlueTool run.
+ *   before launchd started), with an errno otherwise. "deepsleep", which bluetoothd runs when Bluetooth is turned
+ *   off, is answered 0 and the chip stays powered: bluetoothd resets it (HCI Reset) when it is turned on again, and
+ *   any failure here made it log "Clean power off failed" and abort (apollo boot 77). Anything else gets ENOTSUP.
+ *   Boot-arg sweetbtool=0 lets Apple's BlueTool run.
  *
  * Diagnostics (boot-arg sweetbtlog=1): bluetoothd's own power-on log, which goes to os_log and not to sweetnull,
  *   mirrored to stderr (hook_os_log). Boot-arg sweetbtpatch=1: the old stopgap of boots 70-73, bluetoothd reading
@@ -460,9 +462,12 @@ bluetool_request(xpc_connection_t peer, xpc_object_t message)
 	if (arguments != NULL && xpc_get_type(arguments) == &_xpc_type_dictionary) {
 		script = xpc_dictionary_get_string(arguments, "script");
 	}
-	if (command != NULL && script != NULL && strcmp(command, "RunBuiltinScript") == 0 &&
-	    (strcmp(script, "boot") == 0 || strcmp(script, "init") == 0)) {
-		result = controller_ready();
+	if (command != NULL && script != NULL && strcmp(command, "RunBuiltinScript") == 0) {
+		if (strcmp(script, "boot") == 0 || strcmp(script, "init") == 0) {
+			result = controller_ready();
+		} else if (strcmp(script, "deepsleep") == 0) {
+			result = 0;     /* see the header comment */
+		}
 	}
 	say("sweet-bt: BlueTool (ours): %.48s %.48s -> result %d\n", command != NULL ? command : "(no kMsgId)",
 	    script != NULL ? script : "-", result);
@@ -499,7 +504,7 @@ bluetool_main(void)
 		xpc_connection_resume(peer);
 	});
 	xpc_connection_resume(listener);
-	say("sweet-bt: BlueTool (ours): answering boot/init on com.apple.BlueTool; Apple's BlueTool does not run\n");
+	say("sweet-bt: BlueTool (ours): answering boot/init/deepsleep on com.apple.BlueTool; Apple's BlueTool does not run\n");
 	dispatch_main();
 }
 
