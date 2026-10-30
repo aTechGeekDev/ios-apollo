@@ -2,6 +2,54 @@
 
 ## Agent handoff / active work
 
+### >>> 🎉🎉 BLUETOOTH WORKS IN iOS (2026-10-30, boot 78) -- SUMMARY FOR THE NEXT AGENT (read this first) <<<
+
+**Status (user, boot 78):** "audio is smoother now, pairing saved after reboot". Over boots 76-78 the user confirmed: Settings switch and Control Center toggle work, turning Bluetooth off and on works, scanning/discovery, pairing with headphones (2C:CC:8C:D8:0B:42), A2DP music (smooth at 921600 baud), HFP and AVRCP connect, and the pairing survives a reboot.
+**Boot 78 log (observed):** `SWEET UFS: file systems synced every 10 s`, `SWEET BT: the UART now runs at 921600 baud (sweetbtbaud)`, firmware at 921600 (~3 s, was ~18 s), `THE FIRMWARE RUNS`, `THE RADIO IS UP`, BlueTool stand-in answering boot/init/deepsleep, `H4: connected`, `pairedDev list size = 1` at bluetoothd's start (remembered from the last boot). One bluetoothd launch, **0 crashes, 0 restarts**, nothing refused by the chip.
+
+**Known-good builds:** kernel **xnu run 41028453123** (commit 9d5dc7e; later commits are NOTES only), library **bt run 41027123196** (`sweet-bt`, commit 13870a7; 2ce7641's H4 handler + 13870a7's deepsleep). Branch `claude/blissful-hypatia-6ut4kn`, fast-forwarded into `main` at the end of this session.
+
+**Boot command (known good; Wi-Fi + speaker audio + Bluetooth; software UI, no GPU bridge):**
+```sh
+rm -rf xnu/out sweet-bt && \
+gh run download 41028453123 -R aTechGeekDev/ios-apollo -n xnu-kernel -D xnu/out && \
+gh run download 41027123196 -R aTechGeekDev/ios-apollo -n sweet-bt -D sweet-bt && \
+python3 tools/mkadt.py shim/out/apollo.adt --highmem \
+    --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
+    --wifi-fw research/apollo-wifi --bt-fw research/apollo-bt \
+    --file /usr/local/lib/libsweet-bt.dylib=sweet-bt/lib/libsweet-bt.dylib \
+    --files-from tools/root-files/bt-on.txt && \
+python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/apollo.adt shim/out/payload.bin \
+    --cmdline 'debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 sweetwifi=12 apollo_audio=5 sweetbt=6 sweetbtlog=1 sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool sweetnull=backboardd,SpringBoard,bluetoothd,BlueTool' && \
+shim/build.sh ../shim/out/payload.bin && fastboot boot shim/out/shim-boot.img
+# log: fastboot boot recovery/recovery.img && tools/sweet-log-pull.sh logs/apollo-bootNN.txt && \
+#      grep -a -E 'SWEET BT|SWEET UFS|sweet-bt|btd:|H4|CRASH bluetoothd|restarting' logs/apollo-bootNN.txt; adb reboot bootloader
+```
+`sweetbtlog=1` (bluetoothd's os_log mirrored as `btd:` lines) is diagnostic only and can be dropped. bt-on.txt (launchd's disabled.plist without bluetoothd) is already on the root after the first BT boot; keeping it is harmless.
+
+**How it works (the pieces):**
+| Piece | What it does |
+|---|---|
+| xnu 0136 (+0137) | QCA6390 Bluetooth on SE6's UART: rails, BT_EN, firmware from the ADT (`--bt-fw`), address from /chosen; with `sweetbt=6` the H4 kernel control `com.sweet.bluetooth` (bluetoothd's transport, a byte pipe polled by the `sweet-bt-h4` worker every 1 ms, IBS handled) and the registry entry `bluetooth` (SweetBluetooth.cpp: local-mac-address, SweetBluetoothReady) |
+| xnu 0141 | Kernel answers bluetoothd's Broadcom vendor commands (0xfcxx: CC status 0, first parameter byte echoed, 8 zeros) and Read/Write Default Erroneous Data Reporting (0x0c5a/0x0c5b) itself; ORs 0x0c into octet 18 of Supported Commands; logs `refused by the chip`. `sweetbtvsc=0` off, `sweetbtfake=0x....` more opcodes (dada port's approach) |
+| xnu 0142 | registry `transport-speed` as 4-byte OSData (bluetoothd reads it with CFDataGetBytes; a number crashed it, boot 74) |
+| xnu 0143 | Kernel answers 0x204a (LE Read Periodic Advertiser List Size, an *extended advertising* command) itself, so the chip stays in legacy LE mode; otherwise it refuses 0x2007/0x200b with Command Disallowed and bluetoothd restarts (reason 712, boot 75) |
+| xnu 0144 | `sync_internal()` every `sweetsync` s (default 10) from bsd/dev/sweet_ufs.c: non-fsync'd files (e.g. bluetoothd's paired-device plist) survived no forced reboot before (boot 77). **Global: helps every setting on the root** |
+| xnu 0145 | UART moved from 115200 to `sweetbtbaud` (default **921600**) after the ROM version, as Linux hci_qca: vendor 0xfc48 [index], SE6 M/N/D + GENI divider, NVM tag 17 = same index; falls back to 115200 (chip power-cycled) if the switch or the firmware fails. Fixes the A2DP stutter (115200 = ~11 KB/s < AAC 256 kbit/s) |
+| xnu 0114 (multi-group), 0064 | `sweetinject=LIB:prog,..;LIB2:prog` (one library per group); every privilege granted by the sandbox MAC policy (not the BT fix, but in place) |
+| userland/bt-inject (`libsweet-bt.dylib`, bt.yml) | Inserted into bluetoothd and BlueTool. **bluetoothd:** `BT_HCI_TRANSPORT=H4:POSIX:com.sweet.bluetooth,115200`, `BT_BAUDRATE=115200`; fills the H4 transport table's empty stack-stopped slot (+0x60 of image offset 0x844228; turning BT off crashed at pc 0, boot 76). **BlueTool:** LC_MAIN redirected to our own `com.apple.BlueTool` XPC responder: RunBuiltinScript boot/init -> 0 when the controller is ready, deepsleep -> 0 (else "Clean power off failed" abort, boot 77), anything else ENOTSUP -- Apple's BlueTool never runs (both working ports replace BlueTool). Options: `sweetbtlog=1`, `sweetbtool=0`, `sweetbthci=`, `sweetbtpatch=1` (old stopgap, off) |
+| tools/root-files/bt-on.txt | launchd override list with bluetoothd enabled (fairplayd.H2 still off) |
+
+**Bugs found and fixed, in order (boot: symptom -> cause -> fix):** 68: BlueTool patch refused -> wrong image base with an inserted library -> MH_EXECUTE scan. 69-70: BlueTool relaunch loop -> Apple's BlueTool cannot open our UART -> (stopgap) bluetoothd's result read patched. 71-73: power-on stalls, blind -> os_log mirror, args decoded; privileges granted (not it); gate = controller init. Research (umi Mi 10 port, dada Xiaomi 15 port): both replace BlueTool and answer the vendor commands -> stand-in + 0141. 74: crash `-[__NSCFNumber getBytes:range:]` -> transport-speed was a number -> BT_BAUDRATE + 0142. 75: on/unavailable loop -> 0x204a puts the QCA into extended mode -> 0143. 76: works; crash on BT off -> H4 table slot +0x60 empty -> library fills it. 77: abort on BT off (deepsleep ENOTSUP), stutter, pairing lost on reboot -> deepsleep 0, 0144 sync, 0145 921600 baud. 78: all good.
+
+**Open / not done (none blocks Bluetooth):**
+- **GPU bridge + Bluetooth in one boot:** use the two-group `sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd;/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool` (+ backboardd in sweetnull) with the user's boot-64 GPU firmware args (`--gmu-fw/--sqe-fw/--zap-*`, `sweetgpu=`); those args are not in this session's notes -- take them from the user, do not invent them. Not tried yet.
+- **Calls over Bluetooth (HFP audio/mic):** the HFP link connects, but call audio (SCO; on QCA possibly routed to PCM pins rather than HCI) is untested.
+- 0x0804 (Sniff Mode) is refused with Command Disallowed (`refused by the chip (Command Status): 0xc`, boot 77): only power saving; harmless so far.
+- Faster than 921600 (`sweetbtbaud=2000000/3000000/3200000`) is untested: RX is polled every 1 ms with a 128-byte FIFO (safe only if the chip honours RFR) and TX has CTS masked (0x25c = 2).
+- umi's in-memory bluetoothd patches (vendor ranges, init mask, step table; 20H392 offsets in STAGE 2 PREP) were NOT needed and are not ported.
+- Apple binaries used for RE (BlueTool, bluetoothd from the user's bt-ios.tgz) stay out of git.
+
 ### >>> BT STAGE 4 (2026-10-30): faster UART for audio -- xnu 0145 moves the chip and SE6 to sweetbtbaud (default 921600) <<<
 
 **Why:** A2DP stutters (boot 77). The H4 link ran at 115200 baud = ~11.5 KB/s; bluetoothd streams AAC at 256 kbit/s (~32 KB/s + headers). Throughput is set by the baud: the worker sends each packet in a busy loop (bt_uart_tx) and handles one packet per direction per 1 ms iteration (~1000 packets/s, plenty).
