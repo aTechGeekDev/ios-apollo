@@ -11,7 +11,7 @@
 - sweet_touch.c: polls every 100 ms instead of 4 while the display is off and dark (`sweet_display_dark`, set by SweetFramebuffer after the blank, cleared on power-on).
 - SweetFramebuffer.cpp: bilinear 24/25 scaling (`presentSmooth`): per panel line the two source lines blended into a line buffer (2 pixels per 64-bit SWAR op, skipped when the fraction is 0), then per pixel the two columns (32-bit SWAR, weights of 256 precomputed per column); `sweetfb_smooth=0` = nearest. Blend math checked on the host against a per-channel reference: 0 mismatches in 2M random pairs (both widths). Cost: more copy time per frame (the SWEET FB line will say; guess 5-7 ms vs 3.5-4).
 - sweet_backlight.c: SPMI writes retried up to 3 times (50 us apart).
-**Checks:** validate-repo 155 OK; series reproduces the 4 series-created files; sweet_cpufreq.c / sweet_backlight.c compile against stubs. machine_routines.c / SweetFramebuffer.cpp only by CI.
+**Build:** commit ce3f501, xnu run **41080308008**. **Checks:** validate-repo 155 OK; series reproduces the 4 series-created files; sweet_cpufreq.c / sweet_backlight.c compile against stubs. machine_routines.c / SweetFramebuffer.cpp only by CI.
 **Next, from the SWEET TOP lines:** fix whatever burns the idle cores; then the GPU doing the scaling (no CPU copy: hakios's apollo_gpu_present/page-flip path) for both heat and fps.
 
 ### >>> README rewritten (2026-10-30, commit 6ceff1d; user: "rework the readme.md from scratch, make it simple organized and detailed with progress bars") <<<
