@@ -1,0 +1,63 @@
+name: ios-re
+
+# Looks into the iPhone X's iOS 16.7.16 (20H392) system libraries, for the userland work (e.g. how UIKit
+# and SpringBoard pick their layouts from the screen: the native 1080x2400 display, NOTES.md). The
+# dyld shared cache is fetched from Apple's CDN on the runner (only the SystemOS cryptex, by HTTP
+# ranges: tools/remotezip.py), kept in the Actions cache, and never committed or uploaded as an
+# artifact. The `script` input runs with $DSC = the cache's main file and `ipsw` installed; what it
+# prints is the result (in the run's log).
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: "bash run with $DSC set (ipsw dyld ... \"$DSC\" ...)"
+        required: true
+        type: string
+
+jobs:
+  look:
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: brew install blacktop/tap/ipsw jq
+      - uses: actions/cache@v4
+        id: dsc
+        with:
+          path: ~/dsc
+          key: dsc-iPhone10,3-20H392-v1
+      - name: Fetch the dyld shared cache (SystemOS cryptex of iPhone10,3 20H392)
+        if: steps.dsc.outputs.cache-hit != 'true'
+        run: |
+          set -eux
+          URL=$(curl -sfL https://api.ipsw.me/v4/ipsw/iPhone10,3/20H392 | jq -r .url)
+          echo "$URL"
+          mkdir -p ~/ipsw ~/dsc
+          python3 tools/remotezip.py "$URL" BuildManifest.plist ~/ipsw
+          # the SystemOS cryptex's disk image, as BuildManifest names it
+          DMG=$(python3 - <<'EOF'
+          import plistlib, os
+          m = plistlib.load(open(os.path.expanduser('~/ipsw/BuildManifest.plist'), 'rb'))
+          for identity in m['BuildIdentities']:
+              path = identity.get('Manifest', {}).get('Cryptex1,SystemOS', {}).get('Info', {}).get('Path')
+              if path:
+                  print(path)
+                  break
+          EOF
+          )
+          echo "SystemOS: $DMG"
+          python3 tools/remotezip.py "$URL" "$DMG" ~/ipsw
+          F=$(find ~/ipsw -name "$(basename "$DMG")" | head -1)
+          hdiutil attach -readonly -nobrowse -mountpoint ~/sysos "$F"
+          cp ~/sysos/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64* ~/dsc/
+          hdiutil detach ~/sysos
+          rm -rf ~/ipsw
+          ls -la ~/dsc
+      - name: Look
+        env:
+          SCRIPT: ${{ inputs.script }}
+        run: |
+          export DSC=$(ls ~/dsc/dyld_shared_cache_arm64 2>/dev/null || ls ~/dsc/dyld_shared_cache_arm64* | head -1)
+          echo "DSC=$DSC"
+          bash -x -c "$SCRIPT" 2>&1 | head -c 4000000
