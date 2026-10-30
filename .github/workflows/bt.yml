@@ -1,8 +1,8 @@
 name: bt
 
-# libsweet-bt.dylib: the library the kernel inserts into bluetoothd (and later BlueTool) so iOS's
-# Bluetooth stack uses the QCA6390 the kernel brought up (sweet_bt.c, sweetbt=6). It sets
-# BT_HCI_TRANSPORT to the kernel's H4 endpoint. Built with Xcode's iPhoneOS SDK and ad-hoc signed,
+# libsweet-bt.dylib: the library the kernel inserts into bluetoothd and BlueTool so iOS's
+# Bluetooth stack uses the QCA6390 the kernel brought up (sweet_bt.c, sweetbt=6): BT_HCI_TRANSPORT
+# for bluetoothd, and a stand-in for Apple's BlueTool. Built with Xcode's iPhoneOS SDK and ad-hoc signed,
 # apart from userland.yml so a change here does not rebuild Mesa. Artifact sweet-bt:
 # lib/libsweet-bt.dylib, SHA256SUMS; boot-arg sweetinject puts it in, no new root needed
 # (tools/sweet-root-add.sh installs lib/* into /usr/local/lib). See userland/README.md.
@@ -27,6 +27,7 @@ jobs:
           mkdir -p out/lib
           xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" \
             -O2 -Wall -Wextra -Werror -dynamiclib -install_name /usr/local/lib/libsweet-bt.dylib \
+            -framework IOKit -framework CoreFoundation \
             -o out/lib/libsweet-bt.dylib userland/bt-inject/sweet_bt_inject.c
           codesign -s - -f out/lib/libsweet-bt.dylib
           codesign -dv out/lib/libsweet-bt.dylib

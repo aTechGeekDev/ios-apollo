@@ -1,5 +1,6 @@
 # Bluetooth stage 2: let com.apple.bluetoothd run (jobs-off.txt keeps it disabled because there was
 # no Bluetooth driver). This override list disables only fairplayd.H2, so bluetoothd starts; with
 # sweetbt=6 the kernel has the "bluetooth" registry entry and the H4 endpoint, and
-# sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd gives it BT_HCI_TRANSPORT. Undo: jobs-off.txt.
+# sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool gives it BT_HCI_TRANSPORT and a
+# BlueTool stand-in. Undo: jobs-off.txt.
 /private/var/db/com.apple.xpc.launchd/disabled.plist=tools/root-files/launchd-disabled-bt.plist 0:0:0644

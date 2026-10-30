@@ -1,53 +1,96 @@
 /*
- * libsweet-bt.dylib: what the kernel inserts into bluetoothd so iOS's Bluetooth stack talks to the
- * QCA6390 the kernel brought up (sweet_bt.c, boot-arg sweetbt=6: the firmware runs, the H4 kernel
- * control "com.sweet.bluetooth" and the registry entry "bluetooth" are up). Inserted with boot-arg
- *   sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd
- * (xnu 0114's sweetinject + AMFI dyld policy; launchd drops DYLD_ variables itself).
+ * libsweet-bt.dylib: what the kernel inserts into bluetoothd and BlueTool so iOS's Bluetooth stack talks to the
+ * QCA6390 the kernel brought up (sweet_bt.c, boot-arg sweetbt=6: the firmware runs, the H4 kernel control
+ * "com.sweet.bluetooth" and the registry entry "bluetooth" are up). Inserted with boot-arg
+ *   sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool
+ * (xnu 0114's sweetinject + AMFI dyld policy; launchd drops DYLD_ variables itself). Everything happens in the
+ * constructor, before the program's main() runs; dispatched on getprogname() like the CoreAnimation bridge.
  *
- * Two jobs, both in bluetoothd, from the inserted library's constructor before main() runs:
+ * bluetoothd -- the transport. Its HCI transport is named by the environment variable BT_HCI_TRANSPORT, which
+ *   launchd will not let us set in the job's plist (apollo boot 46), so this sets it:
+ *   H4:POSIX:com.sweet.bluetooth,115200 makes bluetoothd open the kernel's H4 endpoint (a stream kernel control of
+ *   that name; sweet_bt.c logs "SWEET BT: H4: connected"). Boot-arg sweetbthci=STRING overrides it, sweetbthci=0
+ *   leaves bluetoothd's environment alone.
  *
- * 1. Transport. bluetoothd's HCI transport is named by the environment variable BT_HCI_TRANSPORT,
- *    which launchd will not let us set in the job's plist (apollo boot 46), so this sets it. The
- *    value H4:POSIX:com.sweet.bluetooth,115200 makes bluetoothd open the kernel's H4 endpoint (a
- *    stream kernel control of that name, to which sweet_bt.c answers "SWEET BT: H4: connected").
- *    Boot-arg sweetbthci=STRING overrides it, sweetbthci=0 leaves bluetoothd's environment alone.
+ * BlueTool -- a stand-in. To power the controller on, bluetoothd asks BlueTool (XPC, MachService
+ *   com.apple.BlueTool) to RunBuiltinScript "boot"/"init" and waits for the reply's "result" to be 0. Apple's
+ *   BlueTool can only open Apple's own transports, never our UART ("Device not open yet"), so it fails and exits,
+ *   bluetoothd reports a firmware error (FWError) and tries again, and the controller never comes up (boots 66-73).
+ *   Both ports that got iOS Bluetooth working on Qualcomm chips replace BlueTool: the Mi 10 port
+ *   (github.com/JopangJovan/hackios-xnu-kernel-umi, umi_bluetool.c) and the Xiaomi 15 port
+ *   (github.com/superboyyy/hakios-arm64e-dada, exec_swap BlueTool). Here our constructor sends BlueTool's main() to
+ *   our own XPC responder instead (take_over_main), so Apple's code never runs and nothing on the root changes. It
+ *   answers boot/init with 0 once the controller is ready -- the registry entry "bluetooth" says SweetBluetoothReady
+ *   and com.sweet.bluetooth resolves -- as the Mi 10 port's helper does (the kernel loaded the firmware and NVM
+ *   before launchd started), with an errno otherwise; anything else gets ENOTSUP. Boot-arg sweetbtool=0 lets
+ *   Apple's BlueTool run.
  *
- * 2. The BlueTool gate. To power the controller on, bluetoothd sends RunBuiltinScript to BlueTool
- *    (XPC, MachService com.apple.BlueTool) and will not proceed until the reply's "result" is 0.
- *    BlueTool's -R boot script can only open Apple's own transports (PCIe/ACIPC), not our UART, so
- *    every command fails "Device not open yet", the script's result is non-zero, and bluetoothd
- *    relaunches BlueTool forever (boots 66-69: Settings spins). But the chip is ALREADY running
- *    (the kernel loaded the firmware), so BlueTool's boot script is redundant -- bluetoothd just
- *    needs the green light. In bluetoothd's reply handler (20H392, image offset 0x272580) the
- *    result is read with
- *        bl _xpc_dictionary_get_int64      ; 0x940fbb92
- *        mov x20, x0
- *        ...
- *        cbz x0, <success>                 ; result == 0 -> "BlueTool finished running %s script"
- *    Replacing that bl with `mov x0, #0` makes the read yield 0, so bluetoothd always takes the
- *    success branch, stores status 0, and goes on to open the H4 transport and power on. (Found by
- *    disassembling the user's 20H392 bluetoothd; boot 69 showed the earlier BlueTool-side patch was
- *    the wrong lever -- bluetoothd is the gatekeeper.) Boot-arg sweetbtpatch=0 skips the patch.
+ * Diagnostics (boot-arg sweetbtlog=1): bluetoothd's own power-on log, which goes to os_log and not to sweetnull,
+ *   mirrored to stderr (hook_os_log). Boot-arg sweetbtpatch=1: the old stopgap of boots 70-73, bluetoothd reading
+ *   every BlueTool result as 0 -- off by default now, since it would also hide "not ready yet".
  *
- * Output goes to stderr, the console log with bluetoothd in boot-arg sweetnull.
+ * Output goes to stderr, the console log with the program's name in boot-arg sweetnull.
  */
+#include <CoreFoundation/CoreFoundation.h>
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
 #include <mach-o/dyld.h>
 #include <mach-o/loader.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
 
 extern const char *getprogname(void);
 extern char ***_NSGetArgv(void);
 extern int *_NSGetArgc(void);
+
+/* The iOS SDK has no IOKit headers; the IOKitLib calls used are declared here (IOKit.framework is linked). */
+typedef mach_port_t io_object_t;
+typedef io_object_t io_service_t;
+typedef io_object_t io_registry_entry_t;
+extern CFMutableDictionaryRef IOServiceNameMatching(const char *name);
+extern io_service_t IOServiceGetMatchingService(mach_port_t mainPort, CFDictionaryRef matching);
+extern CFTypeRef IORegistryEntryCreateCFProperty(io_registry_entry_t entry, CFStringRef key, CFAllocatorRef allocator,
+    uint32_t options);
+extern kern_return_t IOObjectRelease(io_object_t object);
+
+/* Nor XPC headers: the libxpc calls used (libSystem). */
+typedef void *xpc_object_t;
+typedef xpc_object_t xpc_connection_t;
+extern const char _xpc_type_dictionary, _xpc_type_connection;
+extern const void *xpc_get_type(xpc_object_t object);
+extern xpc_connection_t xpc_connection_create_mach_service(const char *name, dispatch_queue_t queue, uint64_t flags);
+extern void xpc_connection_set_event_handler(xpc_connection_t connection, void (^handler)(xpc_object_t object));
+extern void xpc_connection_resume(xpc_connection_t connection);
+extern void xpc_connection_send_message(xpc_connection_t connection, xpc_object_t message);
+extern uid_t xpc_connection_get_euid(xpc_connection_t connection);
+extern xpc_object_t xpc_dictionary_create_reply(xpc_object_t original);
+extern xpc_object_t xpc_dictionary_get_value(xpc_object_t dictionary, const char *key);
+extern const char *xpc_dictionary_get_string(xpc_object_t dictionary, const char *key);
+extern void xpc_dictionary_set_int64(xpc_object_t dictionary, const char *key, int64_t value);
+extern void xpc_release(xpc_object_t object);
+#define SWEET_XPC_MACH_SERVICE_LISTENER 1u
+
+/* Nor the kernel-control ABI (sys/kern_control.h): what CTLIOCGINFO takes. */
+struct sweet_ctl_info {
+	uint32_t ctl_id;
+	char ctl_name[96];
+};
+#define SWEET_CTLIOCGINFO       _IOWR('N', 3, struct sweet_ctl_info)
+#define SWEET_SYSPROTO_CONTROL  2
+#ifndef AF_SYSTEM
+#define AF_SYSTEM               32
+#endif
 
 #define BT_HCI_DEFAULT  "H4:POSIX:com.sweet.bluetooth,115200"
 
@@ -137,16 +180,34 @@ main_executable(void)
 	return NULL;
 }
 
+/* Overwrite count instruction words at `at`: made writable (copied on write), then executable again. 0 or -1. */
+static int
+write_code(uint32_t *at, const uint32_t *words, unsigned count)
+{
+	uintptr_t ps = (uintptr_t)getpagesize();
+	vm_address_t page = (vm_address_t)((uintptr_t)at & ~(ps - 1));
+	vm_size_t span = (vm_size_t)((((uintptr_t)(at + count)) - page + ps - 1) & ~(ps - 1));
+	kern_return_t kr;
+
+	kr = vm_protect(mach_task_self(), page, span, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+	if (kr != KERN_SUCCESS) {
+		say("sweet-bt: vm_protect(rw) at %p failed (%d)\n", (void *)page, kr);
+		return -1;
+	}
+	for (unsigned i = 0; i < count; i++) {
+		at[i] = words[i];
+	}
+	(void)vm_protect(mach_task_self(), page, span, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+	sys_icache_invalidate(at, count * sizeof(*at));
+	return 0;
+}
+
 /* Overwrite one instruction at OFFSET (expected to be ORIG) with VALUE in the main executable. */
 static void
 patch_word(const char *who, uint32_t offset, uint32_t orig, uint32_t value)
 {
 	const struct mach_header *base = main_executable();
 	uint32_t *at;
-	vm_address_t page;
-	vm_size_t span;
-	kern_return_t kr;
-	uintptr_t ps = (uintptr_t)getpagesize();
 
 	if (base == NULL) {
 		say("sweet-bt: %s: no MH_EXECUTE image found; not patched\n", who);
@@ -158,17 +219,9 @@ patch_word(const char *who, uint32_t offset, uint32_t orig, uint32_t value)
 		    who, (void *)at, *at, orig);
 		return;
 	}
-	page = (vm_address_t)((uintptr_t)at & ~(ps - 1));
-	span = (vm_size_t)((((uintptr_t)at + sizeof(*at)) - page + ps - 1) & ~(ps - 1));
-	kr = vm_protect(mach_task_self(), page, span, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-	if (kr != KERN_SUCCESS) {
-		say("sweet-bt: %s: vm_protect(rw) at %p failed (%d); not patched\n", who, (void *)page, kr);
-		return;
+	if (write_code(at, &value, 1) == 0) {
+		say("sweet-bt: %s: patched %p (%#x -> %#x)\n", who, (void *)at, orig, value);
 	}
-	*at = value;
-	(void)vm_protect(mach_task_self(), page, span, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-	sys_icache_invalidate(at, sizeof(*at));
-	say("sweet-bt: %s: patched %p (%#x -> %#x)\n", who, (void *)at, orig, value);
 }
 
 /* Keep only power-on / transport / authorization lines, so the mirror does not flood the ring. */
@@ -182,7 +235,9 @@ keep(const char *s)
 		"fail", "Fail", "error", "Error", "radio", "Radio", "nable", "managerState",
 		/* controller-init outcome (the async power-init gate) */
 		"chip", "Chip", "latform", "anufacturer", "restart", "booting", "timed",
-		"high power", "Turning", "modification", "Unknown", "result", "Init", NULL
+		"high power", "Turning", "modification", "Unknown", "result", "Init",
+		/* the BlueTool exchange and the end of HCI initialization */
+		"BlueTool", "script", "Stack", "initializ", NULL
 	};
 
 	for (int i = 0; words[i] != NULL; i++) {
@@ -311,6 +366,155 @@ patch_bluetoothd(void)
 	patch_word("bluetoothd: BlueTool result gate", BTD_RESULT_OFFSET, BTD_RESULT_ORIG, BTD_RESULT_PATCH);
 }
 
+/*
+ * The controller is ready when the registry entry "bluetooth" says SweetBluetoothReady and the kernel control
+ * com.sweet.bluetooth resolves (sweet_bt.c sets both once the firmware runs). 0, or an errno.
+ */
+static int
+controller_ready(void)
+{
+	io_service_t service = IOServiceGetMatchingService(0, IOServiceNameMatching("bluetooth"));
+	struct sweet_ctl_info info;
+	CFTypeRef ready;
+	bool running;
+	int fd, error;
+
+	if (service == 0) {
+		return ENODEV;
+	}
+	ready = IORegistryEntryCreateCFProperty(service, CFSTR("SweetBluetoothReady"), kCFAllocatorDefault, 0);
+	IOObjectRelease(service);
+	running = ready == kCFBooleanTrue;
+	if (ready != NULL) {
+		CFRelease(ready);
+	}
+	if (!running) {
+		return EIO;
+	}
+	fd = socket(AF_SYSTEM, SOCK_STREAM, SWEET_SYSPROTO_CONTROL);
+	if (fd < 0) {
+		return errno;
+	}
+	memset(&info, 0, sizeof(info));
+	strlcpy(info.ctl_name, "com.sweet.bluetooth", sizeof(info.ctl_name));
+	error = ioctl(fd, SWEET_CTLIOCGINFO, &info) < 0 ? errno : 0;
+	close(fd);
+	return error;
+}
+
+/* One request to com.apple.BlueTool: kMsgId, and for RunBuiltinScript kMsgArgs { script }; the reply's "result". */
+static void
+bluetool_request(xpc_connection_t peer, xpc_object_t message)
+{
+	xpc_object_t reply, arguments;
+	const char *command, *script = NULL;
+	int result = ENOTSUP;
+
+	if (xpc_get_type(message) != &_xpc_type_dictionary) {
+		return;
+	}
+	reply = xpc_dictionary_create_reply(message);
+	if (reply == NULL) {
+		return;
+	}
+	command = xpc_dictionary_get_string(message, "kMsgId");
+	arguments = xpc_dictionary_get_value(message, "kMsgArgs");
+	if (arguments != NULL && xpc_get_type(arguments) == &_xpc_type_dictionary) {
+		script = xpc_dictionary_get_string(arguments, "script");
+	}
+	if (command != NULL && script != NULL && strcmp(command, "RunBuiltinScript") == 0 &&
+	    (strcmp(script, "boot") == 0 || strcmp(script, "init") == 0)) {
+		result = controller_ready();
+	}
+	say("sweet-bt: BlueTool (ours): %.48s %.48s -> result %d\n", command != NULL ? command : "(no kMsgId)",
+	    script != NULL ? script : "-", result);
+	xpc_dictionary_set_int64(reply, "result", result);
+	xpc_connection_send_message(peer, reply);
+	xpc_release(reply);
+}
+
+/* What runs instead of Apple's BlueTool main(): the com.apple.BlueTool service, answered by bluetool_request. */
+static void __attribute__((noreturn))
+bluetool_main(void)
+{
+	xpc_connection_t listener = xpc_connection_create_mach_service("com.apple.BlueTool", dispatch_get_main_queue(),
+	    SWEET_XPC_MACH_SERVICE_LISTENER);
+
+	if (listener == NULL) {
+		say("sweet-bt: BlueTool (ours): cannot check in com.apple.BlueTool\n");
+		exit(1);
+	}
+	xpc_connection_set_event_handler(listener, ^(xpc_object_t object) {
+		xpc_connection_t peer = object;
+		uid_t uid;
+
+		if (xpc_get_type(object) != &_xpc_type_connection) {
+			return;
+		}
+		uid = xpc_connection_get_euid(peer);
+		if (uid != 0 && uid != 501) {           /* bluetoothd runs as mobile */
+			return;
+		}
+		xpc_connection_set_event_handler(peer, ^(xpc_object_t message) {
+			bluetool_request(peer, message);
+		});
+		xpc_connection_resume(peer);
+	});
+	xpc_connection_resume(listener);
+	say("sweet-bt: BlueTool (ours): answering boot/init on com.apple.BlueTool; Apple's BlueTool does not run\n");
+	dispatch_main();
+}
+
+/*
+ * Have dyld's call of the program's main() land in `replacement` instead: main's first instructions become
+ * `ldr x16, <literal>; br x16` with the replacement's address as the literal, 8-aligned (a nop first when main is
+ * not). LC_MAIN names main, so this holds for any build. 0, or -1 with nothing changed.
+ */
+static int
+take_over_main(void (*replacement)(void))
+{
+	const struct mach_header_64 *header = (const struct mach_header_64 *)main_executable();
+	const uint8_t *command, *end;
+	uint64_t entry = 0;
+	uintptr_t main_address, target = (uintptr_t)replacement;
+	uint32_t code[5];
+	unsigned count = 0;
+
+	if (header == NULL || header->magic != MH_MAGIC_64) {
+		return -1;
+	}
+	command = (const uint8_t *)(header + 1);
+	end = command + header->sizeofcmds;
+	for (uint32_t i = 0; i < header->ncmds; i++) {
+		const struct load_command *lc = (const struct load_command *)(const void *)command;
+
+		if ((size_t)(end - command) < sizeof(*lc) || lc->cmdsize < sizeof(*lc) ||
+		    lc->cmdsize > (size_t)(end - command)) {
+			return -1;
+		}
+		if (lc->cmd == LC_MAIN && lc->cmdsize >= sizeof(struct entry_point_command)) {
+			entry = ((const struct entry_point_command *)(const void *)command)->entryoff;
+		}
+		command += lc->cmdsize;
+	}
+	if (entry == 0 || (entry & 3) != 0) {
+		return -1;
+	}
+	main_address = (uintptr_t)header + (uintptr_t)entry;
+	if (main_address & 4) {
+		code[count++] = 0xd503201fu;    /* nop */
+	}
+	code[count++] = 0x58000050u;            /* ldr x16, #8 */
+	code[count++] = 0xd61f0200u;            /* br x16 */
+	code[count++] = (uint32_t)target;
+	code[count++] = (uint32_t)((uint64_t)target >> 32);
+	if (write_code((uint32_t *)main_address, code, count) != 0) {
+		return -1;
+	}
+	say("sweet-bt: BlueTool: main() at %p now goes to our responder\n", (void *)main_address);
+	return 0;
+}
+
 __attribute__((constructor))
 static void
 sweet_bt_init(void)
@@ -344,21 +548,20 @@ sweet_bt_init(void)
 		if (boot_arg(arguments, "sweetbtlog", value, sizeof(value)) != NULL && strcmp(value, "1") == 0) {
 			hook_os_log(main_executable());
 		}
-		if (boot_arg(arguments, "sweetbtpatch", value, sizeof(value)) != NULL && strcmp(value, "0") == 0) {
-			say("sweet-bt: bluetoothd: sweetbtpatch=0: not patching the BlueTool gate\n");
-			return;
+		if (boot_arg(arguments, "sweetbtpatch", value, sizeof(value)) != NULL && strcmp(value, "1") == 0) {
+			patch_bluetoothd();     /* the stopgap of boots 70-73 (see the header comment) */
 		}
-		patch_bluetoothd();
 	} else if (strcmp(name, "BlueTool") == 0) {
-		/*
-		 * Not needed any more (bluetoothd ignores BlueTool's result now); kept so injecting
-		 * BlueTool is harmless and its launches stay visible in the log.
-		 */
 		char **argv = _NSGetArgv() != NULL ? *_NSGetArgv() : NULL;
 		int argc = _NSGetArgc() != NULL ? *_NSGetArgc() : 0;
 
 		for (int i = 0; argv != NULL && i < argc && argv[i] != NULL; i++) {
 			say("sweet-bt: BlueTool argv[%d]=%s\n", i, argv[i]);
+		}
+		if (boot_arg(arguments, "sweetbtool", value, sizeof(value)) != NULL && strcmp(value, "0") == 0) {
+			say("sweet-bt: BlueTool: sweetbtool=0: Apple's BlueTool runs\n");
+		} else if (take_over_main(bluetool_main) != 0) {
+			say("sweet-bt: BlueTool: could not take over main(); Apple's BlueTool runs\n");
 		}
 	}
 }
