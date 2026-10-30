@@ -111,6 +111,10 @@ adb reboot bootloader
 | `ufslogsecs=1` | Flush the log every second (for hangs) |
 | `sweettouch=0`, `sweetkeys=0` | Turn off touch or buttons |
 | `sweetcpufreq=N` | Cap the CPU clock at N MHz (0 = leave as the bootloader set it) |
+| `sweetcpugov=0` | (xnu 0153) Every CPU domain at its top for good instead of the load-following governor (default on) |
+| `sweetthermal=T` | (xnu 0153) Lower the gold/prime (and at T+5 silver) cores' top clock while the hottest core sensor is over T °C (default 75; 0 = no limit) |
+| `sweetcpustats=N` | (xnu 0153) Every N s a `SWEET CPUFREQ` line: clocks, busiest core, temperatures, memory bus (default 10; 0 = never) |
+| `sweetddr=N` / `sweetddrlow=V` | (xnu 0148/0153) Memory bus vote: 0 none, 1 top while busy and V (default 0x800) when quiet (default), 2 always top |
 | `sweetgpu=22 sweetgpukeep=1` | Bring up the GPU and keep it on for programs |
 | `sweetgpulevel=N` | The GPU's speed: 1 = 305 MHz (the default) .. 6 = 587 MHz (its top; for the UI's frame rate) |
 | `sweetddr=0` | (xnu 0148) Leave the memory bus where the boot chain put it; by default it is voted to its top (`SWEET RPMH: THE MEMORY BUS IS VOTED TO ITS TOP: a core copies N MB/s (it was M)`) |
@@ -136,7 +140,7 @@ The other boot-args are described in their drivers' sources in `xnu/patches/` an
 | Path | What |
 | --- | --- |
 | `shim/` | Boot shim, packed as an Android boot image |
-| `xnu/patches/` | The kernel patches (0001–0152), applied in order by CI |
+| `xnu/patches/` | The kernel patches (0001–0153), applied in order by CI |
 | `wifi/` | HackiOS's Linux layer for the Wi-Fi driver; CI builds Linux's ath11k on it and links it into the kernel |
 | `userland/` | Programs and libraries for the phone: GPU tests, Mesa, the CoreAnimation bridge |
 | `tools/` | Device tree builder, payload packer, iOS root builder, log and crash tools |

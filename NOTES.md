@@ -2,6 +2,18 @@
 
 ## Agent handoff / active work
 
+### >>> xnu 0153 (2026-10-30; user: "work on 2 things: 1 performance optimizations and 2nd the device overheats"): CPU governor, temperature limit, memory bus following the load <<<
+
+**Heat, from the code (not measured):** every CPU domain was pinned at its top level from boot (0095/0098 sweet_cpufreq.c: 1804 / 2419 / 2841 MHz, boot 83 log) whether busy or idle, i.e. at the top voltage; the memory bus voted to its top for good (0148); the GPU kept powered at 587 MHz (`sweetgpukeep=1 sweetgpulevel=6`, not changed here); vsync notifications went on 60 Hz with the display off.
+**xnu 0153 (`0153-apollo-cpu-governor-thermal-ddr.patch`):**
+- `osfmk/arm64/machine_routines.c`: `sweet_cpu_sample(cpu, &mpidr, &idle_abs)` = XNU's own per-processor idle time (recount_processor_usage, counts an idle period in progress, as PROCESSOR_CPU_LOAD_INFO).
+- `bsd/dev/sweet_cpufreq.c`: a governor thread (from 15 s into the boot; every 16 ms): each domain gets the level its busiest core needs (busy share x the clock it ran at x 1.5; at 75% busy or more the top at once), up at once, down after 4 samples. Temperature: TSENS0 (TM 0xc263000, status 0xa0+4n, [11:0] tenths of C signed, [21] valid; sensors 1-4 silver, 7-14 gold/prime, 15 GPU; Linux tsens-v2.c, sm8250.dtsi) read every 256 ms; over `sweetthermal` (default 75 C, 0 none) the gold and prime caps go down a step (3 at +10; silver at +5), back up a step at 5 under; never under a third of the table. Memory bus: `sweet_rpmh_ddr_set()` top while anything runs, lowered after ~1 s with every core under 25%. Stats line every `sweetcpustats` s (10): `SWEET CPUFREQ: 10 s: silver N MHz, busiest core N%; gold ...; prime ...; hottest core T C (sensor n), GPU T C; memory bus at its top N% of the time`. `sweetcpugov=0`: the old pinned top.
+- `bsd/dev/sweet_rpmh.c`: `sweet_rpmh_ddr_set(top)`: MC0/SH0 0x3fff or `sweetddrlow` (default 0x800; not 0: the boot chain's scanout votes on this DRV were replaced by 0148's, so the low vote must still carry the panel, guess at the units). `sweetddr`: 0 never, 1 following the load (default), 2 always top (0148).
+- SweetFramebuffer.cpp: no vsync notifications while the display is off and dark; a frame the GPU is still drawing is looked at again after 0.5 ms (IODelay, blocks) instead of 2 ms (boot 83: 19-103 such waits per 10 s, each able to miss a vsync).
+**Checks:** validate-repo 153 OK; the series reproduces the three series-created files; sweet_cpufreq.c compiles against stub headers (-Wall -Wextra: only the host's uint64_t/%llu mismatch).
+**Risks (guesses):** the low memory-bus vote's real bandwidth is unknown (if the panel flickers or tears when idle: `sweetddrlow=0x2000` or `sweetddr=2`); the governor could cost frames on short bursts (then `sweetcpugov=0` to compare).
+**Test:** after boot 85 (0152), the same command with 0153's kernel; grep `SWEET CPUFREQ`. Compare `SWEET FB: 10.0 s` fps with boot 83/85 and how warm the phone gets.
+
 ### >>> BOOT 84 (2026-10-30, native 360x800 pt, `sweetfb_native=1 --native-display`): red rdar status bar, Control Center off; user: "i still want what i said" -> xnu 0152 (375x834 pt) <<<
 
 **Observed (3 photos):** picture 1:1 on the whole panel; red status bar "...45025538" (no visual provider); home screen, App Library and dock laid out normally (4 columns); Control Center in a narrow column, left-aligned, without the iPhone X's top-right status area. User: "apart from the status bar something still looks off in the ui".
