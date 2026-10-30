@@ -26,7 +26,7 @@ jobs:
         id: dsc
         with:
           path: ~/dsc
-          key: dsc-iPhone10,3-20H392-v1
+          key: dsc-iPhone10.3-20H392-v1
       - name: Fetch the dyld shared cache (SystemOS cryptex of iPhone10,3 20H392)
         if: steps.dsc.outputs.cache-hit != 'true'
         run: |
