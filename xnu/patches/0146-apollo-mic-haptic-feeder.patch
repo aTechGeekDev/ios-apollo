@@ -1,0 +1,4492 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -130,6 +130,8 @@
+ bsd/dev/sweet_cs35l41.c			standard
+ bsd/dev/sweet_audio.c			standard
+ bsd/dev/sweet_guard.c			standard
++bsd/dev/sweet_mic.c			standard
++bsd/dev/sweet_haptic.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -59,6 +59,7 @@
+ extern void sweet_bt_init(void);
+ extern void apollo_audio_init(void);
+ extern void apollo_adsp_init(void);
++extern void apollo_haptic_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -678,6 +679,9 @@
+ 	 * DSP, which does nothing without boot-arg apollo_audio=N or apollo_adsp_step=N (sweet_adsp.c) */
+ 	apollo_audio_init();
+ 	apollo_adsp_init();
++	/* the vibration motor (xnu 0146, sweet_haptic.c): nothing without boot-arg apollo_haptic=N; the microphone (sweet_mic.c)
++	 * starts with the DSP's audio services, with apollo_mic=N */
++	apollo_haptic_init();
+ 	return 0;
+ }
+ 
+--- a/bsd/dev/sweet_audio_glue.c
++++ b/bsd/dev/sweet_audio_glue.c
+@@ -3,12 +3,14 @@
+  * sweet_cs35l41.c, sweet_audio.c, sweet_guard.c; xnu 0139) take from the rest of HakiOS, for this kernel:
+  *   - HakiOS's loader, which keeps a log of its own, to which a run can return, and which hands a
+  *     recording of the sound to the host: none here (nothing, nothing, and no recording)
+- *   - the loader's RAM image of files: none; the amplifiers' firmware (apollo_amps_dsp=N) is read from
+- *     /usr/local/fw/ on the root instead. (The DSP's own image is read from there by sweet_adsp.c itself,
+- *     and given back once written: this answers only for the amplifiers' files.)
++ *   - the loader's RAM image of files: none; the amplifiers' firmware (apollo_amps_dsp=N) and the vibration
++ *     motor's waveforms (xnu 0146, sweet_haptic.c: aw8697_haptic.bin) are read from /usr/local/fw/ on the
++ *     root instead. (The DSP's own image is read from there by sweet_adsp.c itself, and given back once
++ *     written; the microphone's files through it too: this answers only for the amplifiers and the motor.)
+  *   - the GCC vote register shared by their drivers (apollo_gcc_vote, hakios.apollo_cpufreq.c there)
++ *   - an RPMh bus vote (apollo_rpmh_bcm_vote, hakios.apollo_cpufreq.c there; the motor's I2C engine): sweet_rpmh.c's
+  *   - the battery manager's reports (apollo_battmgr=1): said, not passed on (SweetBattery reads the gauge)
+- *   - the microphones' path (hakios.apollo_mic.c): not ported yet
++ *   - the microphones' path: sweet_mic.c (xnu 0146)
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -24,6 +26,9 @@
+ void loader_log_putc(char c);
+ void loader_return(void);
+ const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
++bool apollo_rpmh_bcm_vote(const char *name, uint32_t ab, uint32_t ib);
++void apollo_cmd_db_dump(void);
++int sweet_rpmh_bcm_vote(const char *name, uint32_t ab, uint32_t ib);
+ uint64_t loader_sound[3];
+ 
+ static LCK_GRP_DECLARE(sweet_audio_lock_group, "sweet-audio");
+@@ -39,7 +44,7 @@
+ {
+ }
+ 
+-/* The amplifiers' files: /usr/local/DIR/NAME read whole, kept (they are small, and read once). */
++/* The amplifiers' and the motor's files: /usr/local/DIR/NAME read whole, kept (they are small, and read once). */
+ const uint8_t *
+ hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out)
+ {
+@@ -53,7 +58,7 @@
+ 	if (disk_out != NULL) {
+ 		*disk_out = 0;
+ 	}
+-	if (strncmp(name, "cs35l41", 7) != 0 || rootvnode == NULLVP) {
++	if ((strncmp(name, "cs35l41", 7) != 0 && strncmp(name, "aw8697", 6) != 0) || rootvnode == NULLVP) {
+ 		return NULL;                    /* (the DSP's image: sweet_adsp.c reads it, and gives it back) */
+ 	}
+ 	snprintf(path, sizeof(path), "/usr/local/%s/%s", dir, name);
+@@ -106,18 +111,16 @@
+ 	}
+ }
+ 
+-void
+-apollo_mic_dsp_up(void)
+-{
+-}
+-
+-void
+-apollo_mic_dsp_down(void)
++/* A vote for an RPMh bus clock manager by its cmd-db name: sweet_rpmh.c sends it, taking turns with its other requests. */
++bool
++apollo_rpmh_bcm_vote(const char *name, uint32_t ab, uint32_t ib)
+ {
++	return sweet_rpmh_bcm_vote(name, ab, ib) == 0;
+ }
+ 
++/* (theirs prints every cmd-db name when a vote is refused; sweet_rpmh.c has said what it found already) */
+ void
+-apollo_mic_quiesce(void)
++apollo_cmd_db_dump(void)
+ {
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -9,6 +9,10 @@
+  * github.com/JopangJovan/hackios-xnu-kernel-umi (umi_rpmh.c, APSL 2.0): its
+  * firmware leaves AMC_EN set on an idle empty ACTIVE TCS and repeats some
+  * VRM entries across cmd-db slave headers, and SMPS rails keep their mode.
++ *
++ * (xnu 0146) Also one bus clock manager (BCM) vote, sweet_rpmh_bcm_vote(), through the same
++ * request path: the QUP wrappers' core clocks ("QUP0") for the vibration motor's I2C engine
++ * (sweet_haptic.c, after hakios-apollo's apollo_rpmh_bcm_vote() in hakios.apollo_cpufreq.c).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -21,6 +25,7 @@
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ int sweet_rpmh_wifi_power(void);
+ int sweet_rpmh_bt_power(void);
++int sweet_rpmh_bcm_vote(const char *name, uint32_t ab, uint32_t ib);
+ void sweet_rpmh_hold(bool hold);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+@@ -55,6 +60,9 @@
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
+ #define RH_VRM          4u
++#define RH_BCM          5u
++/* a BCM's vote: commit, valid, AB (vote x) and IB (vote y), 14 bits each (Linux bcm-voter.h BCM_TCS_CMD) */
++#define RH_BCM_VOTE(ab, ib)     ((1u << 30) | (1u << 29) | ((ab) & 0x3fffu) << 14 | ((ib) & 0x3fffu))
+ #define RH_TIMEOUT_US   100000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_db;
+@@ -166,8 +174,9 @@
+ 	return 0;
+ }
+ 
++/* RES's address in cmd-db: a VRM (regulator) or, with kind RH_BCM, a bus clock manager */
+ static int
+-rh_lookup(const char *res, uint32_t *address)
++rh_lookup_kind(const char *res, uint32_t *address, unsigned kind)
+ {
+ 	uint32_t key[2] = {0, 0};
+ 	for (unsigned i = 0; i < 8 && res[i]; ++i) {
+@@ -194,9 +203,9 @@
+ 				continue;
+ 			}
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
++			if (slave != kind || (addr >> 16) != kind || (addr & (kind == RH_VRM ? 15u : 3u)) ||
+ 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
++				printf("SWEET RPMH: invalid %s entry for %s\n", kind == RH_VRM ? "VRM" : "BCM", res);
+ 				return EINVAL;
+ 			}
+ 			/* Repeated across slave headers: harmless only for the same register. */
+@@ -218,6 +227,12 @@
+ 	return 0;
+ }
+ 
++static int
++rh_lookup(const char *res, uint32_t *address)
++{
++	return rh_lookup_kind(res, address, RH_VRM);
++}
++
+ static bool
+ rh_free(unsigned t)
+ {
+@@ -263,8 +278,13 @@
+ 	}
+ }
+ 
++/*
++ * COMMANDS writes (ADDRESS + offsets[c] <- values[c]) in one free ACTIVE TCS, waited for. MATCH masks the low
++ * bits off when an inherited request is compared with ADDRESS (a VRM's are its 16 bytes, a BCM's its 4).
++ */
+ static int
+-rh_send(uint32_t address, unsigned mv, bool ldo_mode)
++rh_send_cmds(uint32_t address, uint32_t match, const uint32_t *offsets, const uint32_t *values, unsigned commands,
++    const char *what)
+ {
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+@@ -278,8 +298,8 @@
+ 		}
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+ 			if ((enabled & (1u << c)) &&
+-			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited VRM request in TCS%u\n", t);
++			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~match) == address) {
++				printf("SWEET RPMH: conflicting inherited request in TCS%u\n", t);
+ 				return EBUSY;
+ 			}
+ 		}
+@@ -312,12 +332,8 @@
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+-	/* A PMIC5 LDO gets HPM (raw 7) before enable; SMPS rails keep their mode. */
+-	const uint32_t offsets[3] = {0, ldo_mode ? 8u : 4u, 4};
+-	const uint32_t values[3] = {mv, ldo_mode ? 7u : 1u, 1};
+-	const unsigned commands = ldo_mode ? 3 : 2;
+ 	const uint32_t command_mask = (1u << commands) - 1;
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV%s enable=1 irq-enable=%#x\n", t, mv, ldo_mode ? " mode=7" : "", irq_en);
++	printf("SWEET RPMH: TCS%u ACTIVE %s irq-enable=%#x\n", t, what, irq_en);
+ 	for (unsigned c = 0; c < commands; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+@@ -368,10 +384,22 @@
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: ACTIVE vote complete (requires hardware verification)\n");
+ 	return 0;
+ }
+ 
++static int
++rh_send(uint32_t address, unsigned mv, bool ldo_mode)
++{
++	/* A PMIC5 LDO gets HPM (raw 7) before enable; SMPS rails keep their mode. */
++	const uint32_t offsets[3] = {0, ldo_mode ? 8u : 4u, 4};
++	const uint32_t values[3] = {mv, ldo_mode ? 7u : 1u, 1};
++	char what[48];
++
++	snprintf(what, sizeof(what), "%u mV%s enable=1", mv, ldo_mode ? " mode=7" : "");
++	return rh_send_cmds(address, 15u, offsets, values, ldo_mode ? 3 : 2, what);
++}
++
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+@@ -485,5 +513,40 @@
+ 	}
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
++}
++
++/*
++ * (xnu 0146) One vote for a bus clock manager, by its cmd-db name (e.g. "QUP0", the QUP wrappers' core
++ * clocks, for sweet_haptic.c's I2C engine): AB and IB in the BCM's units, ACTIVE, held until reset.
++ */
++int
++sweet_rpmh_bcm_vote(const char *name, uint32_t ab, uint32_t ib)
++{
++	static const uint32_t offsets[1] = {0};
++	uint32_t values[1] = {RH_BCM_VOTE(ab, ib)};
++	uint32_t address = 0;
++	char what[48];
++	if (!name || !rh_take()) {
++		return EBUSY;
++	}
++	int error = EIO;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup_kind(name, &address, RH_BCM);
++	}
++	if (!error) {
++		snprintf(what, sizeof(what), "BCM %.8s ab=%u ib=%u", name, ab, ib);
++		error = rh_send_cmds(address, 3u, offsets, values, 1, what);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: BCM %s vote failed errno=%d\n", name, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_sound.c
++++ b/bsd/dev/sweet_sound.c
+@@ -1,6 +1,8 @@
+ /* apollo (xnu 0139): the speakers' path through the audio DSP (tertiary TDM) -- the Mi 10T port github.com/enesuzun2002/hakios-apollo (HackiOS for apollo; devices/mi-10t/xnu/files/bsd/dev/hakios.apollo_sound.c; APSL 2.0), on which
+  * it plays iOS's sound through this phone's speakers. Its warnings are not looked at (as with SweetWLAN.cpp).
+- * Changed here, each marked "apollo:": the includes (this tree's headers beside it in bsd/dev).
++ * Changed here, each marked "apollo:": the includes (this tree's headers beside it in bsd/dev); (xnu 0146) the feeder holds a
++ * period the DSP gives back until iOS has written a whole one, instead of padding it with silence (the speakers' stutter),
++ * and says how it keeps up (apollo_sound_hold=N).
+  */
+ #pragma clang diagnostic ignored "-Weverything"
+ /*
+@@ -1098,12 +1100,36 @@
+ static uint64_t fed_frames, silent_frames, ios_frames;
+ static volatile uint32_t ios_peak;              /* the largest sample since the amplifiers last started */
+ 
++/*
++ * apollo (xnu 0146): the speakers stuttered. A period the DSP gave back was filled at once with what the ring held and
++ * the rest padded with silence; but iOS writes in bursts, one per cycle of its audio server (10 to 21 ms of sound), and
++ * the ring holds little between them, so whenever a burst came just after a period came back, silence was put into the
++ * middle of the sound -- the more often, the busier the processors (late bursts). Now, while iOS is writing, a period
++ * that comes back is held until the ring has a whole period's frames, as long as more than hold_low periods are still
++ * queued at the DSP (boot-arg apollo_sound_hold=N, default 3: 60 ms; 0 = filled at once, as before). The queue stays
++ * 7 or 8 periods deep while iOS writes, so a burst may come up to about 80 ms late without a gap, and nothing is
++ * added to the delay. When iOS stops writing (200 ms without a write) the periods are filled with silence again at once,
++ * so the next sound starts with the queue full, as before. What the feeder had to pad while iOS wrote, how low the
++ * queue went and how far apart iOS's writes came are said with the guard's report (every 5 s while the amplifiers are on).
++ */
++static uint32_t hold_low = 3;
++#define HOLD_WRITING_US         200000ull       /* iOS is writing: its latest write less than 200 ms ago */
++static volatile uint64_t last_write_us;         /* when iOS's latest write came, silence or not */
++static volatile uint32_t write_gap_most_us;     /* the most time between two of iOS's writes (under a second) since the report */
++static uint32_t fed_periods, short_periods, short_frames, least_queued = PERIODS, most_ring, held_most_us;
++
+ /* From the writer's thread, under hakios.audio.c's lock: never waits. */
+ static uint32_t
+ ios_sink(const int16_t *frames, uint32_t count)
+ {
+ 	uint32_t head = ring_head, room = RING_FRAMES - (head - ring_tail), taken = count < room ? count : room;
+ 	bool sound = false;
++	uint64_t now = now_us(), gap = now - last_write_us;
++
++	if (last_write_us != 0 && gap < 1000000 && gap > write_gap_most_us) {
++		write_gap_most_us = (uint32_t)gap;      /* apollo: (xnu 0146) how far apart iOS's writes come */
++	}
++	last_write_us = now;
+ 
+ 	for (uint32_t i = 0; i < taken; i++) {
+ 		int16_t left = frames[2 * i], right = frames[2 * i + 1];
+@@ -1120,7 +1146,7 @@
+ 	ring_head = head + taken;
+ 	ios_frames += taken;
+ 	if (sound) {
+-		last_sound_us = now_us();
++		last_sound_us = now;
+ 	}
+ 	return taken;
+ }
+@@ -1157,8 +1183,8 @@
+ 	    db_text(t[5], apollo_guard_decibels(r.slow)));
+ }
+ 
+-/* A period from the ring, the rest of it silence. */
+-static void
++/* A period from the ring, the rest of it silence; how many frames came from the ring. */
++static uint32_t
+ period_fill_ios(unsigned period)
+ {
+ 	int16_t *samples = (int16_t *)(buffer + 4096 * period);
+@@ -1184,46 +1210,113 @@
+ 		__asm__ volatile ("dc cvac, %0" : : "r" (line));
+ 	}
+ 	__asm__ volatile ("dsb sy");
++	return n;
++}
++
++/* apollo: (xnu 0146) how the feeder kept up since it was last said, as one line (with the guard's); nothing if `quiet'. */
++static void
++feeder_say(const char *when, bool quiet)
++{
++	uint32_t gap = write_gap_most_us;
++
++	if (!quiet && fed_periods != 0) {
++		say("apollo sound: the feeder%s: %u periods, %u of them short while iOS wrote (%u ms of silence put in); the DSP's queue "
++		    "at least %u of %u periods; the ring at most %u frames; a period held %u ms at most; iOS's writes %u ms apart at "
++		    "most; %u DSP underflows so far\n", when, fed_periods, short_periods, short_frames / 48, least_queued, PERIODS,
++		    most_ring, held_most_us / 1000, gap / 1000, underflows);
++	}
++	fed_periods = short_periods = short_frames = most_ring = held_most_us = 0;
++	least_queued = PERIODS;
++	write_gap_most_us = 0;
+ }
+ 
+ static void
+ feeder_thread(__unused void *parameter, __unused wait_result_t result)
+ {
+ 	uint32_t sent = 0, failed = 0;
++	uint32_t at_dsp = 0, held = 0;          /* apollo: (xnu 0146) the periods queued at the DSP, and those given back and held */
++	uint64_t held_since[PERIODS];
+ 
+ 	returned = 0;
+ 	for (unsigned p = 0; p < PERIODS; p++) {
+ 		period_fill_ios(p);
+-		sent += period_write(p);
++		if (period_write(p)) {
++			sent++;
++			at_dsp |= 1u << p;
++		}
+ 	}
+ 	while (!stopping) {
+ 		uint32_t back = returned;
+ 		static bool was_on;
++		uint64_t now;
++		bool writing;
+ 
+ 		if (guard_on && !was_on) {
+ 			guard_say("", true);    /* (what it did to the silence meanwhile is of no interest) */
++			feeder_say("", true);
+ 			guard_periods = 0;
+ 		} else if (was_on && !guard_on) {
+ 			guard_say(" until the amplifiers stopped", false);
++			feeder_say(" until the amplifiers stopped", false);
+ 		} else if (guard_on && guard_periods >= 250) {
+ 			guard_say(", 5 s", false);
++			feeder_say(", 5 s", false);
+ 			guard_periods = 0;
+ 		}
+ 		was_on = guard_on;
++		now = now_us();
+ 		if (back != 0) {
+ 			OSBitAndAtomic(~back, &returned);
++			at_dsp &= ~back;
++			held |= back;
+ 			for (unsigned p = 0; p < PERIODS; p++) {
+ 				if (back & 1u << p) {
+-					period_fill_ios(p);
+-					if (period_write(p)) {
+-						sent++;
+-					} else {
+-						failed++;
+-					}
++					held_since[p] = now;
+ 				}
+ 			}
+ 		}
+-		sleep_ms(2);
++		/*
++		 * apollo: (xnu 0146) each period given back is filled once iOS has written a whole period's frames; while iOS
++		 * writes and more than hold_low periods are still queued at the DSP it is held for that, else filled with what
++		 * there is (and silence) at once
++		 */
++		writing = last_write_us != 0 && now - last_write_us < HOLD_WRITING_US;
++		for (unsigned p = 0; held != 0 && p < PERIODS; p++) {
++			uint32_t available = ring_head - ring_tail, n;
++
++			if (!(held & 1u << p)) {
++				continue;
++			}
++			if (available > most_ring) {
++				most_ring = available;
++			}
++			if (available < PERIOD_FRAMES && writing && hold_low != 0 &&
++			    (uint32_t)__builtin_popcount(at_dsp) > hold_low) {
++				break;
++			}
++			n = period_fill_ios(p);
++			held &= ~(1u << p);
++			if (now - held_since[p] > held_most_us) {
++				held_most_us = (uint32_t)(now - held_since[p]);
++			}
++			if (writing) {
++				fed_periods++;
++				if (n < PERIOD_FRAMES) {
++					short_periods++;
++					short_frames += PERIOD_FRAMES - n;
++				}
++			}
++			if (period_write(p)) {
++				sent++;
++				at_dsp |= 1u << p;
++			} else {
++				failed++;
++			}
++		}
++		if (writing && (uint32_t)__builtin_popcount(at_dsp) < least_queued) {
++			least_queued = (uint32_t)__builtin_popcount(at_dsp);
++		}
++		sleep_ms(held != 0 ? 1 : 2);
+ 	}
+ 	say("apollo sound: the feeder stops: %u periods written (%u could not be sent), %u given back (%u with an error), %u underflows; "
+ 	    "from iOS %llu frames came, %llu went to the DSP, %llu of silence filled in\n", sent, failed, written_done, write_errors,
+@@ -1467,6 +1560,13 @@
+ 		    below / 8, below % 8 * 125);
+ 		say("apollo sound: through the guard (hakios.guard.c): %u.%03u dB of gain first (sound_gain), then high-pass at 200 Hz; peaks "
+ 		    "3 dB, the 0.2 s/3 s/60 s power 6/9/12 dB under full scale at Android's level\n", gain / 8, gain % 8 * 125);
++		/* apollo: (xnu 0146) */
++		if (hold_low != 0) {
++			say("apollo sound: while iOS writes, a period the DSP gives back waits for a whole period of its sound as long as "
++			    "more than %u are still queued (apollo_sound_hold)\n", hold_low);
++		} else {
++			say("apollo sound: apollo_sound_hold=0: each period is filled at once, short ones with silence\n");
++		}
+ 		if (guard_as < below) {
+ 			say("apollo sound: sound_guard_as=%u: FOR A TEST the guard reckons the amplifiers %u.%03u dB under Android's level, louder "
+ 			    "than they are, and holds back as much as it would there\n", guard_as, guard_as / 8, guard_as % 8 * 125);
+@@ -1524,6 +1624,10 @@
+ 	PE_parse_boot_argn("apollo_sound_pause", &pause_ms, sizeof(pause_ms));
+ 	PE_parse_boot_argn("apollo_sound_guard_as", &guard_as, sizeof(guard_as));
+ 	PE_parse_boot_argn("apollo_sound_gain", &gain, sizeof(gain));
++	PE_parse_boot_argn("apollo_sound_hold", &hold_low, sizeof(hold_low));    /* apollo: (xnu 0146) see feeder_thread() */
++	if (hold_low >= PERIODS) {
++		hold_low = PERIODS - 1;
++	}
+ 	if (gain > APOLLO_GUARD_MAX_GAIN) {
+ 		gain = APOLLO_GUARD_MAX_GAIN;
+ 	}
+--- /dev/null
++++ b/bsd/dev/sweet_mic.c
+@@ -0,0 +1,2654 @@
++/* apollo (xnu 0146): the main microphone (the WCD938x codec over SoundWire, through the audio DSP) -- the Mi 10T port
++ * github.com/enesuzun2002/hakios-apollo (HackiOS for apollo; devices/mi-10t/xnu/files/bsd/dev/hakios.apollo_mic.c; APSL 2.0), with
++ * which iOS records from this phone's microphones. Its warnings are not looked at (as with SweetWLAN.cpp). Changed here, each
++ * marked "apollo:": the includes (this tree's headers beside it in bsd/dev); Xiaomi's ACDB data (apollo_mic_path=1) is read from
++ * /usr/local/fw/ on the root (sweet_adsp.c's apollo_adsp_fw_file()), put there by tools/pull-mic-haptic-fw.sh's list.
++ */
++#pragma clang diagnostic ignored "-Weverything"
++/*
++ * The Xiaomi Mi 10T's (apollo) main microphone, through the audio DSP. A copy of bsd/dev/hakios.mic.c (the POCO X5
++ * Pro's, brought up on that phone), kept apart from it, with apollo's numbers: from Android's own live device tree
++ * (the legacy APR stack's bolero-cdc under /soc/qcom,msm-audio-apr/qcom,q6core-audio), Xiaomi's mixer paths
++ * (.device-local/apollo/audio/) and Xiaomi's kernel (apollo-q-oss, kernel-apollo/: techpack/audio at LA.UM.8.12:
++ * asoc/codecs/bolero/, asoc/codecs/wcd938x/, soc/swr-mstr-ctrl.c, soc/pinctrl-lpi.c, dsp/q6afe.c,
++ * asoc/codecs/audio-ext-clk-up.c, asoc/kona.c, asoc/kona-port-config.h; drivers/pinctrl/qcom/pinctrl-kona.c;
++ * arch/arm64/boot/dts/venor/qcom/kona-lpi.dtsi, kona-pinctrl.dtsi). Nothing here happens unless boot-arg
++ * apollo_mic=N asks for it, with apollo_audio=N (hakios.apollo_adsp.c), which calls apollo_mic_dsp_up() once the
++ * DSP's audio services are up. (The POCO's driver needs boot-arg mic=, which apollo never sets: the two never run
++ * together, and /dev/hakios-mic is this one's on apollo.)
++ *
++ * What differs from the POCO, and why it matters here:
++ *   - the digital codec, "bolero", is 1.x on kona (bolero-cdc.c gives it 1.2 for its four macros, unless the VA
++ *     macro's core ID says 2.1): no SoundWire mic clock dividers anywhere (va_macro_init() and the TX macro's
++ *     SWR_MIC_CTL writes are 2.0/2.1 only), the "TX SMIC MUX" inputs are ADC0..3 and SWR_DMIC0..7 (smic_mux_text),
++ *     and every register access of a 1.x macro is made under the macro's clock (__bolero_reg_read()), which for
++ *     the TX and the VA macro is TX_CORE_CLK (the tree's va-macro qcom,default-clk-id 0)
++ *   - the TX SoundWire master is version 1.5.1 (the tree's qcom,swr-master-version 0x1050001): it has no HCTL
++ *     workaround (that is >= 1.6, and the POCO's 0x32a90a8 is not touched here), its link status is not looked at
++ *     (swrm_check_link_status() returns true at once for <= 1.5.1), and -- what matters most -- every access to its
++ *     registers is made with the TX macro's SoundWire clock running (is_swr_clk_needed(): <= 1.5.1, so
++ *     swrm_ahb_read()/swrm_ahb_write() call swrm_clk_request() around each access). apollo_mic=1 therefore reads
++ *     the master only if that clock is found running already; apollo_mic=2 reads it once the clock is started
++ *   - the frame and the ports are kona's own: swr-mstr-ctrl.c of this techpack copies the master's port tables to
++ *     the codec's ports as they are (no table of the devices' own), from kona-port-config.h's
++ *     tx_frame_params_default (asoc/kona.c gives sm_port_map to this phone: no wcd937x, no lito v2, not the
++ *     "xrfusionult" card)
++ *   - the codec's reset is TLMM GPIO 32 on the south tile, the pins are LPI GPIOs 0, 1 and 2 only
++ *
++ * The main microphone under Android (Xiaomi's "voice-rec-mic" path, which a one-channel recording uses, with
++ * "audio-record" = MultiMedia1 <- TX_CDC_DMA_TX_3): the analog microphone at ADC1 of the WCD938x codec ("AMIC1",
++ * biased by "MIC BIAS1": the tree's qcom,audio-routing), whose samples go over SoundWire (the TX master of bolero)
++ * into decimator 0 of the TX macro ("TX DEC0 MUX" SWR_MIC, "TX SMIC MUX0" ADC0: bolero's ADC0 is the codec's ADC1,
++ * "TX SWR_ADC0" <- "ADC1_OUTPUT" in the tree's routing), out of it through the codec DMA interface
++ * TX_CDC_DMA_TX_3, the AFE's port, into a stream that is read (ASM). Decimator 0, not 1: "voice-rec-mic" is
++ * Xiaomi's one-channel recording from ADC1 alone and uses DEC0 (its "handset-mic" puts ADC1 on DEC1 only because
++ * DEC0 carries the second microphone, ADC4, there); with DEC0 the port's one channel is its first (mask 1), and
++ * DEC0 is also the one decimator tx_macro_init() sets up (tx_macro_reg_init: TX0_TX_PATH_SEC7). Before any of it:
++ * the LPASS's own clocks, which the DSP gives out (Android's audio-ref-clk nodes):
++ *   lpass_core_hw_vote   AFE_CMD_REMOTE_LPASS_CORE_HW_VOTE_REQUEST, block 3 ("LPASS_HW_MACRO"): the tree's
++ *                        vote_lpass_core_hw, qcom,codec-ext-clk-src 9 = AUDIO_EXT_CLK_LPASS_CORE_HW_VOTE, which
++ *                        lpass_hw_vote_prepare() (audio-ext-clk-up.c) votes as AFE_LPASS_CORE_HW_MACRO_BLOCK
++ *                        (q6afe-v2.h: NONE 0, RSVD 1, AVTIMER 2, MACRO 3, DCODEC 4)
++ *   lpass_audio_hw_vote  the same, block 4 ("LPASS_HW_DCODEC"): ext-clk-src 11 = AUDIO_EXT_CLK_LPASS_AUDIO_HW_VOTE
++ *   tx_core_clk          AFE clock 0x30c at 19.2 MHz (the tree's tx_core_clk: qcom,codec-lpass-clk-id, -ext-clk-freq)
++ *   tx_npl_clk           AFE clock 0x30d at 19.2 MHz (bolero_clk_rsc_mux0_clk_request() starts the NPL clock with
++ *                        the core one). (The VA macro's own va_core 0x30b and va_npl 0x310 are not asked for:
++ *                        the TX path's clock request is TX_CORE_CLK for TX_CORE_CLK, tx_macro_mclk_enable().)
++ * Without them the macros' registers are not to be touched at all: an access to a block without its clock may
++ * hang the bus.
++ *
++ *   apollo_mic=1  a look: the votes and the two clocks asked for, then -- only if all four were given -- the
++ *                 registers of the TX and VA macros, of the LPASS pins the master uses (and their slew rates)
++ *                 and of the codec's reset pin read (nothing written to any of them); the TX SoundWire master's
++ *                 too, but only if the TX macro's SoundWire clock is found running (see above); then the clocks
++ *                 and the votes given back
++ *   apollo_mic=2  ... and the codec brought up far enough to answer on SoundWire, nothing of it set: its supplies
++ *                 as the boot chain leaves them (PM8150 S4, 1.8 V, always on, and the PM8150A's BoB for the mic
++ *                 bias: nothing of the PMICs is touched), its reset released (GPIO 32 low 20 us, then high, 16 mA:
++ *                 wcd938x_reset() with msm-cdc-pinctrl's two states), the master's pins to their active state
++ *                 (LPASS GPIOs 0, 1, 2: function 1, 2 mA, slew rate 1; the clock without a pull, the data with a
++ *                 keeper), the TX macro's clocks as tx_macro_tx_va_mclk_enable() starts them (bolero's
++ *                 "fs-gen-sequence" in the VA macro, FREQ_MCLK, MCLK_CONTROL, FS_CNT_CONTROL, the SoundWire clock
++ *                 with a reset), the master started as swrm_runtime_resume() and swrm_master_init() start it (the
++ *                 frame 50 rows x 2 columns, auto-enumeration, its interrupts' masks), the codec's TX device waited
++ *                 for (ID 0x000d01170223, the tree's wcd938x-tx-slave) and its chip ID read over SoundWire. Then
++ *                 all of it undone, in reverse: the codec back in reset, the pins and registers as they were found
++ *   apollo_mic=3  ... and the main microphone listened to for apollo_mic_secs seconds (default 10, at most 600)
++ *                 the way Android records from it: the codec set up as wcd938x_bind() and wcd938x_init_reg() set
++ *                 it up (its interrupts as edges, the mic biases' 2750 mV, its bias and sleep registers); the
++ *                 DSP's side (a stream read through our memory, ASM session 2; a device path for recording, ADM;
++ *                 the codec DMA port TX_CDC_DMA_TX_3, AFE port 0xB037, 48 kHz, 16 bits, one channel: decimator
++ *                 0); the TX macro's decimator 0 fed from ADC0 ("TX SMIC MUX0" ADC0, "TX DEC0 MUX" SWR_MIC,
++ *                 "TX_DEC0 Volume" 87, and tx_macro_enable_dec()); "MIC BIAS1" and ADC1 in its default ("normal")
++ *                 mode -- Xiaomi's paths set no "TX0 MODE" -- with "ADC1 Volume" 12 (Xiaomi's "voice-rec-mic");
++ *                 the SoundWire port as kona's tables have it (see datapath_on()); then the decimator unmuted after
++ *                 100 ms and its filter settled after 300 ms, as tx-macro's delayed work does. Each second's level
++ *                 goes to the log. Every register write is read back (the few whose reading back is not known on
++ *                 this phone are said so, with what they read); any mismatch or a DSP command refused stops it
++ *                 all. Tests: apollo_mic_input=0 (decimator 0 fed from ZERO: exact silence), apollo_mic_adc=0 (ADC1
++ *                 left off), apollo_mic_test=1 (no mic bias), apollo_mic_test=2 (ADC1's input held)
++ *   apollo_mic=4  the main microphone for iOS: /dev/hakios-mic, with the POCO's contract (see below)
++ *
++ * What apollo_mic=3 and 4 record is apollo_mic_path=N (see port_config()'s comment): 1, the default, Android's
++ * ordinary recording -- Xiaomi's "handset-mic", both microphones (the main one, ADC1, on decimator 1; the top
++ * one, ADC4 through "ADC4 MUX" INP5 with "MIC BIAS4", on decimator 0), the port's two channels, and Xiaomi's
++ * topology 0x10010315 with its ACDB calibration in the device path; the one channel iOS gets is made here
++ * (apollo_mic_mix: 0 the average, 1 the main microphone, 2 the top one). 0: the "voice-rec-mic" path described
++ * above (ADC1 alone, decimator 0, no processing), as first brought up; path 1 falls back to it if any of it fails.
++ *
++ * What is asked for is given back at the end, and before the DSP is shut down (apollo_mic_dsp_down()).
++ */
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <libkern/OSAtomic.h>
++#include <kern/kalloc.h>
++#include <mach/mach_types.h>
++#include <miscfs/devfs/devfs.h>
++#include <pexpert/pexpert.h>
++#include <sys/conf.h>
++#include "hakios.apollo_input.h"   /* apollo: this tree's, beside it */
++#include <sys/systm.h>
++#include <sys/uio.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t thread_terminate(thread_t thread);
++extern void loader_log_putc(char c);
++
++static LCK_GRP_DECLARE(apollo_mic_lock_group, "apollo-mic");
++static LCK_MTX_DECLARE(mic_lock, &apollo_mic_lock_group);      /* what is asked for, and given back */
++
++static uint32_t level;
++static bool running;
++
++static int say(const char *format, ...) __printflike(1, 2);
++
++/*
++ * Every line is kept as well, and all of them said again at the run's end (apollo_mic_quiesce()):
++ * the log of a run keeps its beginning and its end, and this happens in between.
++ */
++#define KEPT_LINES              400
++static char kept[KEPT_LINES][168];
++static unsigned kept_count;
++
++static int
++say(const char *format, ...)
++{
++	char line[400];
++	va_list list;
++	int length;
++
++	va_start(list, format);
++	length = vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	for (const char *c = line; *c != 0; c++) {
++		loader_log_putc(*c);
++	}
++	printf("%s", line);
++	strlcpy(kept[kept_count++ % KEPT_LINES], line, sizeof(kept[0]));
++	return length;
++}
++
++/* A line that says all went as it should: not said again in iOS's later recordings (apollo_mic=4), where it is the same each time. */
++static bool quiet;
++#define note(...)       do { if (!quiet) { say(__VA_ARGS__); } } while (0)
++
++static void
++sleep_ms(uint32_t ms)
++{
++	delay_for_interval(ms, NSEC_PER_MSEC);
++}
++
++static uint32_t __attribute__((noinline))
++rd(vm_offset_t address)
++{
++	uint32_t value;
++
++	__asm__ volatile ("ldr %w0, [%1]" : "=r" (value) : "r" (address) : "memory");
++	return value;
++}
++
++static void __attribute__((noinline))
++wr(vm_offset_t address, uint32_t value)
++{
++	__asm__ volatile ("str %w0, [%1]" : : "r" (value), "r" (address) : "memory");
++}
++
++static void
++spin_us(uint32_t us)
++{
++	uint64_t until;
++
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &until);
++	until += mach_absolute_time();
++	while (mach_absolute_time() < until) {
++	}
++}
++
++static bool broken;                     /* a write that did not read back: nothing more is written, all is undone */
++static char last_write[120] = "nothing written";
++
++struct block {
++	const char *name;
++	uint32_t phys, size;
++	vm_offset_t base;
++};
++
++static uint32_t
++get(struct block *b, const char *name, uint32_t offset)
++{
++	uint32_t value;
++
++	if (b->base == 0) {
++		b->base = ml_io_map(b->phys, b->size);
++	}
++	value = rd(b->base + offset);
++	note("apollo mic: %s %s (%#x) = %#x\n", b->name, name, b->phys + offset, value);
++	return value;
++}
++
++/*
++ * A register written (and read back, unless `check' is 0: some bits clear themselves, and a few registers
++ * are not known to read back on this phone -- what they read is said). A write that does not read back as
++ * written (in the bits of `check') stops the bring-up.
++ */
++static bool
++put(struct block *b, const char *name, uint32_t offset, uint32_t value, uint32_t check)
++{
++	uint32_t back;
++
++	if (broken) {
++		return false;
++	}
++	if (b->base == 0) {
++		b->base = ml_io_map(b->phys, b->size);
++	}
++	snprintf(last_write, sizeof(last_write), "%#x to %s %s (%#x)", value, b->name, name, b->phys + offset);
++	wr(b->base + offset, value);
++	back = rd(b->base + offset);
++	if ((back & check) != (value & check)) {
++		say("apollo mic: %s %s (%#x) <- %#x, but it reads %#x: STOPPING HERE\n", b->name, name, b->phys + offset, value,
++		    back);
++		broken = true;
++		return false;
++	}
++	if (check) {
++		note("apollo mic: %s %s (%#x) <- %#x, reads back\n", b->name, name, b->phys + offset, value);
++	} else {
++		note("apollo mic: %s %s (%#x) <- %#x (not checked: it reads %#x)\n", b->name, name, b->phys + offset, value, back);
++	}
++	return true;
++}
++
++/* only the bits of `mask' changed */
++static bool
++put_bits(struct block *b, const char *name, uint32_t offset, uint32_t mask, uint32_t value)
++{
++	uint32_t now;
++
++	if (b->base == 0) {
++		b->base = ml_io_map(b->phys, b->size);
++	}
++	now = rd(b->base + offset);
++	return put(b, name, offset, (now & ~mask) | (value & mask), mask);
++}
++
++/* ---- the DSP: votes and clocks ------------------------------------------------------------------- */
++
++#define APR_SVC_AFE                             4
++#define APR_BASIC_RSP_RESULT                    0x000110e8u
++#define APR_WAIT_MS                             1000
++#define AFE_SVC_CMD_SET_PARAM                   0x000100f3u
++#define AFE_MODULE_CLOCK_SET                    0x0001028fu
++#define AFE_PARAM_ID_CLOCK_SET                  0x00010290u
++#define AFE_CMD_REMOTE_LPASS_CORE_HW_VOTE_REQUEST       0x000100f4u     /* (q6afe-v2.h) */
++#define AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST   0x000100f5u
++#define AFE_CMD_REMOTE_LPASS_CORE_HW_DEVOTE_REQUEST     0x000100f6u
++#define LPASS_HW_MACRO_BLOCK                    3       /* AFE_LPASS_CORE_HW_MACRO_BLOCK (q6afe-v2.h) */
++#define LPASS_HW_DCODEC_BLOCK                   4       /* AFE_LPASS_CORE_HW_DCODEC_BLOCK */
++#define CLOCK_TX_CORE                           0x30c   /* the tree's tx_core_clk, qcom,codec-lpass-clk-id */
++#define CLOCK_TX_NPL                            0x30d   /* tx_npl_clk */
++#define CLOCK_HZ                                19200000        /* qcom,codec-lpass-ext-clk-freq 0x124f800 */
++#define CLOCK_COUPLE_NO                         1       /* Q6AFE_LPASS_CLK_ATTRIBUTE_COUPLE_NO, audio-ext-clk-up.c's default */
++
++static const char *
++dsp_error(uint32_t status)
++{
++	static const char *const names[] = { "ok", "failed", "bad parameter", "unsupported", "version", "unexpected", "panic",
++		                             "no resource", "bad handle", "already", "not ready", "pending", "busy", "aborted",
++		                             "preempted", "continue", "immediate", "not implemented", "need more", "no memory",
++		                             "not there" };
++
++	return status < sizeof(names) / sizeof(names[0]) ? names[status] : "an error this does not know";
++}
++
++static bool
++command(const char *what, uint8_t service, uint32_t opcode, const void *payload, uint32_t length, uint32_t wanted,
++    struct hakios_apr_answer *answer)
++{
++	struct hakios_apr_answer local;
++
++	if (answer == NULL) {
++		answer = &local;
++	}
++	if (!apollo_adsp_apr(service, 0, 0, opcode, payload, length, APR_WAIT_MS, answer)) {
++		say("apollo mic: %s (opcode %#x): NO ANSWER\n", what, opcode);
++		return false;
++	}
++	if (answer->opcode == APR_BASIC_RSP_RESULT && answer->words[0] == opcode) {
++		if (answer->words[1] == 0) {
++			note("apollo mic: %s: done\n", what);
++		} else {
++			say("apollo mic: %s: REFUSED: %s\n", what, dsp_error(answer->words[1]));
++		}
++		return answer->words[1] == 0 && wanted == 0;
++	}
++	if (wanted != 0 && answer->opcode == wanted) {
++		return true;
++	}
++	say("apollo mic: %s: an answer not expected: opcode %#x, %u bytes: %#x %#x\n", what, answer->opcode, answer->length,
++	    answer->words[0], answer->words[1]);
++	return false;
++}
++
++struct afe_param {
++	uint32_t module, param;
++	uint16_t size, reserved;
++} __attribute__((packed));
++
++struct afe_clock_set {
++	uint32_t version, id, hz;
++	uint16_t attribute, root;
++	uint32_t enable;
++} __attribute__((packed));
++
++static bool
++afe_service_param(const char *what, uint32_t module, uint32_t param, const void *data, uint16_t size)
++{
++	uint8_t packet[16 + sizeof(struct afe_param) + 64];
++	uint32_t *head = (uint32_t *)packet;
++	struct afe_param *p = (struct afe_param *)(packet + 16);
++
++	bzero(packet, sizeof(packet));
++	head[0] = (uint32_t)sizeof(*p) + size;          /* payload size; address 0 and handle 0: in band */
++	p->module = module;
++	p->param = param;
++	p->size = size;
++	memcpy(packet + 16 + sizeof(*p), data, size);
++	return command(what, APR_SVC_AFE, AFE_SVC_CMD_SET_PARAM, packet, 16 + (uint32_t)sizeof(*p) + size, 0, NULL);
++}
++
++/* (audio-ext-clk-up.c: Q6AFE_LPASS_CLK_CONFIG_API_VERSION 1, the id and rate of the tree, couple-no, root 0) */
++static bool
++afe_clock(const char *what, uint32_t id, bool on)
++{
++	struct afe_clock_set clock = { 1, id, CLOCK_HZ, CLOCK_COUPLE_NO, 0, on };
++
++	return afe_service_param(what, AFE_MODULE_CLOCK_SET, AFE_PARAM_ID_CLOCK_SET, &clock, sizeof(clock));
++}
++
++static uint32_t vote_handle[5];
++static bool voted[5], core_clock, npl_clock;
++
++static bool
++vote(uint32_t block, const char *client)
++{
++	struct {
++		uint32_t block;
++		char client[8];
++	} __attribute__((packed)) request = { block, { 0 } };
++	struct hakios_apr_answer answer;
++	char what[80];
++
++	strlcpy(request.client, client, sizeof(request.client));
++	snprintf(what, sizeof(what), "the LPASS's vote for block %u (\"%s\")", block, client);
++	if (!command(what, APR_SVC_AFE, AFE_CMD_REMOTE_LPASS_CORE_HW_VOTE_REQUEST, &request, sizeof(request),
++	    AFE_CMD_RSP_REMOTE_LPASS_CORE_HW_VOTE_REQUEST, &answer)) {
++		return false;
++	}
++	vote_handle[block] = answer.words[0];
++	voted[block] = true;
++	say("apollo mic: %s: given, handle %u\n", what, vote_handle[block]);
++	return true;
++}
++
++static void
++devote(uint32_t block)
++{
++	uint32_t request[2] = { block, vote_handle[block] };
++	char what[64];
++
++	if (!voted[block]) {
++		return;
++	}
++	snprintf(what, sizeof(what), "the LPASS's vote for block %u, given back", block);
++	(void)command(what, APR_SVC_AFE, AFE_CMD_REMOTE_LPASS_CORE_HW_DEVOTE_REQUEST, request, sizeof(request), 0, NULL);
++	voted[block] = false;
++}
++
++static bool
++clocks_on(void)
++{
++	if (!vote(LPASS_HW_MACRO_BLOCK, "LPASS_HW_MACRO") || !vote(LPASS_HW_DCODEC_BLOCK, "LPASS_HW_DCODEC")) {
++		return false;
++	}
++	core_clock = afe_clock("the TX macro's core clock (0x30c) at 19.2 MHz, on", CLOCK_TX_CORE, true);
++	if (!core_clock) {
++		return false;
++	}
++	npl_clock = afe_clock("the TX macro's NPL clock (0x30d) at 19.2 MHz, on", CLOCK_TX_NPL, true);
++	return npl_clock;
++}
++
++static void
++clocks_off(void)
++{
++	if (npl_clock) {
++		(void)afe_clock("the TX macro's NPL clock, off", CLOCK_TX_NPL, false);
++		npl_clock = false;
++	}
++	if (core_clock) {
++		(void)afe_clock("the TX macro's core clock, off", CLOCK_TX_CORE, false);
++		core_clock = false;
++	}
++	devote(LPASS_HW_DCODEC_BLOCK);
++	devote(LPASS_HW_MACRO_BLOCK);
++}
++
++/* ---- the blocks, read ------------------------------------------------------------------------------ */
++
++/* (the tree: tx-macro@3220000, va-macro@3370000, tx_swr_master swrm-io-base 0x3230000, lpi_pinctrl@33c0000) */
++static struct block tx_macro = { "the TX macro", 0x03220000, 0x1000 };
++static struct block va_macro = { "the VA macro", 0x03370000, 0x1000 };
++static struct block tx_swr = { "the TX SoundWire master", 0x03230000, 0x2000 };
++static struct block lpi = { "the LPASS pins", 0x033c0000, 0x3000 };
++/* GPIO 32: TLMM 0x0f000000 + SOUTH 0x500000 + 32 x REG_SIZE 0x1000 (pinctrl-kona.c: PINGROUP(32, SOUTH, ...)) */
++static struct block tlmm_32 = { "the pin controller", 0x0f520000, 0x1000 };
++
++/* bolero-cdc-registers.h: the TX macro's from TX_START_OFFSET 0, the VA macro's from VA_START_OFFSET 0x3000 */
++#define TX_MCLK_CONTROL         0x000
++#define TX_FS_CNT_CONTROL       0x004
++#define TX_SWR_CONTROL          0x008
++#define TX_FREQ_MCLK            0x090
++#define VA_MCLK_CONTROL         0x000
++#define VA_FS_CNT_CONTROL       0x004
++#define VA_TOP_CFG0             0x080
++#define VA_CORE_ID_0            0x0c0
++#define VA_CORE_ID_1            0x0c4
++
++/* the master's registers to look at (swrm_registers.h) */
++static const struct { const char *name; uint32_t offset; } swr_look[] = {
++	{ "COMP_HW_VERSION", 0x000 }, { "COMP_CFG", 0x004 }, { "COMP_STATUS", 0x014 }, { "COMP_PARAMS", 0x100 },
++	{ "COMP_MASTER_ID", 0x104 }, { "INTERRUPT_STATUS", 0x200 }, { "INTERRUPT_MASK", 0x204 }, { "ENUMERATOR_CFG", 0x500 },
++	{ "MCP_FRAME_CTRL_BANK0", 0x101c }, { "MCP_FRAME_CTRL_BANK1", 0x105c }, { "MCP_BUS_CTRL", 0x1044 },
++	{ "MCP_CFG", 0x1048 }, { "MCP_STATUS", 0x104c }, { "MCP_SLV_STATUS", 0x1090 },
++};
++
++static void
++master_look(void)
++{
++	for (size_t i = 0; i < sizeof(swr_look) / sizeof(swr_look[0]); i++) {
++		(void)get(&tx_swr, swr_look[i].name, swr_look[i].offset);
++	}
++}
++
++static void
++look(void)
++{
++	static const struct { const char *name; uint32_t offset; } tx[] = {
++		{ "MCLK_CONTROL", 0x000 }, { "FS_CNT_CONTROL", 0x004 }, { "SWR_CONTROL", 0x008 }, { "TOP_CFG0", 0x080 },
++		{ "SWR_CTRL", 0x088 }, { "FREQ_MCLK", 0x090 }, { "SWR_AMIC0_CTL", 0x0d0 }, { "SWR_AMIC1_CTL", 0x0d4 },
++		{ "ADC_MUX0_CFG0", 0x100 }, { "ADC_MUX0_CFG1", 0x104 }, { "TX0_TX_PATH_CTL", 0x400 }, { "TX0_TX_PATH_CFG0", 0x404 },
++		{ "TX0_TX_VOL_CTL", 0x40c }, { "TX0_TX_PATH_SEC2", 0x418 }, { "TX0_TX_PATH_SEC7", 0x42c },
++	}, va[] = {
++		{ "MCLK_CONTROL", 0x000 }, { "FS_CNT_CONTROL", 0x004 }, { "TOP_CFG0", 0x080 }, { "CORE_ID_0", 0x0c0 },
++		{ "CORE_ID_1", 0x0c4 },
++	};
++	static const unsigned pins[] = { 0, 1, 2 };
++	struct block slew = { "the LPASS pins' slew rates", 0x0355a000, 0x1000, 0 };
++
++	for (size_t i = 0; i < sizeof(tx) / sizeof(tx[0]); i++) {
++		(void)get(&tx_macro, tx[i].name, tx[i].offset);
++	}
++	for (size_t i = 0; i < sizeof(va) / sizeof(va[0]); i++) {
++		(void)get(&va_macro, va[i].name, va[i].offset);
++	}
++	for (size_t i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
++		char name[48];
++
++		snprintf(name, sizeof(name), "gpio%u config (SoundWire TX)", pins[i]);
++		(void)get(&lpi, name, 0x1000 * pins[i]);
++		snprintf(name, sizeof(name), "gpio%u in/out", pins[i]);
++		(void)get(&lpi, name, 0x1000 * pins[i] + 4);
++	}
++	(void)get(&slew, "slew rates (gpio0: bits 0-1, gpio1: 2-3, gpio2: 4-5)", 0);
++	(void)get(&tlmm_32, "gpio32 config (the codec's reset)", 0);
++	(void)get(&tlmm_32, "gpio32 in/out", 4);
++	/*
++	 * The master last, and only with its clock running: a 1.5.1 master is not accessed without the TX
++	 * macro's SoundWire clock (is_swr_clk_needed(), swrm_ahb_read()), and starting that clock is a write
++	 */
++	if (rd(tx_macro.base + TX_SWR_CONTROL) & 1) {
++		say("apollo mic: the TX macro's SoundWire clock is running: the master is read\n");
++		master_look();
++	} else {
++		say("apollo mic: the TX macro's SoundWire clock is off: the master (version 1.5.1) is NOT read without it; "
++		    "apollo_mic=2 reads it once the clock is started\n");
++	}
++}
++
++/* ---- the codec's reset, the master's pins ------------------------------------------------------------ */
++
++#define TLMM_CFG                0x0
++#define TLMM_IO                 0x4
++static uint32_t found_reset_cfg, found_reset_io;
++static bool reset_taken;
++
++/*
++ * wcd938x_reset(): msm-cdc-pinctrl's sleep state (wcd938x_reset_sleep: 16 mA, no pull, output low), 20 us,
++ * its active state (wcd938x_reset_active: 16 mA, output high), 20 us. Both states name the function "func2",
++ * which kona's TLMM does not have (pinctrl-kona.c: gpio32's are gpio, qup12, NA, atest_usb03, ...): the
++ * pinctrl core drops that mux setting and keeps the configuration, so under Android the pin is a GPIO (function
++ * 0), as it is written here. [1:0] pull, [5:2] function, [8:6] drive (mA / 2 - 1), [9] output enable.
++ */
++static bool
++reset_release(void)
++{
++	if (tlmm_32.base == 0) {
++		tlmm_32.base = ml_io_map(tlmm_32.phys, tlmm_32.size);
++	}
++	found_reset_cfg = rd(tlmm_32.base + TLMM_CFG);
++	found_reset_io = rd(tlmm_32.base + TLMM_IO);
++	reset_taken = true;
++	if (!put(&tlmm_32, "gpio32 out (the codec's reset)", TLMM_IO, 0, 2) ||
++	    !put(&tlmm_32, "gpio32 config: gpio, 16 mA, no pull, output", TLMM_CFG, 0x3c0, 0x3ff)) {
++		return false;
++	}
++	spin_us(30);
++	if (!put(&tlmm_32, "gpio32 out: high (the codec out of reset)", TLMM_IO, 2, 2)) {
++		return false;
++	}
++	spin_us(30);
++	return true;
++}
++
++static void
++reset_restore(void)
++{
++	if (!reset_taken) {
++		return;
++	}
++	broken = false;         /* (putting back is done whatever went before) */
++	(void)put(&tlmm_32, "gpio32 out: low (the codec in reset)", TLMM_IO, 0, 2);
++	(void)put(&tlmm_32, "gpio32 config, as it was found", TLMM_CFG, found_reset_cfg, 0x3ff);
++	(void)put(&tlmm_32, "gpio32 out, as it was found", TLMM_IO, found_reset_io & 2, 2);
++	reset_taken = false;
++}
++
++/*
++ * kona-lpi.dtsi: tx_swr_clk_active (gpio0: func1, 2 mA, slew-rate 1, bias-disable), tx_swr_data1_active
++ * (gpio1: func1, 2 mA, slew-rate 1, bias-bus-hold), tx_swr_data2_active (gpio2: the same); the slew register
++ * qcom,slew-reg 0x355a000, the pins' places in it qcom,lpi-slew-offset-tbl (0, 2, 4), two bits each
++ * (pinctrl-lpi.c: LPI_SLEW_BITS_SIZE). The register layout is pinctrl-lpi.c's (LPI_GPIO_REG_*), as on the POCO.
++ */
++static struct block lpi_slew = { "the LPASS pins' slew rates", 0x0355a000, 0x1000 };
++static const struct { unsigned pin, slew_bit; uint32_t pull; const char *name; } swr_pins[] = {
++	{ 0, 0, 0, "gpio0 (SoundWire TX clock)" }, { 1, 2, 2, "gpio1 (data 1)" }, { 2, 4, 2, "gpio2 (data 2)" },
++};
++#define SWR_PINS                (sizeof(swr_pins) / sizeof(swr_pins[0]))
++#define SLEW_MASK               0x3fu   /* the three pins' fields */
++static uint32_t found_pin_cfg[SWR_PINS], found_pin_dir[SWR_PINS], found_slew;
++static bool pins_taken;
++
++static bool
++pins_on(void)
++{
++	uint32_t slew;
++
++	if (lpi.base == 0) {
++		lpi.base = ml_io_map(lpi.phys, lpi.size);
++	}
++	if (lpi_slew.base == 0) {
++		lpi_slew.base = ml_io_map(lpi_slew.phys, lpi_slew.size);
++	}
++	for (unsigned i = 0; i < SWR_PINS; i++) {
++		found_pin_cfg[i] = rd(lpi.base + 0x1000 * swr_pins[i].pin);
++		found_pin_dir[i] = rd(lpi.base + 0x1000 * swr_pins[i].pin + 4);
++	}
++	found_slew = rd(lpi_slew.base);
++	pins_taken = true;
++	slew = found_slew;
++	for (unsigned i = 0; i < SWR_PINS; i++) {
++		slew = (slew & ~(3u << swr_pins[i].slew_bit)) | (1u << swr_pins[i].slew_bit);
++	}
++	if (!put(&lpi_slew, "slew rates: 1 for the three", 0, slew, SLEW_MASK)) {
++		return false;
++	}
++	for (unsigned i = 0; i < SWR_PINS; i++) {
++		/* [1:0] pull, [5:2] function, [8:6] drive (mA / 2 - 1), [9] output: function 1, 2 mA, not an output */
++		uint32_t cfg = (found_pin_cfg[i] & ~0x3ffu) | swr_pins[i].pull | 1u << 2;
++
++		if (!put(&lpi, swr_pins[i].name, 0x1000 * swr_pins[i].pin, cfg, 0x3ff) ||
++		    !put(&lpi, "its direction: in", 0x1000 * swr_pins[i].pin + 4, 0, 2)) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static void
++pins_restore(void)
++{
++	if (!pins_taken) {
++		return;
++	}
++	broken = false;
++	for (unsigned i = 0; i < SWR_PINS; i++) {
++		(void)put(&lpi, "a pin, as it was found", 0x1000 * swr_pins[i].pin, found_pin_cfg[i], 0x3ff);
++		(void)put(&lpi, "its direction, as it was found", 0x1000 * swr_pins[i].pin + 4, found_pin_dir[i], 2);
++	}
++	(void)put(&lpi_slew, "slew rates, as they were found", 0, found_slew, SLEW_MASK);
++	pins_taken = false;
++}
++
++/* ---- the TX macro's clocks, the SoundWire master ----------------------------------------------------- */
++
++#define SWRM_COMP_HW_VERSION            0x0000
++#define SWRM_COMP_CFG                   0x0004
++#define SWRM_COMP_SW_RESET              0x0008
++#define SWRM_COMP_STATUS                0x0014
++#define SWRM_COMP_PARAMS                0x0100
++#define SWRM_INTERRUPT_MASK             0x0204          /* (SWRM_INTERRUPT_MASK_ADDR: written with the interrupts that are on) */
++#define SWRM_INTERRUPT_CLEAR            0x0208
++#define SWRM_CPU_INTERRUPT_EN           0x0210          /* SWR_MSTR_RX_SWRM_CPU_INTERRUPT_EN */
++#define SWRM_CMD_FIFO_WR_CMD            0x0300
++#define SWRM_CMD_FIFO_RD_CMD            0x0304
++#define SWRM_CMD_FIFO_CMD               0x0308
++#define SWRM_CMD_FIFO_STATUS            0x030c
++#define SWRM_CMD_FIFO_CFG               0x0314
++#define SWRM_CMD_FIFO_RD_FIFO           0x0318
++#define SWRM_ENUMERATOR_CFG             0x0500
++#define SWRM_ENUMERATOR_SLAVE_DEV_ID_1(m) (0x0530 + 0x8 * (m))
++#define SWRM_ENUMERATOR_SLAVE_DEV_ID_2(m) (0x0534 + 0x8 * (m))
++#define SWRM_MCP_FRAME_CTRL_BANK(m)     (0x101c + 0x40 * (m))
++#define SWRM_MCP_BUS_CTRL               0x1044
++#define SWRM_MCP_CFG                    0x1048
++#define SWRM_MCP_STATUS                 0x104c
++#define SWRM_MCP_SLV_STATUS             0x1090
++#define SWRM_INTERRUPT_STATUS_MASK      0x1fdfd         /* (swr-mstr-ctrl.c) */
++#define SWRM_VERSION_1_5_1              0x01050001u     /* (swr-mstr-ctrl.h; the tree's qcom,swr-master-version) */
++#define SWR_BUS_HZ                      9600000         /* MCLK_FREQ (swr-wcd.h): swrm_probe()'s mclk_freq and bus_clk */
++#define SWR_ROWS                        50              /* SWR_ROW_50 (control value 1) */
++#define SWR_FRAME_SYNC_HZ               4000            /* SWRM_FRAME_SYNC_SEL */
++#define CODEC_TX_ID                     0x000d01170223ull       /* the tree's wcd938x-tx-slave, reg <0xd 0x1170223> */
++#define SWRS_SCP_INT_STATUS_MASK_1      0x41
++
++static bool tx_clocks_taken, master_taken;
++static uint32_t found_freq_mclk;
++static uint32_t wr_depth = 8;           /* the master's command FIFO's depth (COMP_PARAMS: swrm_probe()'s wr_fifo_depth) */
++static uint8_t read_id = 0;
++
++/*
++ * tx_macro_tx_va_mclk_enable() for TX_MCLK (the pins first: pins_on()), with tx_macro_mclk_enable() in it:
++ * bolero_clk_rsc_fs_gen_request() runs the tree's qcom,fs-gen-sequence <0x3000 1, 0x3004 1, 0x3080 2> as
++ * regmap_update_bits(register, mask, mask) -- VA MCLK_CONTROL bit 0, FS_CNT_CONTROL bit 0, TOP_CFG0 bit 1 (the
++ * POCO's tree has FS_CNT's two bits, and a toggle; this one has bit 0 alone) --; then "9.6MHz MCLK" (FREQ_MCLK
++ * bit 0), MCLK_CONTROL and FS_CNT_CONTROL on; then, the first time (reset_swr), the SoundWire clock with a reset.
++ */
++static bool
++tx_clocks_on(void)
++{
++	if (tx_macro.base == 0) {
++		tx_macro.base = ml_io_map(tx_macro.phys, tx_macro.size);
++	}
++	found_freq_mclk = rd(tx_macro.base + TX_FREQ_MCLK);
++	tx_clocks_taken = true;
++	return put_bits(&va_macro, "MCLK_CONTROL (fs-gen)", VA_MCLK_CONTROL, 0x01, 0x01) &&
++	       put_bits(&va_macro, "FS_CNT_CONTROL (fs-gen)", VA_FS_CNT_CONTROL, 0x01, 0x01) &&
++	       put_bits(&va_macro, "TOP_CFG0 (fs-gen)", VA_TOP_CFG0, 0x02, 0x02) &&
++	       /* (the POCO's reads 0 back whatever is written; on this phone it is not known: said, not checked) */
++	       put(&tx_macro, "FREQ_MCLK: 9.6 MHz", TX_FREQ_MCLK, (found_freq_mclk & ~1u) | 1, 0) &&
++	       put_bits(&tx_macro, "MCLK_CONTROL: on", TX_MCLK_CONTROL, 0x01, 0x01) &&
++	       put_bits(&tx_macro, "FS_CNT_CONTROL: on", TX_FS_CNT_CONTROL, 0x01, 0x01) &&
++	       put_bits(&tx_macro, "SWR_CONTROL: reset", TX_SWR_CONTROL, 0x02, 0x02) &&
++	       put_bits(&tx_macro, "SWR_CONTROL: clock on", TX_SWR_CONTROL, 0x01, 0x01) &&
++	       put_bits(&tx_macro, "SWR_CONTROL: reset over", TX_SWR_CONTROL, 0x02, 0x00);
++}
++
++static void
++tx_clocks_off(void)
++{
++	if (!tx_clocks_taken) {
++		return;
++	}
++	broken = false;
++	(void)put_bits(&tx_macro, "SWR_CONTROL: clock off", TX_SWR_CONTROL, 0x01, 0x00);
++	(void)put_bits(&tx_macro, "FS_CNT_CONTROL: off", TX_FS_CNT_CONTROL, 0x01, 0x00);
++	(void)put_bits(&tx_macro, "MCLK_CONTROL: off", TX_MCLK_CONTROL, 0x01, 0x00);
++	(void)put(&tx_macro, "FREQ_MCLK: as it was found", TX_FREQ_MCLK, found_freq_mclk, 0);
++	(void)put_bits(&va_macro, "TOP_CFG0 (fs-gen off)", VA_TOP_CFG0, 0x02, 0x00);
++	(void)put_bits(&va_macro, "FS_CNT_CONTROL (fs-gen off)", VA_FS_CNT_CONTROL, 0x01, 0x00);
++	(void)put_bits(&va_macro, "MCLK_CONTROL (fs-gen off)", VA_MCLK_CONTROL, 0x01, 0x00);
++	tx_clocks_taken = false;
++}
++
++static uint32_t
++swr_rd(uint32_t offset)
++{
++	if (tx_swr.base == 0) {
++		tx_swr.base = ml_io_map(tx_swr.phys, tx_swr.size);
++	}
++	return rd(tx_swr.base + offset);
++}
++
++/*
++ * swrm_runtime_resume()'s branch for a master that is not woken from a clock stop (the SSR one: two software
++ * resets, then swrm_master_init()); this techpack's master_init() for 1.5.1: no HCTL workaround (>= 1.6 only),
++ * the frame 50 rows x 2 columns, ssp period 9.6 MHz x 2 / (50 x 2 x 4000) = 48, auto-enumeration, 31 commands
++ * without a ping, 3 retries, the bus clock started, the interrupts as pulses and masked as swr-mstr-ctrl.c masks
++ * them, the master on; no link status looked at (<= 1.5.1); then "continue execute on command ignore" (>= 1.5.1).
++ */
++static bool
++master_on(void)
++{
++	uint32_t ssp = SWR_BUS_HZ * 2 / (SWR_ROWS * 2 * SWR_FRAME_SYNC_HZ), cfg, version;
++
++	version = swr_rd(SWRM_COMP_HW_VERSION);
++	wr_depth = (swr_rd(SWRM_COMP_PARAMS) & 0x7c00) >> 10;
++	say("apollo mic: the TX SoundWire master is version %#x (the tree says 0x1050001); its write FIFO holds %u commands\n",
++	    version, wr_depth);
++	if (version != SWRM_VERSION_1_5_1) {
++		say("apollo mic: NOT the master this was written for: STOPPING HERE (nothing of it written)\n");
++		broken = true;
++		return false;
++	}
++	if (wr_depth == 0) {
++		wr_depth = 8;
++	}
++	master_taken = true;
++	if (!put(&tx_swr, "COMP_SW_RESET", SWRM_COMP_SW_RESET, 1, 0) || !put(&tx_swr, "COMP_SW_RESET", SWRM_COMP_SW_RESET, 1, 0)) {
++		return false;
++	}
++	cfg = (swr_rd(SWRM_MCP_CFG) & ~0x3e0000u) | 0x1fu << 17;
++	if (!put(&tx_swr, "MCP_FRAME_CTRL_BANK0: 50 rows, 2 columns", SWRM_MCP_FRAME_CTRL_BANK(0), 1u << 3 | 0u | (ssp - 1) << 16,
++	    0xff07ff) ||
++	    !put(&tx_swr, "ENUMERATOR_CFG: auto", SWRM_ENUMERATOR_CFG, 1, 1) ||
++	    !put(&tx_swr, "MCP_CFG: 31 pings", SWRM_MCP_CFG, cfg, 0x3e0000) ||
++	    !put(&tx_swr, "CMD_FIFO_CFG: 3 retries", SWRM_CMD_FIFO_CFG, 3, 0x7) ||
++	    !put(&tx_swr, "MCP_BUS_CTRL: the clock started", SWRM_MCP_BUS_CTRL, 2, 0) ||
++	    !put(&tx_swr, "COMP_CFG: interrupts as pulses", SWRM_COMP_CFG, 2, 0) ||
++	    !put(&tx_swr, "INTERRUPT_CLEAR", SWRM_INTERRUPT_CLEAR, 0xffffffff, 0) ||
++	    !put(&tx_swr, "INTERRUPT_MASK", SWRM_INTERRUPT_MASK, SWRM_INTERRUPT_STATUS_MASK, 0) ||
++	    !put(&tx_swr, "CPU_INTERRUPT_EN", SWRM_CPU_INTERRUPT_EN, SWRM_INTERRUPT_STATUS_MASK, 0) ||
++	    !put(&tx_swr, "COMP_CFG: on", SWRM_COMP_CFG, 3, 0)) {
++		return false;
++	}
++	spin_us(105);   /* ("wait for hw enumeration to complete", swrm_runtime_resume()) */
++	say("apollo mic: the master is on (COMP_STATUS %#x: not looked at for 1.5.1, the codec's enumeration says)\n",
++	    swr_rd(SWRM_COMP_STATUS));
++	return put(&tx_swr, "CMD_FIFO_CFG: | 0x80000000", SWRM_CMD_FIFO_CFG, swr_rd(SWRM_CMD_FIFO_CFG) | 0x80000000u, 0);
++}
++
++static void
++master_off(void)
++{
++	if (!master_taken) {
++		return;
++	}
++	broken = false;
++	(void)put(&tx_swr, "COMP_CFG: off", SWRM_COMP_CFG, 0, 0);
++	(void)put(&tx_swr, "INTERRUPT_MASK: none", SWRM_INTERRUPT_MASK, 0, 0);
++	(void)put(&tx_swr, "CPU_INTERRUPT_EN: none", SWRM_CPU_INTERRUPT_EN, 0, 0);
++	(void)put(&tx_swr, "COMP_SW_RESET", SWRM_COMP_SW_RESET, 1, 0);
++	master_taken = false;
++}
++
++/* A command to a device on the bus (SWR_REG_VAL_PACK): a register written (swrm_cmd_fifo_wr_cmd()). */
++static bool
++swr_write(uint8_t device, uint16_t reg, uint8_t value, uint8_t id)
++{
++	uint32_t packed = reg | (uint32_t)id << 16 | (uint32_t)device << 20 | (uint32_t)value << 24;
++
++	for (int i = 0; i < 30 && ((swr_rd(SWRM_CMD_FIFO_STATUS) >> 8) & 0x1f) >= wr_depth; i++) {
++		spin_us(510);
++	}
++	snprintf(last_write, sizeof(last_write), "SoundWire: device %u register %#x <- %#x", device, reg, value);
++	wr(tx_swr.base + SWRM_CMD_FIFO_WR_CMD, packed);
++	spin_us(155);
++	return true;
++}
++
++/* ... and one read (swrm_cmd_fifo_rd_cmd()): false if the answer does not come (or is not this command's) */
++static bool
++swr_read(uint8_t device, uint16_t reg, uint8_t *value)
++{
++	uint32_t answer = 0, packed;
++
++	read_id = read_id < 14 ? read_id + 1 : 0;
++	packed = reg | (uint32_t)read_id << 16 | (uint32_t)device << 20 | 1u << 24;
++	for (int i = 0; i < 30 && ((swr_rd(SWRM_CMD_FIFO_STATUS) >> 8) & 0x1f) >= wr_depth; i++) {
++		spin_us(510);
++	}
++	spin_us(105);
++	wr(tx_swr.base + SWRM_CMD_FIFO_RD_CMD, packed);
++	spin_us(255);
++	for (int tries = 0; tries < 4; tries++) {
++		for (int i = 0; i < 30 && ((swr_rd(SWRM_CMD_FIFO_STATUS) >> 16) & 0x1f) == 0; i++) {
++			spin_us(510);
++		}
++		answer = swr_rd(SWRM_CMD_FIFO_RD_FIFO);
++		if (((answer >> 8) & 0xf) == read_id) {
++			*value = (uint8_t)answer;
++			return true;
++		}
++		spin_us(505);
++		if (tries == 2) {
++			/* (as swrm_cmd_fifo_rd_cmd() does before its last try: the FIFO flushed, the read sent again) */
++			wr(tx_swr.base + SWRM_CMD_FIFO_CMD, 1);
++			wr(tx_swr.base + SWRM_CMD_FIFO_RD_CMD, packed);
++			spin_us(255);
++		}
++	}
++	say("apollo mic: SoundWire: device %u register %#x: no answer (fifo %#x, last %#x)\n", device, reg,
++	    swr_rd(SWRM_CMD_FIFO_STATUS), answer);
++	return false;
++}
++
++static uint8_t codec_device;
++
++/* the codec's TX device, enumerated: its device number, 0 if it did not show up (swrm_get_logical_dev_num()) */
++static uint8_t
++codec_wait(void)
++{
++	for (int waited = 0; waited < 200; waited++) {
++		for (uint8_t d = 1; d <= 11; d++) {
++			uint64_t id = (uint64_t)swr_rd(SWRM_ENUMERATOR_SLAVE_DEV_ID_2(d)) << 32 | swr_rd(SWRM_ENUMERATOR_SLAVE_DEV_ID_1(d));
++			uint32_t status = (swr_rd(SWRM_MCP_SLV_STATUS) >> (2 * d)) & 3;
++
++			if ((id & 0xffffffffffffull) == CODEC_TX_ID && (status == 1 || status == 2)) {
++				say("apollo mic: the codec's TX device is device %u on the bus (ID %#llx, status %u) after %d ms\n", d,
++				    id & 0xffffffffffffull, status, waited);
++				return d;
++			}
++		}
++		sleep_ms(1);
++	}
++	say("apollo mic: the codec's TX device did not show up; the master has seen:\n");
++	for (uint8_t d = 1; d <= 11; d++) {
++		uint64_t id = (uint64_t)swr_rd(SWRM_ENUMERATOR_SLAVE_DEV_ID_2(d)) << 32 | swr_rd(SWRM_ENUMERATOR_SLAVE_DEV_ID_1(d));
++
++		if (id != 0) {
++			say("apollo mic:   device %u: ID %#llx\n", d, id);
++		}
++	}
++	say("apollo mic:   slave status %#x, COMP_STATUS %#x, interrupt status %#x\n", swr_rd(SWRM_MCP_SLV_STATUS),
++	    swr_rd(SWRM_COMP_STATUS), swr_rd(0x200));
++	return 0;
++}
++
++static void
++codec_look(void)
++{
++	static const struct { const char *name; uint16_t reg; } regs[] = {
++		{ "DIGITAL_CHIP_ID0", 0x3401 }, { "DIGITAL_CHIP_ID1", 0x3402 }, { "DIGITAL_CHIP_ID2", 0x3403 },
++		{ "DIGITAL_CHIP_ID3", 0x3404 }, { "SCP DEVICE_ID_0", 0x0050 }, { "SCP DEVICE_ID_1", 0x0051 },
++	};
++
++	for (size_t i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++		uint8_t value;
++
++		if (swr_read(codec_device, regs[i].reg, &value)) {
++			say("apollo mic: the codec's %s (%#x) = %#x\n", regs[i].name, regs[i].reg, value);
++		}
++	}
++}
++
++/* ---- apollo_mic=3: the codec set up as Android sets it up for the main microphone ------------------------- */
++
++/* wcd938x-registers.h (WCD938X_BASE_ADDRESS 0x3000): the same chip as the POCO's, the same registers */
++#define WCD_ANA_BIAS                    0x3001
++#define WCD_ANA_TX_CH1                  0x300e
++#define WCD_ANA_TX_CH2                  0x300f
++#define WCD_ANA_MICB1                   0x3022
++#define WCD_ANA_MICB2                   0x3023
++#define WCD_ANA_MICB3                   0x3025
++#define WCD_ANA_MICB4                   0x3026
++#define WCD_BIAS_VBG_FINE_ADJ           0x3029
++#define WCD_MICB1_TEST_CTL_1            0x306b
++#define WCD_MICB1_TEST_CTL_2            0x306c
++#define WCD_MICB2_TEST_CTL_1            0x306e
++#define WCD_MICB2_TEST_CTL_2            0x306f
++#define WCD_MICB3_TEST_CTL_1            0x3071
++#define WCD_MICB3_TEST_CTL_2            0x3072
++#define WCD_MICB4_TEST_CTL_1            0x3074
++#define WCD_MICB4_TEST_CTL_2            0x3075
++#define WCD_TX_3_4_TEST_BLK_EN2         0x308f
++#define WCD_HPH_REFBUFF_UHQA_CTL        0x30dd
++#define WCD_HPH_SURGE_HPHLR_SURGE_EN    0x30e2
++#define WCD_SLEEP_CTL                   0x3103
++#define WCD_LDORXTX_CONFIG              0x312a
++#define WCD_HPH_NEW_INT_RDAC_GAIN_CTL   0x3132
++#define WCD_HPH_NEW_INT_RDAC_HD2_CTL_L  0x3140
++#define WCD_HPH_NEW_INT_RDAC_HD2_CTL_R  0x3141
++#define WCD_TXFE_ICTRL_STG2MAIN_ULP     0x31df
++#define WCD_TXFE_ICTRL_STG2CASC_ULP     0x31e1
++#define WCD_SWR_TX_CLK_RATE             0x3405
++#define WCD_CDC_ANA_CLK_CTL             0x3408
++#define WCD_CDC_DIG_CLK_CTL             0x3409
++#define WCD_CDC_TX_ANA_MODE_0_1         0x3410
++#define WCD_CDC_ANA_TX_CLK_CTL          0x3417
++#define WCD_CDC_REQ_CTL                 0x3457
++#define WCD_CDC_DMIC_CTL                0x345b
++#define WCD_INTR_LEVEL_0                0x3474
++#define WCD_EFUSE_REG_30                0x34ce
++#define WCD_TX_REQ_FB_CTL_0             0x34d0
++#define SWRS_SCP_CONTROL                0x0044
++#define SWRS_SCP_FRAME_CTRL_BANK(m)     (0x0060 + 0x10 * (m))
++#define SWRS_SCP_HOST_CLK_DIV2_CTL_BANK(m) (0x00e0 + 0x10 * (m))
++#define SWRS_DP_CHANNEL_ENABLE_BANK(n, m) (0x120 + 0x100 * (n) + 0x10 * (m))
++#define SWRS_DP_SAMPLE_CONTROL_1_BANK(n, m) (0x122 + 0x100 * (n) + 0x10 * (m))
++#define SWRS_DP_OFFSET_CONTROL_1_BANK(n, m) (0x124 + 0x100 * (n) + 0x10 * (m))
++#define SWRS_DP_OFFSET_CONTROL_2_BANK(n, m) (0x125 + 0x100 * (n) + 0x10 * (m))
++#define SWRS_DP_LANE_CONTROL_BANK(n, m) (0x128 + 0x100 * (n) + 0x10 * (m))
++/* swrm_registers.h: port n (1-based) */
++#define SWRM_DP_PORT_CTRL_BANK(n, m)    (0x1124 + 0x100 * ((n) - 1) + 0x40 * (m))
++#define SWRM_DP_PORT_CTRL_2_BANK(n, m)  (0x1128 + 0x100 * ((n) - 1) + 0x40 * (m))
++#define SWRM_DP_PORT_HCTRL_BANK(n, m)   (0x1134 + 0x100 * ((n) - 1) + 0x40 * (m))
++
++static uint8_t write_id;
++
++/* a register of the codec's (device codec_device on the bus) written and, unless `check' is 0, read back */
++static bool
++codec_put(uint16_t reg, uint8_t value, uint8_t check)
++{
++	uint8_t back = 0;
++
++	if (broken) {
++		return false;
++	}
++	write_id = write_id < 14 ? write_id + 1 : 0;
++	swr_write(codec_device, reg, value, write_id);
++	if (check == 0) {
++		note("apollo mic: the codec's %#06x <- %#04x\n", reg, value);
++		return true;
++	}
++	if (!swr_read(codec_device, reg, &back) || (back & check) != (value & check)) {
++		say("apollo mic: the codec's %#06x <- %#04x, but it reads %#04x: STOPPING HERE\n", reg, value, back);
++		broken = true;
++		return false;
++	}
++	note("apollo mic: the codec's %#06x <- %#04x, reads back\n", reg, value);
++	return true;
++}
++
++static bool
++codec_bits(uint16_t reg, uint8_t mask, uint8_t value)
++{
++	uint8_t now = 0;
++
++	if (broken || !swr_read(codec_device, reg, &now)) {
++		broken = true;
++		return false;
++	}
++	return (now & mask) == (value & mask) || codec_put(reg, (uint8_t)((now & ~mask) | (value & mask)), mask);
++}
++
++/* a command to all devices on the bus (device 15, command id 15: Android's broadcasts) */
++static void
++broadcast(uint16_t reg, uint8_t value)
++{
++	swr_write(0xf, reg, value, 0xf);
++	note("apollo mic: SoundWire, to all: %#06x <- %#04x\n", reg, value);
++	/*
++	 * Android waits for the master's "broadcast" completion here, the interrupt it does not have under this
++	 * kernel (swrm_cmd_fifo_wr_cmd(), at most 200 ms); 10 ms, as on the POCO, then the bank is looked at
++	 */
++	sleep_ms(10);
++}
++
++/* to all devices, with an ordinary command id (swrm_cmd_fifo_wr_cmd(..., 0xF, 0x00, ...)) */
++static void
++to_all(uint16_t reg, uint8_t value)
++{
++	write_id = write_id < 14 ? write_id + 1 : 0;
++	swr_write(0xf, reg, value, write_id);
++	note("apollo mic: SoundWire, to all: %#06x <- %#04x\n", reg, value);
++}
++
++/* wcd938x_bind(), wcd938x_set_micbias_data(), wcd938x_init_reg() (this techpack's) */
++static bool
++codec_init(void)
++{
++	uint8_t efuse = 0;
++	/* the tree's qcom,cdc-micbias1..4-mv: 2750 mV, wcd938x_get_micb_vout_ctl_val(): (2750 - 1000) / 50 */
++	const uint8_t vout = (2750 - 1000) / 50;
++
++	if (!codec_put(WCD_INTR_LEVEL_0, 0, 0xff) || !codec_put(WCD_INTR_LEVEL_0 + 1, 0, 0xff) ||
++	    !codec_put(WCD_INTR_LEVEL_0 + 2, 0, 0xff) ||
++	    !codec_bits(WCD_ANA_MICB1, 0x3f, vout) || !codec_bits(WCD_ANA_MICB2, 0x3f, vout) ||
++	    !codec_bits(WCD_ANA_MICB3, 0x3f, vout) || !codec_bits(WCD_ANA_MICB4, 0x3f, vout) ||
++	    !codec_bits(WCD_SLEEP_CTL, 0x0e, 0x0e) || !codec_bits(WCD_SLEEP_CTL, 0x80, 0x80)) {
++		return false;
++	}
++	sleep_ms(1);
++	if (!codec_bits(WCD_SLEEP_CTL, 0x40, 0x40)) {
++		return false;
++	}
++	sleep_ms(1);
++	if (!codec_bits(WCD_LDORXTX_CONFIG, 0x10, 0x00) || !codec_bits(WCD_BIAS_VBG_FINE_ADJ, 0xf0, 0x80) ||
++	    !codec_bits(WCD_ANA_BIAS, 0x80, 0x80) || !codec_bits(WCD_ANA_BIAS, 0x40, 0x40)) {
++		return false;
++	}
++	sleep_ms(10);
++	if (!codec_bits(WCD_ANA_BIAS, 0x40, 0x00) || !codec_bits(WCD_HPH_NEW_INT_RDAC_GAIN_CTL, 0xf0, 0x00) ||
++	    !codec_bits(WCD_HPH_NEW_INT_RDAC_HD2_CTL_L, 0x1f, 0x15) || !codec_bits(WCD_HPH_NEW_INT_RDAC_HD2_CTL_R, 0x1f, 0x15) ||
++	    !codec_bits(WCD_HPH_REFBUFF_UHQA_CTL, 0xc0, 0x80) || !codec_bits(WCD_CDC_DMIC_CTL, 0x02, 0x02) ||
++	    !codec_bits(WCD_TXFE_ICTRL_STG2CASC_ULP, 0xff, 0x14) || !codec_bits(WCD_TXFE_ICTRL_STG2MAIN_ULP, 0x1f, 0x08) ||
++	    !codec_bits(WCD_TX_REQ_FB_CTL_0, 0xff, 0x55) || !codec_bits(WCD_TX_REQ_FB_CTL_0 + 1, 0xff, 0x44) ||
++	    !codec_bits(WCD_TX_REQ_FB_CTL_0 + 2, 0xff, 0x11) || !codec_bits(WCD_TX_REQ_FB_CTL_0 + 3, 0xff, 0x00) ||
++	    !codec_bits(WCD_TX_REQ_FB_CTL_0 + 4, 0xff, 0x00) ||
++	    !codec_bits(WCD_MICB1_TEST_CTL_1, 0xe0, 0xe0) || !codec_bits(WCD_MICB2_TEST_CTL_1, 0xe0, 0xe0) ||
++	    !codec_bits(WCD_MICB3_TEST_CTL_1, 0xe0, 0xe0) || !codec_bits(WCD_MICB4_TEST_CTL_1, 0xe0, 0xe0) ||
++	    !codec_bits(WCD_TX_3_4_TEST_BLK_EN2, 0x01, 0x00) || !swr_read(codec_device, WCD_EFUSE_REG_30, &efuse) ||
++	    !codec_bits(WCD_SLEEP_CTL, 0x0e, (uint8_t)((efuse & 0x07) << 1)) ||
++	    /* (this techpack's wcd938x_init_reg() ends with the surge detection on: 0xC0; the POCO's with it off) */
++	    !codec_bits(WCD_HPH_SURGE_HPHLR_SURGE_EN, 0xc0, 0xc0)) {
++		return false;
++	}
++	say("apollo mic: the codec is set up as wcd938x_init_reg() sets it up (efuse 30: %#x)\n", efuse);
++	return true;
++}
++
++/*
++ * Two ways to record, boot-arg apollo_mic_path=N:
++ *
++ *   1 (the default) Android's own ordinary recording (Xiaomi's ACDB "Tutu" and configs, the phone's getprop: no
++ *     Fluence for it; the HAL's SND_DEVICE_IN_HANDSET_MIC, mixer path "handset-mic", ACDB device 4, app type
++ *     0x11132, 48 kHz): both microphones -- the main one (ADC1, AMIC1, MIC BIAS1) on decimator 1, the top one
++ *     (ADC4 through "ADC4 MUX" INP5, AMIC5, MIC BIAS4) on decimator 0, "ADC1/ADC4 Volume" 6, the decimators at
++ *     0 dB --, the port's two channels (channel 0 the top microphone, channel 1 the main one), and the DSP's
++ *     processing in the device path: Xiaomi's topology 0x10010315 (mic gain, EANS -- off by its calibration --,
++ *     an IIR treble cut, MBDRC) with its calibration. The two channels come up to us as they are, and the one
++ *     channel iOS gets is made here (apollo_mic_mix: 0 their average, 1 the main one, 2 the top one). If the
++ *     DSP refuses any of it (or anything else of this path fails), it is all undone and path 0 is set up in
++ *     its place, for the rest of the run.
++ *   0 Xiaomi's "voice-rec-mic": ADC1 alone on decimator 0, "ADC1 Volume" 12, "TX_DEC0 Volume" 87, no processing
++ *     (topology none): what was brought up first, kept as it was.
++ *
++ * The bus and the data ports as Android has them. ADC1 is SoundWire port type ADC1 = 18 and ADC4 is ADC4 = 21
++ * (dt-bindings/sound/audio-codec-port-types.h). The tree's qcom,tx_swr_ch_map (wcd938x_parse_port_mapping():
++ * port, type, channel mask, rate, master type) puts ADC1 on the codec's port 0 (its DP1), channel mask 1, and
++ * ADC4 on the codec's port 1 (its DP2), channel mask 2; the master's qcom,swr-port-mapping puts type 0x12 on
++ * its port 2, channel mask 1, and type 0x15 on its port 3, channel mask 2 (swrm_get_master_port()). With no
++ * "TX0 MODE"/"TX3 MODE" in Xiaomi's paths the ADCs' mode is 0 (ADC_MODE_INVALID): wcd938x_get_clk_rate() gives
++ * each port 9.6 MHz and the codec's TX clock rate is "9.6 MHz" (0, wcd938x_set_swr_clk_rate()); the bus runs at
++ * MCLK / 1 (divider 0), the frame 50 rows x 16 columns. The ssp period is swrm_get_ssp_period() of what
++ * swrm_update_bus_clk() adds up: one port, 9.6 MHz: 9.6 MHz x 2 / (50 x 16 x 4000) = 6; two ports, 19.2 MHz
++ * (swrm_get_clk_div_rate() leaves a sum above 9.6 MHz as it is, and swrm_get_clk_div() of 9.6 / 19.2 is 0):
++ * 12 -- as Android computes it for handset-mic. The ports' parameters are kona-port-config.h's
++ * tx_frame_params_default by the master's port (index port - 1): port 2 "TX1" si 1, offset1 1, offset2 0, lane
++ * 0; port 3 "TX2" si 1, offset1 0, offset2 0, lane 1 (the second data line, LPI GPIO 2); no hstart and hstop.
++ * They are written to the codec's ports and to the master's as swrm_copy_data_port_config() writes them, one
++ * master port after the other (the codec's with command id 0; no block or word-length controls: those are 0xFF
++ * there). Into the bank not in use, then the banks switched, then the other bank.
++ */
++struct swr_port {
++	uint8_t master_port, codec_port, master_mask, codec_mask, si, offset1, offset2, lane;
++};
++static const struct swr_port swr_ports[2] = {
++	{ 2, 0, 0x1, 0x1, 1, 1, 0, 0 },         /* ADC1 (the main microphone) */
++	{ 3, 1, 0x2, 0x2, 1, 0, 0, 1 },         /* ADC4 (the top one): path 1 only */
++};
++static uint32_t mic_path = 1;           /* boot-arg apollo_mic_path=N: 1 Android's handset-mic and its processing, 0 voice-rec-mic */
++static uint32_t mic_mix;                /* boot-arg apollo_mic_mix=N (path 1): 0 the two channels' average, 1 the main one, 2 the top one */
++static uint32_t pan_setting;            /* boot-arg apollo_mic_pan=N (path 1): the IIR's pan, in place of Xiaomi's 1 (see pp_params()) */
++static uint32_t ns_setting;             /* boot-arg apollo_mic_ns=1 (path 1): Xiaomi's noise suppressor on (see pp_params()) */
++static uint32_t drc_setting = 1;        /* boot-arg apollo_mic_drc=0 (path 1): Xiaomi's multiband DRC off (see pp_params()) */
++static unsigned channels = 1;           /* what the port, the path and the stream carry: 2 on path 1 */
++static uint8_t bank_now;
++static uint32_t adc_on = 1;             /* boot-arg apollo_mic_adc=0 (a test): the ADCs and their mic biases left off, the ports alone */
++static uint32_t test_bits;              /* boot-arg apollo_mic_test=N (tests): 1 no mic bias, 2 the ADCs' inputs held */
++
++static bool
++port_config(uint8_t bank, bool first)
++{
++	/* the codec's side (swrm_apply_port_config() first: the devices' clock halved in that bank, to all, id 0) */
++	if (first) {
++		to_all(SWRS_SCP_HOST_CLK_DIV2_CTL_BANK(bank), 0x01);
++	}
++	for (unsigned i = 0; i < (mic_path == 1 ? 2u : 1u); i++) {
++		const struct swr_port *p = &swr_ports[i];
++		char name[80];
++
++		swr_write(codec_device, SWRS_DP_CHANNEL_ENABLE_BANK(p->codec_port, bank), p->codec_mask, 0);
++		swr_write(codec_device, SWRS_DP_SAMPLE_CONTROL_1_BANK(p->codec_port, bank), p->si, 0);
++		swr_write(codec_device, SWRS_DP_OFFSET_CONTROL_1_BANK(p->codec_port, bank), p->offset1, 0);
++		swr_write(codec_device, SWRS_DP_OFFSET_CONTROL_2_BANK(p->codec_port, bank), p->offset2, 0);
++		swr_write(codec_device, SWRS_DP_LANE_CONTROL_BANK(p->codec_port, bank), p->lane, 0);
++		note("apollo mic: the codec's data port %u, bank %u: channels %#x on, sample interval %u, offsets %u %u, lane %u\n",
++		    p->codec_port + 1, bank, p->codec_mask, p->si, p->offset1, p->offset2, p->lane);
++		/* the master's port */
++		snprintf(name, sizeof(name), "DP_PORT_CTRL (port %u): channels %#x, offsets %u %u, interval %u", p->master_port,
++		    p->master_mask, p->offset1, p->offset2, p->si);
++		if (!put(&tx_swr, name, SWRM_DP_PORT_CTRL_BANK(p->master_port, bank),
++		    (uint32_t)p->master_mask << 24 | (uint32_t)p->offset2 << 16 | (uint32_t)p->offset1 << 8 | p->si, 0xffffffff)) {
++			return false;
++		}
++		snprintf(name, sizeof(name), "DP_PORT_CTRL_2 (port %u): lane %u", p->master_port, p->lane);
++		if (!put(&tx_swr, name, SWRM_DP_PORT_CTRL_2_BANK(p->master_port, bank), p->lane, 0xff)) {
++			return false;
++		}
++		/* (SWR_HSTOP_MAX_VAL << 4 | SWR_HSTART_MIN_VAL; on the POCO it reads 0 back whatever is written: said, not checked) */
++		snprintf(name, sizeof(name), "DP_PORT_HCTRL (port %u): hstop 15, hstart 0", p->master_port);
++		if (!put(&tx_swr, name, SWRM_DP_PORT_HCTRL_BANK(p->master_port, bank), 0xf0, 0)) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static bool
++datapath_on(void)
++{
++	uint8_t current = 0, bank;
++	uint32_t frame, ssp = mic_path == 1 ? 12 : 6;
++
++	/* wcd938x_tx_swr_ctrl(): the codec's TX clock rate ("9.6 MHz": 0) in the bank about to be used */
++	if (!swr_read(codec_device, SWRS_SCP_CONTROL, &current)) {
++		return false;
++	}
++	bank = (current & 0x40) ? 0 : 1;
++	if (!codec_bits(WCD_SWR_TX_CLK_RATE, bank ? 0xf0 : 0x0f, 0x00)) {
++		return false;
++	}
++	/* swrm_slvdev_datapath_control() */
++	bank = (swr_rd(SWRM_MCP_STATUS) & 1) ? 0 : 1;
++	if (!put(&tx_swr, "CPU_INTERRUPT_EN", SWRM_CPU_INTERRUPT_EN, SWRM_INTERRUPT_STATUS_MASK, 0) || !port_config(bank, true)) {
++		return false;
++	}
++	/* 50 rows (1), 16 columns (7), MCLK / 1 (divider 0), the ssp period */
++	frame = (swr_rd(SWRM_MCP_FRAME_CTRL_BANK(bank)) & ~0xff07ffu) | 1u << 3 | 7u | 0u << 8 | (ssp - 1) << 16;
++	if (!put(&tx_swr, ssp == 12 ? "MCP_FRAME_CTRL (the bank to come): 50 x 16, MCLK / 1, ssp 12" :
++	    "MCP_FRAME_CTRL (the bank to come): 50 x 16, MCLK / 1, ssp 6", SWRM_MCP_FRAME_CTRL_BANK(bank), frame, 0xff07ff)) {
++		return false;
++	}
++	broadcast(SWRS_SCP_FRAME_CTRL_BANK(bank), 1u << 3 | 7u);       /* (enable_bank_switch(): the switch itself) */
++	bank_now = (swr_rd(SWRM_MCP_STATUS) & 1);
++	say("apollo mic: the banks switched: the master is in bank %u now (asked for %u)\n", bank_now, bank);
++	if (bank_now != bank || !port_config(bank ? 0 : 1, false)) {
++		return false;
++	}
++	/* and the codec's rate in the other bank */
++	if (!codec_bits(WCD_SWR_TX_CLK_RATE, bank ? 0x0f : 0xf0, 0x00)) {
++		return false;
++	}
++	/* (what the codec's ports say they are set to, both banks; its interrupts) */
++	for (unsigned i = 0; i < (mic_path == 1 ? 2u : 1u); i++) {
++		uint8_t port = swr_ports[i].codec_port;
++
++		for (uint8_t b = 0; b < 2; b++) {
++			uint8_t v[6] = { 0 };
++
++			(void)swr_read(codec_device, SWRS_DP_CHANNEL_ENABLE_BANK(port, b), &v[0]);
++			(void)swr_read(codec_device, SWRS_DP_SAMPLE_CONTROL_1_BANK(port, b), &v[1]);
++			(void)swr_read(codec_device, SWRS_DP_OFFSET_CONTROL_1_BANK(port, b), &v[2]);
++			(void)swr_read(codec_device, SWRS_DP_LANE_CONTROL_BANK(port, b), &v[3]);
++			(void)swr_read(codec_device, SWRS_SCP_FRAME_CTRL_BANK(b), &v[4]);
++			(void)swr_read(codec_device, SWRS_SCP_HOST_CLK_DIV2_CTL_BANK(b), &v[5]);
++			note("apollo mic: the codec's DP%u, bank %u: channels %#x, interval %u, offset %u, lane %u; frame %#x, div2 %#x\n",
++			    port + 1, b, v[0], v[1], v[2], v[3], v[4], v[5]);
++		}
++	}
++	{
++		uint8_t status = 0, control = 0, dp_int = 0, dp_ctl = 0;
++
++		(void)swr_read(codec_device, 0x0040, &status);
++		(void)swr_read(codec_device, SWRS_SCP_CONTROL, &control);
++		(void)swr_read(codec_device, 0x0100, &dp_int);
++		(void)swr_read(codec_device, 0x0102, &dp_ctl);
++		note("apollo mic: the codec's SCP int status %#x, control/status %#x; DP1 int status %#x, port control %#x; the "
++		    "master's interrupt status %#x\n", status, control, dp_int, dp_ctl, swr_rd(0x200));
++	}
++	return true;
++}
++
++#define WCD_ANA_TX_CH4                  0x3011
++#define WCD_CDC_TX_ANA_MODE_2_3         0x3411
++#define WCD_TX_NEW_AMIC_MUX_CFG         0x3127
++
++/*
++ * "MIC BIAS1" (wcd938x_micbias_control(MICB_ENABLE)), "ADC1 Volume" (12 on path 0, Xiaomi's "voice-rec-mic";
++ * 6 on path 1, its "handset-mic"), then ADC1 as wcd938x_codec_enable_adc() and wcd938x_enable_req() set it
++ * up: its mode the default one (ADC_MODE_VAL_NORMAL, 3), and its input held only for the moment its mode is
++ * written (this techpack's enable_adc() lets go of it at once: wcd938x_tx_channel_config(..., 1), then (..., 0))
++ */
++static bool
++adc1_on(void)
++{
++	return codec_bits(WCD_CDC_DIG_CLK_CTL, 0xf0, 0xf0) && codec_bits(WCD_CDC_ANA_CLK_CTL, 0x10, 0x10) &&
++	       codec_bits(WCD_CDC_ANA_TX_CLK_CTL, 0x01, 0x01) && codec_bits(WCD_MICB1_TEST_CTL_2, 0x01, 0x01) &&
++	       codec_bits(WCD_MICB2_TEST_CTL_2, 0x01, 0x01) && codec_bits(WCD_MICB3_TEST_CTL_2, 0x01, 0x01) &&
++	       codec_bits(WCD_MICB4_TEST_CTL_2, 0x01, 0x01) && codec_bits(WCD_ANA_MICB1, 0xc0, (test_bits & 1) ? 0x00 : 0x40) &&
++	       /* "ADC1 Volume": WCD938X_ANA_TX_CH1 bits 4:0 (SOC_SINGLE_TLV, max 20) */
++	       codec_bits(WCD_ANA_TX_CH1, 0x1f, mic_path == 1 ? 6 : 12) &&
++	       codec_bits(WCD_CDC_ANA_CLK_CTL, 0x08, 0x08) && codec_bits(WCD_CDC_ANA_CLK_CTL, 0x10, 0x10) &&
++	       codec_bits(WCD_CDC_REQ_CTL, 0x02, 0x02) && codec_bits(WCD_CDC_REQ_CTL, 0x01, 0x00) &&
++	       codec_bits(WCD_ANA_TX_CH2, 0x40, 0x40) && codec_bits(WCD_CDC_TX_ANA_MODE_0_1, 0x0f, 0x03) &&
++	       codec_bits(WCD_CDC_DIG_CLK_CTL, 0x10, 0x10) && codec_bits(WCD_ANA_TX_CH2, 0x40, (test_bits & 2) ? 0x40 : 0x00);
++}
++
++/*
++ * Path 1: the top microphone. "MIC BIAS4" (the tree's routing: AMIC5 <- MIC BIAS4; the bias registers'
++ * common part is already on), "ADC4 MUX" INP5 (WCD938X_TX_NEW_AMIC_MUX_CFG bit 5: 0), "ADC4 Volume" 6
++ * (WCD938X_ANA_TX_CH4 bits 4:0), then ADC4 as wcd938x_codec_enable_adc() sets up its channel 3:
++ * CDC_ANA_CLK_CTL, its hold (WCD938X_ANA_TX_CH4 bit 5, wcd938x_tx_channel_config()), its mode in
++ * TX_ANA_MODE_2_3 bits 7:4 (3, normal), its digital clock (CDC_DIG_CLK_CTL bit 7), the hold let go.
++ */
++static bool
++adc4_on(void)
++{
++	return codec_bits(WCD_ANA_MICB4, 0xc0, (test_bits & 1) ? 0x00 : 0x40) &&
++	       codec_bits(WCD_TX_NEW_AMIC_MUX_CFG, 0x20, 0x00) &&
++	       codec_bits(WCD_ANA_TX_CH4, 0x1f, 6) &&
++	       codec_bits(WCD_CDC_ANA_CLK_CTL, 0x08, 0x08) && codec_bits(WCD_CDC_ANA_CLK_CTL, 0x10, 0x10) &&
++	       codec_bits(WCD_ANA_TX_CH4, 0x20, 0x20) && codec_bits(WCD_CDC_TX_ANA_MODE_2_3, 0xf0, 0x30) &&
++	       codec_bits(WCD_CDC_DIG_CLK_CTL, 0x80, 0x80) && codec_bits(WCD_ANA_TX_CH4, 0x20, (test_bits & 2) ? 0x20 : 0x00);
++}
++
++/* ---- the TX macro's decimators ---------------------------------------------------------------------------- */
++
++/* bolero-cdc-registers.h: decimator d's at 0x400 + 0x80 d (TX_MACRO_TX_PATH_OFFSET), its input mux at 0x100 + 8 d */
++#define TX_ADC_MUX_CFG0(d)              (0x100 + 0x8 * (d))
++#define TX_ADC_MUX_CFG1(d)              (0x104 + 0x8 * (d))
++#define TX_PATH_CTL(d)                  (0x400 + 0x80 * (d))
++#define TX_PATH_CFG0(d)                 (0x404 + 0x80 * (d))
++#define TX_VOL_CTL(d)                   (0x40c + 0x80 * (d))
++#define TX_PATH_SEC2(d)                 (0x418 + 0x80 * (d))
++#define TX_PATH_SEC7(d)                 (0x42c + 0x80 * (d))
++#define SMIC_ADC0                       1       /* smic_mux_text: "ZERO", "ADC0", "ADC1", "ADC2", "ADC3", ... */
++#define SMIC_ADC3                       4
++#define DEC0_VOLUME                     3       /* "TX_DEC0 Volume" 87 (path 0): SOC_SINGLE_SX_TLV(..., -84, 40): 87 - 84 = +3 dB */
++
++static uint32_t found_dec[2][7];
++static uint32_t smic_input = SMIC_ADC0; /* boot-arg apollo_mic_input=N (path 0): TX SMIC MUX0's input (1 ADC0, Android's; 0 ZERO, a test) */
++static bool dec_taken[2];
++static uint8_t dec_input[2];            /* what feeds each decimator in use (its SMIC MUX value) */
++static uint8_t hpf_cut_off[2];          /* the decimators' high-pass filters as they were found */
++
++static uint32_t
++dec_reg(unsigned d, unsigned i)
++{
++	static const uint32_t r[7] = { 0x100, 0x104, 0x400, 0x404, 0x40c, 0x418, 0x42c };
++
++	return i < 2 ? r[i] + 0x8 * d : r[i] + 0x80 * d;
++}
++
++/*
++ * Which bolero this is: its core ID, as bolero_soc_codec_probe() reads it. This techpack takes 02 0E for
++ * 2.1 and otherwise keeps the version it gave by the macros' count (1.2 here); what kona's own reads is not
++ * known (said). A 2.1 is not what this file was written for: it stops.
++ */
++static bool
++bolero_look(void)
++{
++	uint32_t id0 = get(&va_macro, "CORE_ID_0", VA_CORE_ID_0) & 0xff, id1 = get(&va_macro, "CORE_ID_1", VA_CORE_ID_1) & 0xff;
++
++	if (id0 == 0x02 && id1 == 0x0e) {
++		say("apollo mic: the digital codec says it is bolero 2.1 (core ID %02x %02x): not kona's 1.x: STOPPING HERE\n", id0, id1);
++		broken = true;
++		return false;
++	}
++	say("apollo mic: the digital codec's core ID is %02x %02x: bolero 1.x, as this techpack takes it on kona\n", id0, id1);
++	return true;
++}
++
++/*
++ * Decimator d fed from `input' at `volume' (signed dB): tx_macro_init()'s tx_macro_reg_init (TX0_TX_PATH_SEC7,
++ * decimator 0's only), the mixer controls' writes (tx_macro_put_dec_enum(): "TX SMIC MUXd" ADC0..3 -- below 5,
++ * an analog mic: CFG0 bit 7 cleared --; "TX DECd MUX" SWR_MIC: CFG1's 1; "TX_DECd Volume"),
++ * tx_macro_hw_params()' rate (48 kHz: 4), and tx_macro_enable_dec()'s PRE_PMU and POST_PMU.
++ */
++static bool
++dec_on(unsigned d, uint8_t input, uint8_t volume)
++{
++	char name[96];
++	uint32_t cfg0;
++
++	for (unsigned i = 0; i < 7; i++) {
++		found_dec[d][i] = get(&tx_macro, "(as found)", dec_reg(d, i));
++	}
++	dec_taken[d] = true;
++	dec_input[d] = input;
++	if (d == 0 && !put_bits(&tx_macro, "TX0_TX_PATH_SEC7 (tx_macro_reg_init)", TX_PATH_SEC7(0), 0x3f, 0x0a)) {
++		return false;
++	}
++	snprintf(name, sizeof(name), "ADC_MUX%u_CFG0: %s", d, input == SMIC_ADC0 ? "ADC0 (the main microphone)" :
++	    input == SMIC_ADC3 ? "ADC3 (the top microphone)" : "ANOTHER INPUT (apollo_mic_input)");
++	if (!put_bits(&tx_macro, "TX_PATH_CFG0: an analog mic", TX_PATH_CFG0(d), 0x80, 0x00) ||
++	    !put_bits(&tx_macro, name, TX_ADC_MUX_CFG0(d), 0x0f, input & 0x0f) ||
++	    !put_bits(&tx_macro, "ADC_MUX_CFG1: SWR_MIC", TX_ADC_MUX_CFG1(d), 0x03, 0x01)) {
++		return false;
++	}
++	snprintf(name, sizeof(name), "TX%u_TX_VOL_CTL: %+d dB (TX_DEC%u Volume %d)", d, (int)(int8_t)volume, d, 84 + (int)(int8_t)volume);
++	if (!put(&tx_macro, name, TX_VOL_CTL(d), volume, 0xff) ||
++	    !put_bits(&tx_macro, "TX_PATH_CTL: 48 kHz", TX_PATH_CTL(d), 0x0f, 0x04) ||
++	    /* PRE_PMU: the decimator's mode (0), its PGA muted */
++	    !put_bits(&tx_macro, "TX_PATH_CFG0: mode 0", TX_PATH_CFG0(d), 0x06, 0x00) ||
++	    !put_bits(&tx_macro, "TX_PATH_CTL: muted", TX_PATH_CTL(d), 0x10, 0x10) ||
++	    /* POST_PMU: on (an analog mic: the gate not cleared first); the high-pass filter at 150 Hz while it settles */
++	    !put_bits(&tx_macro, "TX_PATH_CTL: on", TX_PATH_CTL(d), 0x20, 0x20)) {
++		return false;
++	}
++	cfg0 = get(&tx_macro, "TX_PATH_CFG0", TX_PATH_CFG0(d));
++	hpf_cut_off[d] = (cfg0 & 0x60) >> 5;
++	if (hpf_cut_off[d] != 2 && !put_bits(&tx_macro, "TX_PATH_CFG0: high-pass 150 Hz", TX_PATH_CFG0(d), 0x60, 2u << 5)) {
++		return false;
++	}
++	/* the filter's gate: 2, then (an analog mic) 1; "6ms delay is required as per HW spec" */
++	if (!put_bits(&tx_macro, "TX_PATH_SEC2: filter gate", TX_PATH_SEC2(d), 0x03, 0x02) ||
++	    !put_bits(&tx_macro, "TX_PATH_SEC2", TX_PATH_SEC2(d), 0x03, 0x01)) {
++		return false;
++	}
++	sleep_ms(6);
++	/* "apply gain after decimator is enabled": the gain written again */
++	return put(&tx_macro, "TX_VOL_CTL: written again", TX_VOL_CTL(d), get(&tx_macro, "TX_VOL_CTL", TX_VOL_CTL(d)), 0xff);
++}
++
++/* after TX_MACRO_AMIC_UNMUTE_DELAY_MS (100; tx_unmute_delay's 40 is less): the PGA unmuted */
++static bool
++dec_unmute(unsigned d)
++{
++	return !dec_taken[d] || put_bits(&tx_macro, "TX_PATH_CTL: unmuted", TX_PATH_CTL(d), 0x10, 0x00);
++}
++
++/*
++ * after TX_MACRO_AMIC_HPF_DELAY_MS (300), tx_macro_tx_hpf_corner_freq_callback() for an analog mic (queued only
++ * if the filter was not at 150 Hz already): the codec's hold on the ADC let go (bolero_clear_amic_tx_hold(), the
++ * codec's TX_CH_HOLD_CLEAR: ADC1's ANA_TX_CH2 bit 6, ADC4's ANA_TX_CH4 bit 5), the filter back to where it was,
++ * its gate 2, 20 us at 48 kHz, 1
++ */
++static bool
++dec_settled(unsigned d)
++{
++	bool top = dec_input[d] == SMIC_ADC3;
++
++	if (!dec_taken[d] || hpf_cut_off[d] == 2) {
++		return true;
++	}
++	return codec_bits(top ? WCD_ANA_TX_CH4 : WCD_ANA_TX_CH2, top ? 0x20 : 0x40, (test_bits & 2) ? 0xff : 0x00) &&
++	       put_bits(&tx_macro, "TX_PATH_CFG0: high-pass as it was", TX_PATH_CFG0(d), 0x60, (uint32_t)hpf_cut_off[d] << 5) &&
++	       put_bits(&tx_macro, "TX_PATH_SEC2: filter gate", TX_PATH_SEC2(d), 0x03, 0x02) &&
++	       (spin_us(21), put_bits(&tx_macro, "TX_PATH_SEC2", TX_PATH_SEC2(d), 0x03, 0x01));
++}
++
++/* PRE_PMD (muted), POST_PMD (off, mode 0, the mute bit back), then all as it was found */
++static void
++dec_off(unsigned d)
++{
++	if (!dec_taken[d]) {
++		return;
++	}
++	broken = false;
++	(void)put_bits(&tx_macro, "TX_PATH_CTL: muted", TX_PATH_CTL(d), 0x10, 0x10);
++	(void)put_bits(&tx_macro, "TX_PATH_CTL: off", TX_PATH_CTL(d), 0x20, 0x00);
++	(void)put_bits(&tx_macro, "TX_PATH_CFG0: mode 0", TX_PATH_CFG0(d), 0x06, 0x00);
++	for (unsigned i = 0; i < 7; i++) {
++		(void)put(&tx_macro, "(put back as found)", dec_reg(d, i), found_dec[d][i], 0);
++	}
++	dec_taken[d] = false;
++}
++
++/* the decimators of the path: 0 (path 0: ADC0 at +3 dB; path 1: ADC3, the top microphone, at 0 dB), 1 (path 1: ADC0 at 0 dB) */
++static bool
++decimators_on(void)
++{
++	if (mic_path != 1) {
++		return dec_on(0, (uint8_t)smic_input, DEC0_VOLUME);
++	}
++	return dec_on(0, SMIC_ADC3, 0) && dec_on(1, SMIC_ADC0, 0);
++}
++
++/* ---- the DSP: the codec DMA port, a device path for recording, a stream that is read ------------------ */
++
++#define APR_SVC_ADSP_CORE                       3
++#define APR_SVC_ASM                             7
++#define APR_SVC_ADM                             8
++#define AFE_PORT_CMD_DEVICE_START               0x000100e5u
++#define AFE_PORT_CMD_DEVICE_STOP                0x000100e6u
++#define AFE_PORT_CMD_SET_PARAM_V2               0x000100efu
++#define AFE_MODULE_AUDIO_DEV_INTERFACE          0x0001020cu
++#define AFE_PARAM_ID_CODEC_DMA_CONFIG           0x000102b8u     /* (apr_audio-v2.h) */
++#define MIC_PORT                                0xb037          /* AFE_PORT_ID_TX_CODEC_DMA_TX_3 */
++#define ADM_CMD_SHARED_MEM_MAP_REGIONS          0x00010322u
++#define ADM_CMDRSP_SHARED_MEM_MAP_REGIONS       0x00010323u
++#define ADM_CMD_SHARED_MEM_UNMAP_REGIONS        0x00010324u
++#define ADM_CMD_ADD_TOPOLOGIES                  0x00010335u
++#define ADM_CMD_DEVICE_OPEN_V5                  0x00010326u
++#define ADM_CMDRSP_DEVICE_OPEN_V5               0x00010329u
++#define ADM_CMD_DEVICE_CLOSE_V5                 0x00010327u
++#define ADM_CMD_MATRIX_MAP_ROUTINGS_V5          0x00010325u
++#define ADM_CMD_SET_PP_PARAMS_V6                0x0001035du
++#define ADM_PATH_LIVE_RECORDING                 2
++#define ADM_MATRIX_AUDIO_TX                     1
++#define ADM_TOPOLOGY_NONE                       0x00010312u
++#define ADM_TOPOLOGY_XIAOMI_TX                  0x10010315u     /* "AUDIO_TX_MONO_COPP_MBDRC_V4", Xiaomi's custom one */
++#define AVCS_CMD_SHARED_MEM_MAP_REGIONS         0x00012924u     /* (q6core.h) */
++#define AVCS_CMDRSP_SHARED_MEM_MAP_REGIONS      0x00012925u
++#define AVCS_CMD_SHARED_MEM_UNMAP_REGIONS       0x00012926u
++#define AVCS_CMD_REGISTER_TOPOLOGIES            0x00012923u
++#define ASM_CMD_SHARED_MEM_MAP_REGIONS          0x00010d92u
++#define ASM_CMDRSP_SHARED_MEM_MAP_REGIONS       0x00010d93u
++#define ASM_CMD_SHARED_MEM_UNMAP_REGIONS        0x00010d94u
++#define ASM_STREAM_CMD_OPEN_READ_V3             0x00010db4u
++#define ASM_STREAM_CMD_SET_ENCDEC_PARAM         0x00010c10u
++#define ASM_PARAM_ID_ENCDEC_ENC_CFG_BLK_V2      0x00010da3u
++#define ASM_SESSION_CMD_RUN_V2                  0x00010daau
++#define ASM_DATA_CMD_READ_V2                    0x00010dacu
++#define ASM_DATA_EVENT_READ_DONE_V2             0x00010d9au
++#define ASM_STREAM_CMD_CLOSE                    0x00010bcdu
++#define ASM_TOPOLOGY_NONE                       0x00010c68u
++#define ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2      0x00010da5u
++#define ASM_SHMEM_4K_POOL                       3               /* (ADSP_MEMORY_MAP_SHMEM8_4K_POOL, for all three services) */
++#define MIC_SESSION                             2               /* (the speakers' is 1, hakios.apollo_sound.c) */
++#define MIC_SESSION_FALLBACK                    3               /* path 0 after a failed path 1: a session nothing was routed to */
++#define MIC_STREAM_PORT                         ((uint16_t)(mic_session << 8 | 1))
++#define ADM_CMD_SET_PP_PARAMS_V5                0x00010328u
++#define AVCS_CMD_GET_FWK_VERSION                0x0001292cu     /* (apr_audio-v2.h) */
++#define AVCS_CMDRSP_GET_FWK_VERSION             0x0001292du
++#define READ_TOKEN                              0x40000000u     /* | the period */
++#define PCM_CHANNEL_FL                          1
++#define PCM_CHANNEL_FR                          2
++#define PCM_CHANNEL_FC                          3
++#define MIC_RATE                                48000
++#define MIC_PERIODS                             8
++#define MIC_PERIOD_FRAMES                       960             /* 20 ms; one channel (path 0) or two (path 1) of 16 bits */
++#define MIC_PERIOD_BYTES                        (MIC_PERIOD_FRAMES * 2 * channels)
++#define TOPOLOGY_PAGE                           MIC_PERIODS     /* the page of our DSP memory behind the periods: the topology */
++#define CAL_PAGE                                (MIC_PERIODS + 1)       /* ... and the one behind it: the device path's calibration */
++#define APR_PAYLOAD_MOST                        256             /* apollo_adsp_apr()'s cap: a packet of sizeof(struct apr_header) + 256 */
++
++/*
++ * Xiaomi's calibration data, from its ACDB (/vendor/etc/acdbdata/Tutu/Tutu_Global_cal.acdb and Tutu_Handset_cal.acdb
++ * on the phone). It is Xiaomi's, so it is not in this repository: devices/mi-10t/pull-firmware.sh pulls the two
++ * files and devices/mi-10t/tools/acdb-mic.py writes these four out of them into fw-audio-apollo/, which goes into
++ * the image's fw/ (userland/firmware.sh). They are read at path 1's start (mic_fw_load()), checked, and kept for
++ * the run; if any is missing or not what it should be, path 0 is used.
++ *   mic_topology_v2.bin      global property 0x132ac: the definition of topology 0x10010315 alone (count 1), the
++ *                            AVCS REGISTER_TOPOLOGIES v2 form: version 2, the topology, config 1, 4 modules with
++ *                            their instance IDs: 0x10c35 (mic gain), 0x1091f (EANS), 0x10c02 instance 0x8000 (IIR),
++ *                            0x10943 (MBDRC v4); 52 bytes
++ *   mic_topology_v1.bin      global property 0x131a7: the same, v1 form (no instance IDs); 36 bytes
++ *   mic_topology_legacy.bin  global property 0x12e47: the same, ADM_CMD_ADD_TOPOLOGIES' form (16 module slots of 6
++ *                            words); 396 bytes
++ *   mic_audproc.bin          Tutu_Handset_cal.acdb, the ADM's processing calibration for device 4 ("HANDSET_MIC"),
++ *                            app type 0x11132 (GENERAL_RECORDING), 48 kHz: 9 parameters, each param_hdr_v3 (module,
++ *                            instance, reserved, parameter, size) and its data, as ADM_CMD_SET_PP_PARAMS_V6 takes
++ *                            them; 504 bytes
++ * (No audio volume calibration for device 4, no AFE calibration for the TX port.)
++ */
++#define MIC_FW_MOST                             3072    /* what any of them may be (the calibration goes into one page) */
++struct mic_fw {
++	const char *name;
++	const uint8_t *data;
++	uint64_t size;
++};
++static struct mic_fw fw_topology_v2 = { "mic_topology_v2.bin", NULL, 0 }, fw_topology_v1 = { "mic_topology_v1.bin", NULL, 0 },
++    fw_topology_legacy = { "mic_topology_legacy.bin", NULL, 0 }, fw_audproc = { "mic_audproc.bin", NULL, 0 };
++static bool fw_loaded;
++static uintptr_t mic_memory;
++static uint64_t mic_address;
++static bool memory_taken, mic_mapped, mic_copp_open, mic_stream_open, mic_port_on, topology_registered;
++static uint32_t mic_session = MIC_SESSION;
++static int topology_version;            /* the definition the DSP took: 2 (with instance IDs), 1 (without), 0 (the ADM's legacy one) */
++static bool fwk_asked;
++static bool cal_mapped;                 /* the calibration's page mapped for the ADM: unmapped when the path is taken down */
++static uint32_t cal_handle;
++static bool restart_port;               /* path 0 after a failed path 1: the port stopped once more before it is set up */
++static volatile uint32_t first_read_ms, first_read_status, first_read_bytes, first_error_status;
++static uint64_t listen_began;
++static uint32_t mic_map_handle, mic_copp;
++static volatile uint32_t read_ready, read_errors, reads_done;
++static volatile uint32_t read_sizes[MIC_PERIODS];
++
++static bool
++mic_events(uint8_t service, __unused uint16_t port, uint32_t opcode, uint32_t token, const uint32_t *payload, uint32_t length)
++{
++	if (service != APR_SVC_ASM || !(token & READ_TOKEN) || (token & 0x3fffffff) >= MIC_PERIODS) {
++		return false;
++	}
++	if (reads_done == 0 && first_read_ms == 0) {
++		uint64_t ns;
++
++		/* (the first answer to a read, whatever it is: said by listen()) */
++		absolutetime_to_nanoseconds(mach_absolute_time() - listen_began, &ns);
++		first_read_ms = (uint32_t)(ns / NSEC_PER_MSEC) + 1;
++		first_read_status = opcode == ASM_DATA_EVENT_READ_DONE_V2 ? (length >= 4 ? payload[0] : 0xffffffffu) :
++		    (length >= 8 ? payload[1] : 0xffffffffu);
++		first_read_bytes = opcode == ASM_DATA_EVENT_READ_DONE_V2 && length >= 24 ? payload[4] : 0;
++	}
++	if (opcode == ASM_DATA_EVENT_READ_DONE_V2) {
++		if (length < 24 || payload[0] != 0) {
++			if (read_errors == 0) {
++				first_error_status = length >= 4 ? payload[0] : 0xffffffffu;
++			}
++			OSIncrementAtomic((volatile SInt32 *)&read_errors);
++		}
++		read_sizes[token & 0x3fffffff] = length >= 24 ? payload[4] : 0;
++		OSIncrementAtomic((volatile SInt32 *)&reads_done);
++		OSBitOrAtomic(1u << (token & 31), &read_ready);
++		return true;
++	}
++	if (opcode == APR_BASIC_RSP_RESULT) {
++		if (read_errors == 0) {
++			first_error_status = length >= 8 ? payload[1] : 0xffffffffu;
++		}
++		OSIncrementAtomic((volatile SInt32 *)&read_errors);
++		OSBitOrAtomic(1u << (token & 31), &read_ready);
++		read_sizes[token & 0x3fffffff] = 0;
++		return true;
++	}
++	return false;
++}
++
++static bool
++mic_read(unsigned period)
++{
++	uint32_t read[5] = { (uint32_t)(mic_address + 4096 * period), (uint32_t)((mic_address + 4096 * period) >> 32),
++		             mic_map_handle, MIC_PERIOD_BYTES, period };
++
++	return apollo_adsp_apr(APR_SVC_ASM, MIC_STREAM_PORT, READ_TOKEN | period, ASM_DATA_CMD_READ_V2, read, sizeof(read), 0, NULL);
++}
++
++static bool
++afe_port_param(uint32_t module, uint32_t param, const void *data, uint16_t size, const char *what)
++{
++	uint8_t packet[16 + sizeof(struct afe_param) + 64];
++	struct afe_param *p = (struct afe_param *)(packet + 16);
++
++	bzero(packet, sizeof(packet));
++	*(uint16_t *)packet = MIC_PORT;
++	*(uint16_t *)(packet + 2) = (uint16_t)(sizeof(*p) + size);
++	p->module = module;
++	p->param = param;
++	p->size = size;
++	memcpy(packet + 16 + sizeof(*p), data, size);
++	return command(what, APR_SVC_AFE, AFE_PORT_CMD_SET_PARAM_V2, packet, 16 + (uint32_t)sizeof(*p) + size, 0, NULL);
++}
++
++/*
++ * A command to a service's port, its basic answer looked at: the ADM's commands to a device path go to the
++ * path's COPP as the port (q6adm.c: dest_port = the COPP's id). true only if done.
++ */
++static bool
++port_command(const char *what, uint8_t service, uint16_t port, uint32_t opcode, const void *payload, uint32_t length)
++{
++	struct hakios_apr_answer answer;
++
++	if (!apollo_adsp_apr(service, port, 0, opcode, payload, length, APR_WAIT_MS, &answer)) {
++		say("apollo mic: %s (opcode %#x): NO ANSWER\n", what, opcode);
++		return false;
++	}
++	if (answer.opcode == APR_BASIC_RSP_RESULT && answer.words[0] == opcode) {
++		if (answer.words[1] == 0) {
++			note("apollo mic: %s: done\n", what);
++			return true;
++		}
++		say("apollo mic: %s: REFUSED: %s\n", what, dsp_error(answer.words[1]));
++		return false;
++	}
++	say("apollo mic: %s: an answer not expected: opcode %#x, %u bytes: %#x %#x\n", what, answer.opcode, answer.length,
++	    answer.words[0], answer.words[1]);
++	return false;
++}
++
++/*
++ * One of the four files of Xiaomi's data: fw/ of the small image (hakios_image_file(): the image's own memory), else
++ * /fw on the root (apollo_adsp_fw_file(): ours); kept for the run either way.
++ */
++extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
++static bool
++mic_fw_file(struct mic_fw *f)
++{
++	f->data = hakios_image_file("fw", f->name, &f->size, NULL);
++	if (f->data == NULL) {
++		f->data = apollo_adsp_fw_file(f->name, &f->size);
++	}
++	if (f->data == NULL) {
++		/* apollo: our tool and folder */
++		say("apollo mic: /usr/local/fw/%s is NOT THERE: it comes from the phone's ACDB -- tools/pull-mic-haptic-fw.sh, and its "
++		    "list for one boot\n", f->name);
++		return false;
++	}
++	if (f->size < 8 || f->size > MIC_FW_MOST || (f->size & 3) != 0) {
++		say("apollo mic: fw/%s: %llu bytes, NOT A SIZE IT CAN HAVE\n", f->name, f->size);
++		return false;
++	}
++	return true;
++}
++
++/* a topology definition file: one topology (count 1), 0x10010315, whose definition ends exactly at the file's end */
++static bool
++mic_fw_topology(const struct mic_fw *f, int kind)
++{
++	const uint32_t *w = (const uint32_t *)f->data;
++	uint32_t words = (uint32_t)(f->size / 4), topology, end;
++
++	if (kind == 0) {                /* legacy: count, topology, modules, 16 slots of 6 words */
++		topology = w[1];
++		end = 1 + 2 + 16 * 6;
++	} else {                        /* v1 / v2: count, version, topology, config, modules, modules' words */
++		topology = words >= 5 ? w[2] : 0;
++		end = words >= 5 ? 5 + (kind == 2 ? 2 : 1) * w[4] : ~0u;
++	}
++	if (w[0] != 1 || topology != ADM_TOPOLOGY_XIAOMI_TX || end != words) {
++		say("apollo mic: fw/%s: NOT ONE DEFINITION OF TOPOLOGY 0x10010315 (count %u, topology %#x, %u bytes for %u): not used\n",
++		    f->name, w[0], topology, (unsigned)f->size, end == ~0u ? 0 : 4 * end);
++		return false;
++	}
++	return true;
++}
++
++/* the calibration file: param_hdr_v3 headers and their data, walked exactly to the file's end */
++static bool
++mic_fw_audproc(const struct mic_fw *f)
++{
++	uint32_t at = 0, count = 0;
++
++	while (at + 16 <= f->size) {
++		uint32_t size = *(const uint32_t *)(f->data + at + 12);
++
++		if ((size & 3) != 0 || size > f->size - at - 16) {
++			break;
++		}
++		at += 16 + size;
++		count++;
++	}
++	if (at != f->size || count == 0) {
++		say("apollo mic: fw/%s: its parameters do not walk to its end (%u parameters, %u of %u bytes): not used\n", f->name,
++		    count, at, (unsigned)f->size);
++		return false;
++	}
++	say("apollo mic: fw/%s: %u parameters, %u bytes\n", f->name, count, at);
++	return true;
++}
++
++/* All four, once a run: false (and said) if any is missing or not what it should be: path 1 is then not taken. */
++static bool
++mic_fw_load(void)
++{
++	if (fw_loaded) {
++		return true;
++	}
++	fw_loaded = mic_fw_file(&fw_topology_v2) && mic_fw_topology(&fw_topology_v2, 2) &&
++	    mic_fw_file(&fw_topology_v1) && mic_fw_topology(&fw_topology_v1, 1) &&
++	    mic_fw_file(&fw_topology_legacy) && mic_fw_topology(&fw_topology_legacy, 0) &&
++	    mic_fw_file(&fw_audproc) && mic_fw_audproc(&fw_audproc);
++	if (fw_loaded) {
++		say("apollo mic: Xiaomi's topology and calibration for the device path are in fw/ (from the phone's ACDB)\n");
++	}
++	return fw_loaded;
++}
++
++/*
++ * One way of making topology 0x10010315 known to the DSP, out of band: the definition copied into the page of our
++ * DSP memory behind the periods (cleaned out of our caches: the DSP reads memory), that page mapped for the
++ * service (pool 3, as q6core_map_memory_regions() and the ADM's remap_cal_data() map it), the registration
++ * pointing at it, the page unmapped again (q6core_send_custom_topologies(), send_adm_custom_topology()).
++ */
++static bool
++topology_try(const char *how, uint8_t service, uint32_t map_op, uint32_t map_rsp, uint32_t register_op, uint32_t unmap_op,
++    const uint8_t *blob, uint32_t size)
++{
++	struct {
++		uint16_t pool, regions;
++		uint32_t property, low, high, size;
++	} __attribute__((packed)) map = { ASM_SHMEM_4K_POOL, 1, 0, 0, 0, 4096 };
++	uint64_t address = mic_address + 4096 * TOPOLOGY_PAGE;
++	uint32_t registration[4], handle;
++	struct hakios_apr_answer answer;
++	uint8_t *page = (uint8_t *)(mic_memory + 4096 * TOPOLOGY_PAGE);
++	char what[120];
++	bool done;
++
++	bzero(page, 4096);
++	memcpy(page, blob, size);
++	for (vm_offset_t line = (vm_offset_t)page; line < (vm_offset_t)page + 4096; line += 64) {
++		__asm__ volatile ("dc cvac, %0" : : "r" (line));        /* the DSP reads memory, not our caches */
++	}
++	__asm__ volatile ("dsb sy");
++	map.low = (uint32_t)address;
++	map.high = (uint32_t)(address >> 32);
++	snprintf(what, sizeof(what), "the topology's page, mapped for the %s", how);
++	if (!command(what, service, map_op, &map, sizeof(map), map_rsp, &answer)) {
++		return false;
++	}
++	handle = answer.words[0];
++	registration[0] = (uint32_t)address;
++	registration[1] = (uint32_t)(address >> 32);
++	registration[2] = handle;
++	registration[3] = size;
++	snprintf(what, sizeof(what), "topology 0x10010315 registered: %s, %u bytes at %#llx, handle %#x", how, size, address, handle);
++	done = port_command(what, service, 0, register_op, registration, sizeof(registration));
++	snprintf(what, sizeof(what), "the topology's page, unmapped for the %s", how);
++	(void)command(what, service, unmap_op, &handle, sizeof(handle), 0, NULL);
++	return done;
++}
++
++/* Xiaomi's topology made known to the DSP once a run: AVCS v2, else v1, else the ADM's legacy command. */
++static bool
++topology_register(void)
++{
++	if (topology_registered) {
++		return true;
++	}
++	topology_version = 2;
++	topology_registered =
++	    topology_try("core service (AVCS, v2 definition)", APR_SVC_ADSP_CORE, AVCS_CMD_SHARED_MEM_MAP_REGIONS,
++	    AVCS_CMDRSP_SHARED_MEM_MAP_REGIONS, AVCS_CMD_REGISTER_TOPOLOGIES, AVCS_CMD_SHARED_MEM_UNMAP_REGIONS, fw_topology_v2.data,
++	    (uint32_t)fw_topology_v2.size) ||
++	    (topology_version = 1, topology_try("core service (AVCS, v1 definition)", APR_SVC_ADSP_CORE, AVCS_CMD_SHARED_MEM_MAP_REGIONS,
++	    AVCS_CMDRSP_SHARED_MEM_MAP_REGIONS, AVCS_CMD_REGISTER_TOPOLOGIES, AVCS_CMD_SHARED_MEM_UNMAP_REGIONS, fw_topology_v1.data,
++	    (uint32_t)fw_topology_v1.size)) ||
++	    (topology_version = 0, topology_try("ADM (legacy ADD_TOPOLOGIES)", APR_SVC_ADM, ADM_CMD_SHARED_MEM_MAP_REGIONS, ADM_CMDRSP_SHARED_MEM_MAP_REGIONS,
++	    ADM_CMD_ADD_TOPOLOGIES, ADM_CMD_SHARED_MEM_UNMAP_REGIONS, fw_topology_legacy.data,
++	    (uint32_t)fw_topology_legacy.size));
++	say("apollo mic: Xiaomi's topology 0x10010315 %s\n", topology_registered ? "IS KNOWN TO THE DSP" :
++	    "COULD NOT BE REGISTERED in any of the three ways");
++	return topology_registered;
++}
++
++/*
++ * What the DSP says it is (q6core_send_get_avcs_fwk_ver_cmd(): AVCS_CMD_GET_FWK_VERSION, no payload; its answer
++ * avcs_get_fwk_version, then each service's ID and API version), asked once a run and said, for the log.
++ */
++static void
++fwk_version(void)
++{
++	struct hakios_apr_answer answer;
++	uint32_t services;
++
++	if (fwk_asked) {
++		return;
++	}
++	fwk_asked = true;
++	if (!command("the DSP's framework version (AVCS_CMD_GET_FWK_VERSION)", APR_SVC_ADSP_CORE, AVCS_CMD_GET_FWK_VERSION, NULL, 0,
++	    AVCS_CMDRSP_GET_FWK_VERSION, &answer)) {
++		return;
++	}
++	services = answer.words[4];
++	say("apollo mic: the DSP's AVS build %u.%u.%u.%u, %u services:\n", answer.words[0], answer.words[1], answer.words[2],
++	    answer.words[3], services);
++	for (uint32_t i = 0; i < services && 5 + 3 * i + 2 < 64 && 4 * (5 + 3 * i + 3) <= answer.length; i++) {
++		say("apollo mic:   service %#x: API version %u (branch %u)\n", answer.words[5 + 3 * i], answer.words[6 + 3 * i],
++		    answer.words[7 + 3 * i]);
++	}
++}
++
++/*
++ * Xiaomi's calibration of the device path (Android's send_adm_cal() after the routing), in band, one parameter a
++ * command, each answered and its status said. adm_set_pp_params() sends ADM_CMD_SET_PP_PARAMS_V6 with
++ * param_hdr_v3 headers (module, instance, reserved, parameter, size) when instance IDs are supported
++ * (q6common_is_instance_id_supported(), which Android's HAL sets through the mixer control "Instance ID
++ * Support"), else ADM_CMD_SET_PP_PARAMS_V5 with param_hdr_v1 headers (module, parameter, size in 16 bits,
++ * reserved; q6common_pack_pp_params()). Here: V6 if the DSP took the topology's v2 definition (the one with
++ * instance IDs), V5 otherwise -- and V5 also if V6 is refused. The command: a memory header of zeros (address
++ * low, high, handle: in band), the parameters' size (the header's 16 bytes not counted), the parameters; to
++ * the COPP as the port (dest_port = the COPP's id), its answer APR_BASIC_RSP_RESULT { opcode, status }.
++ *
++ * The one change: the IIR's pan (asm_iir_filter_config_params: the stages' count, their 5 coefficients each,
++ * then each stage's shift factor and pan, 16 bits each). Xiaomi's is 1, which puts its treble cut on one channel
++ * only; Android records that way and the HAL keeps one channel, but here both channels are kept to the end and
++ * averaged into iOS's one channel (apollo_mic_mix=0), and a filter on one of the two would make the average two
++ * different microphones' sounds through two different responses. So it is 0 (apollo_mic_pan=N: another),
++ * which in Qualcomm's IIR is both channels -- not confirmed by any source here: said in the log, and
++ * apollo_mic_pan=1 gives Xiaomi's own back.
++ */
++static int
++pp_one(bool v6, const uint8_t *param, uint32_t number)
++{
++	uint32_t module = *(const uint32_t *)param, instance = *(const uint16_t *)(param + 4),
++	    id = *(const uint32_t *)(param + 8), size = *(const uint32_t *)(param + 12);
++	uint32_t packet[APR_PAYLOAD_MOST / 4], length;
++	struct hakios_apr_answer answer;
++	uint32_t opcode = v6 ? ADM_CMD_SET_PP_PARAMS_V6 : ADM_CMD_SET_PP_PARAMS_V5;
++
++	length = (v6 ? 16 : 12) + size;
++	if (16 + length > APR_PAYLOAD_MOST) {
++		say("apollo mic: calibration parameter %u (module %#x parameter %#x, %u bytes) does not fit one command\n", number,
++		    module, id, size);
++		return -1;
++	}
++	bzero(packet, sizeof(packet));
++	packet[3] = length;                     /* (packet[0..2]: address and handle 0: in band) */
++	if (v6) {
++		memcpy(&packet[4], param, 16 + size);
++	} else {
++		packet[4] = module;
++		packet[5] = id;
++		packet[6] = size & 0xffff;      /* (size, 16 bits; reserved 0) */
++		memcpy(&packet[7], param + 16, size);
++	}
++	if (!apollo_adsp_apr(APR_SVC_ADM, (uint16_t)mic_copp, 0, opcode, packet, 16 + length, APR_WAIT_MS, &answer)) {
++		say("apollo mic: calibration %s, parameter %u (module %#x instance %#x parameter %#x, %u bytes): NO ANSWER (or not "
++		    "sent: the kernel's log says which)\n", v6 ? "V6" : "V5", number, module, instance, id, size);
++		return -1;
++	}
++	if (answer.opcode != APR_BASIC_RSP_RESULT || answer.words[0] != opcode) {
++		say("apollo mic: calibration %s, parameter %u: an answer not expected: opcode %#x, %u bytes: %#x %#x\n", v6 ? "V6" : "V5",
++		    number, answer.opcode, answer.length, answer.words[0], answer.words[1]);
++		return -1;
++	}
++	say("apollo mic: calibration %s, parameter %u (module %#x instance %#x parameter %#x, %u bytes): %s\n", v6 ? "V6" : "V5",
++	    number, module, instance, id, size, answer.words[1] == 0 ? "done" : dsp_error(answer.words[1]));
++	return (int)answer.words[1];
++}
++
++/*
++ * The calibration as Android sends it (send_adm_cal(): out of band): the whole of it in a page of our DSP memory
++ * (the one behind the topology's), that page mapped for the ADM (adm_memory_map_regions():
++ * ADM_CMD_SHARED_MEM_MAP_REGIONS, pool 3, its handle in ADM_CMDRSP_SHARED_MEM_MAP_REGIONS), then one
++ * SET_PP_PARAMS with the memory header { address low, high, handle } and the parameters' size, nothing in the
++ * packet itself: a command of 32 bytes, which fits the DSP's receive intents (the in-band one of 172 bytes did
++ * not: GLINK had no intent of the DSP's that size). V6 with the v3 headers as the ACDB has them; V5 with each
++ * header made v1 (module, parameter, 16-bit size, reserved). The page stays mapped until the path is taken down.
++ */
++static bool
++pp_out_of_band(const uint8_t *blob, uint32_t size, bool v6)
++{
++	struct {
++		uint16_t pool, regions;
++		uint32_t property, low, high, size;
++	} __attribute__((packed)) map = { ASM_SHMEM_4K_POOL, 1, 0, 0, 0, 4096 };
++	uint64_t address = mic_address + 4096 * CAL_PAGE;
++	uint8_t *page = (uint8_t *)(mic_memory + 4096 * CAL_PAGE);
++	uint32_t command_words[4], length = 0;
++	struct hakios_apr_answer answer;
++	uint32_t opcode = v6 ? ADM_CMD_SET_PP_PARAMS_V6 : ADM_CMD_SET_PP_PARAMS_V5;
++	char what[160];
++
++	bzero(page, 4096);
++	if (v6) {
++		memcpy(page, blob, size);
++		length = size;
++	} else {
++		for (uint32_t at = 0; at + 16 <= size; at += 16 + *(const uint32_t *)(blob + at + 12)) {
++			uint32_t one = *(const uint32_t *)(blob + at + 12);
++
++			*(uint32_t *)(page + length) = *(const uint32_t *)(blob + at);
++			*(uint32_t *)(page + length + 4) = *(const uint32_t *)(blob + at + 8);
++			*(uint32_t *)(page + length + 8) = one & 0xffff;
++			memcpy(page + length + 12, blob + at + 16, one);
++			length += 12 + one;
++		}
++	}
++	for (vm_offset_t line = (vm_offset_t)page; line < (vm_offset_t)page + 4096; line += 64) {
++		__asm__ volatile ("dc cvac, %0" : : "r" (line));        /* the DSP reads memory, not our caches */
++	}
++	__asm__ volatile ("dsb sy");
++	map.low = (uint32_t)address;
++	map.high = (uint32_t)(address >> 32);
++	if (!command("the calibration's page, mapped for the ADM", APR_SVC_ADM, ADM_CMD_SHARED_MEM_MAP_REGIONS, &map, sizeof(map),
++	    ADM_CMDRSP_SHARED_MEM_MAP_REGIONS, &answer)) {
++		return false;
++	}
++	cal_mapped = true;
++	cal_handle = answer.words[0];
++	command_words[0] = (uint32_t)address;
++	command_words[1] = (uint32_t)(address >> 32);
++	command_words[2] = cal_handle;
++	command_words[3] = length;
++	snprintf(what, sizeof(what), "Xiaomi's calibration of COPP %u, out of band (%s, %u bytes at %#llx, handle %#x)", mic_copp,
++	    v6 ? "SET_PP_PARAMS_V6" : "SET_PP_PARAMS_V5", length, address, cal_handle);
++	if (!apollo_adsp_apr(APR_SVC_ADM, (uint16_t)mic_copp, 0, opcode, command_words, sizeof(command_words), APR_WAIT_MS, &answer)) {
++		say("apollo mic: %s: NO ANSWER (or not sent: the kernel's log says which)\n", what);
++		return false;
++	}
++	if (answer.opcode != APR_BASIC_RSP_RESULT || answer.words[0] != opcode) {
++		say("apollo mic: %s: an answer not expected: opcode %#x, %u bytes: %#x %#x\n", what, answer.opcode, answer.length,
++		    answer.words[0], answer.words[1]);
++		return false;
++	}
++	say("apollo mic: %s: %s\n", what, answer.words[1] == 0 ? "DONE" : dsp_error(answer.words[1]));
++	return answer.words[1] == 0;
++}
++
++static bool
++pp_params(void)
++{
++	static uint8_t blob_space[MIC_FW_MOST];         /* (Xiaomi's calibration, copied to be changed: pan, noise suppressor, DRC) */
++	uint8_t *blob = blob_space;
++	const uint32_t blob_size = (uint32_t)fw_audproc.size;
++	uint32_t at = 0, number = 0;
++	bool v6 = topology_version == 2;
++
++	memcpy(blob, fw_audproc.data, blob_size);
++	while (at + 16 <= blob_size) {
++		uint32_t module = *(uint32_t *)(blob + at), param = *(uint32_t *)(blob + at + 8), size = *(uint32_t *)(blob + at + 12);
++
++		if (module == 0x10c02 && param == 0x10c05 && size >= 4) {
++			uint32_t stages = *(uint16_t *)(blob + at + 16);
++			uint32_t pan_at = at + 16 + 4 + 20 * stages + 2 * stages;
++
++			for (uint32_t s = 0; s < stages && pan_at + 2 * s + 2 <= at + 16 + size; s++) {
++				say("apollo mic: the IIR's stage %u: pan %u, made %u\n", s, *(uint16_t *)(blob + pan_at + 2 * s), pan_setting);
++				*(uint16_t *)(blob + pan_at + 2 * s) = (uint16_t)pan_setting;
++			}
++		}
++		/*
++		 * apollo_mic_ns=1: the noise suppressor in Xiaomi's chain (EANS, module 0x1091f) switched on, with Xiaomi's own tuning
++		 * (parameter 0x10920, sent as it is). Their calibration for ordinary recording has it off (ADM_PARAM_ID_EANS_ENABLE
++		 * 0x10c4b = 0): Android hides the microphones' hiss (about 30 dB under speech here, both microphones alike, 28 October)
++		 * later, in the apps. Tuned for calls: music may come out a little watery.
++		 */
++		if (module == 0x1091f && param == 0x10c4b && size >= 4 && ns_setting) {
++			say("apollo mic: the noise suppressor (EANS): enable %u, made 1 (apollo_mic_ns=1)\n", *(uint32_t *)(blob + at + 16));
++			*(uint32_t *)(blob + at + 16) = 1;
++		}
++		/*
++		 * apollo_mic_drc=0: Xiaomi's multiband DRC (module 0x10943, its enable 0x10944 { mode, enable }) off. With the
++		 * suppressor on, the hiss came back in every pause of speech (28 October): the DRC's make-up gain lifts what is
++		 * quiet, the room's hiss with it.
++		 */
++		if (module == 0x10943 && param == 0x10944 && size >= 8 && !drc_setting) {
++			say("apollo mic: the multiband DRC: enable %u, made 0 (apollo_mic_drc=0)\n", *(uint32_t *)(blob + at + 20));
++			*(uint32_t *)(blob + at + 20) = 0;
++		}
++		at += 16 + size;
++	}
++	if (pp_out_of_band(blob, blob_size, v6)) {
++		return true;
++	}
++	say("apollo mic: Xiaomi's calibration of the device path (COPP %u), in band instead: %s, one parameter a command\n", mic_copp,
++	    v6 ? "ADM_CMD_SET_PP_PARAMS_V6 (the topology's v2 definition was taken: instance IDs)" :
++	    "ADM_CMD_SET_PP_PARAMS_V5 (no instance IDs)");
++	for (at = 0; at + 16 <= blob_size; at += 16 + *(uint32_t *)(blob + at + 12)) {
++		int status = pp_one(v6, blob + at, ++number);
++
++		if (status != 0 && v6 && number == 1 && status > 0) {
++			/* refused (not lost): this DSP may not take V6: V5 for all of them */
++			say("apollo mic: V6 refused: the calibration sent as V5 instead\n");
++			v6 = false;
++			status = pp_one(v6, blob + at, number);
++		}
++		if (status != 0) {
++			return false;
++		}
++	}
++	say("apollo mic: Xiaomi's calibration of the device path is in: %u parameters, %u bytes\n", number, (unsigned)blob_size);
++	return true;
++}
++
++/*
++ * the stream and the path, opened, mapped and routed (msm-pcm-q6 and q6adm/q6asm at a recording's open and
++ * prepare), in our memory behind the speakers' periods (apollo_audio_dsp_memory(): 16 pages, the SMMU's
++ * stream 0x1801, set up by whichever of the two comes first): the periods in the first 8, the topology's
++ * definition (path 1) in the 9th
++ */
++static bool
++dsp_path_on(void)
++{
++	struct {
++		uint16_t pool, regions;
++		uint32_t property, low, high, size;
++	} __attribute__((packed)) map = { ASM_SHMEM_4K_POOL, 1, 0, 0, 0, 0 };
++	struct {
++		uint16_t flags, mode, endpoint1, endpoint2;
++		uint32_t topology;
++		uint16_t channels, bits;
++		uint32_t rate;
++		uint8_t map[8];
++	} __attribute__((packed)) open = { 0, ADM_PATH_LIVE_RECORDING, MIC_PORT, 0xffff, ADM_TOPOLOGY_NONE, 1, 16, MIC_RATE,
++		                           { PCM_CHANNEL_FC } };
++	struct {
++		uint32_t mode, endpoint, topology, format;
++		uint16_t bits, reserved;
++	} __attribute__((packed)) reading = { 0, 0, ASM_TOPOLOGY_NONE, ASM_MEDIA_FMT_MULTI_CHANNEL_PCM_V2, 16, 0 };
++	struct {
++		uint32_t param, size, frames_per_buffer, block_size;
++		uint16_t channels, bits;
++		uint32_t rate;
++		uint16_t is_signed, reserved;
++		uint8_t map[8];
++	} __attribute__((packed)) encoder = { ASM_PARAM_ID_ENCDEC_ENC_CFG_BLK_V2, 28, 0, 20, 1, 16, MIC_RATE, 1, 0, { PCM_CHANNEL_FC } };
++	struct {
++		uint32_t matrix, sessions;
++		uint16_t session, copps;
++		uint16_t copp[2];
++	} __attribute__((packed)) route = { ADM_MATRIX_AUDIO_TX, 1, (uint16_t)mic_session, 1, { 0, 0 } };
++	struct hakios_apr_answer answer;
++	uint32_t bytes = 0;
++
++	if (mic_path == 1) {
++		/* two channels, left and right: the port's channel 0 (decimator 0, the top microphone) and 1 (the main one) */
++		open.topology = ADM_TOPOLOGY_XIAOMI_TX;
++		open.channels = 2;
++		open.map[0] = PCM_CHANNEL_FL;
++		open.map[1] = PCM_CHANNEL_FR;
++		encoder.channels = 2;
++		encoder.map[0] = PCM_CHANNEL_FL;
++		encoder.map[1] = PCM_CHANNEL_FR;
++	}
++	if (!apollo_audio_dsp_memory(&mic_memory, &mic_address, &bytes)) {
++		say("apollo mic: no memory the DSP can see\n");
++		return false;
++	}
++	memory_taken = true;
++	if (bytes < (CAL_PAGE + 1) * 4096) {
++		say("apollo mic: the memory the DSP can see is too small (%u bytes)\n", bytes);
++		return false;
++	}
++	map.low = (uint32_t)mic_address;
++	map.high = (uint32_t)(mic_address >> 32);
++	map.size = MIC_PERIODS * 4096;
++	apollo_adsp_apr_events_second(mic_events);
++	if (!command("our periods for the microphone, mapped for the DSP", APR_SVC_ASM, ASM_CMD_SHARED_MEM_MAP_REGIONS, &map,
++	    sizeof(map), ASM_CMDRSP_SHARED_MEM_MAP_REGIONS, &answer)) {
++		return false;
++	}
++	mic_mapped = true;
++	mic_map_handle = answer.words[0];
++	say("apollo mic: our %u KB at %#llx are the DSP's handle %#x\n", MIC_PERIODS * 4, mic_address, mic_map_handle);
++	if (!apollo_adsp_apr(APR_SVC_ASM, MIC_STREAM_PORT, 0, ASM_STREAM_CMD_OPEN_READ_V3, &reading, sizeof(reading), APR_WAIT_MS,
++	    &answer) || answer.opcode != APR_BASIC_RSP_RESULT || answer.words[1] != 0) {
++		say("apollo mic: the stream, opened for reading: %s (%#x %#x)\n", "REFUSED OR NO ANSWER", answer.opcode, answer.words[1]);
++		return false;
++	}
++	mic_stream_open = true;
++	say("apollo mic: the stream (session %u), opened for reading 16-bit linear PCM, no processing: done\n", mic_session);
++	if (!apollo_adsp_apr(APR_SVC_ASM, MIC_STREAM_PORT, 0, ASM_STREAM_CMD_SET_ENCDEC_PARAM, &encoder, sizeof(encoder), APR_WAIT_MS,
++	    &answer) || answer.opcode != APR_BASIC_RSP_RESULT || answer.words[1] != 0) {
++		say("apollo mic: the stream's format: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[1]);
++		return false;
++	}
++	say("apollo mic: the stream's format: %u channel%s of 16 bits at 48 kHz: done\n", channels, channels == 1 ? "" : "s");
++	if (mic_path == 1) {
++		fwk_version();
++		if (!topology_register()) {
++			return false;
++		}
++	}
++	if (!apollo_adsp_apr(APR_SVC_ADM, MIC_PORT, 0, ADM_CMD_DEVICE_OPEN_V5, &open, sizeof(open), APR_WAIT_MS, &answer) ||
++	    answer.opcode != ADM_CMDRSP_DEVICE_OPEN_V5 || answer.words[0] != 0) {
++		say("apollo mic: a device path from the port (topology %#x): REFUSED OR NO ANSWER (%#x %#x%s%s)\n", open.topology,
++		    answer.opcode, answer.words[0], answer.opcode == ADM_CMDRSP_DEVICE_OPEN_V5 ? ": " : "",
++		    answer.opcode == ADM_CMDRSP_DEVICE_OPEN_V5 ? dsp_error(answer.words[0]) : "");
++		return false;
++	}
++	mic_copp_open = true;
++	mic_copp = answer.words[1] & 0xffff;
++	route.copp[0] = (uint16_t)mic_copp;
++	say("apollo mic: the device path from port %#x is open: COPP %u (live recording, topology %#x, %u channel%s, 16 bits, 48 kHz)\n",
++	    MIC_PORT, mic_copp, open.topology, channels, channels == 1 ? "" : "s");
++	if (!command(mic_session == MIC_SESSION ? "the device path routed to session 2" : "the device path routed to session 3", APR_SVC_ADM, ADM_CMD_MATRIX_MAP_ROUTINGS_V5, &route, sizeof(route), 0,
++	    NULL)) {
++		return false;
++	}
++	return mic_path != 1 || pp_params();
++}
++
++/*
++ * the codec DMA port: TX_CDC_DMA_TX_3 at 48 kHz, 16 bits; the active channels' mask is the TX macro's for the
++ * AIF (tx_macro_get_channel_map(): active_ch_mask, the decimators' bits): path 0 decimator 0 (1), path 1
++ * decimators 0 and 1 (3: channel 0 the top microphone, channel 1 the main one)
++ */
++static bool
++dsp_port_on(void)
++{
++	struct {
++		uint32_t version, rate;
++		uint16_t bits, format, channels, mask;
++	} __attribute__((packed)) config = { 1, MIC_RATE, 16, 0, 1, 1u << 0 };
++	uint16_t start[2] = { MIC_PORT, 0 };
++
++	if (mic_path == 1) {
++		config.channels = 2;
++		config.mask = 0x3;
++	}
++	if (restart_port) {
++		/* (path 1 had it, with two channels: stopped again whatever undo() was told, then set up anew for one) */
++		(void)command("the port 0xb037, stopped once more before path 0 sets it up", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_STOP, start,
++		    sizeof(start), 0, NULL);
++		restart_port = false;
++	}
++	if (!afe_port_param(AFE_MODULE_AUDIO_DEV_INTERFACE, AFE_PARAM_ID_CODEC_DMA_CONFIG, &config, sizeof(config),
++	    mic_path == 1 ? "the port TX_CDC_DMA_TX_3 (0xb037): 2 channels of 16 bits at 48 kHz, decimators 0 and 1" :
++	    "the port TX_CDC_DMA_TX_3 (0xb037): 1 channel of 16 bits at 48 kHz, decimator 0")) {
++		return false;
++	}
++	mic_port_on = command("the port 0xb037, started", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_START, start, sizeof(start), 0, NULL);
++	return mic_port_on;
++}
++
++static void
++dsp_off(void)
++{
++	uint16_t stop[2] = { MIC_PORT, 0 };
++
++	/* (each answer said: after a command the DSP never answered, these show whether it still listens) */
++	if (mic_stream_open) {
++		(void)port_command(mic_session == MIC_SESSION ? "the stream (session 2), closed" : "the stream (session 3), closed",
++		    APR_SVC_ASM, MIC_STREAM_PORT, ASM_STREAM_CMD_CLOSE, NULL, 0);
++		mic_stream_open = false;
++	}
++	if (mic_copp_open) {
++		char what[48];
++
++		snprintf(what, sizeof(what), "the device path (COPP %u), closed", mic_copp);
++		(void)port_command(what, APR_SVC_ADM, (uint16_t)mic_copp, ADM_CMD_DEVICE_CLOSE_V5, NULL, 0);
++		mic_copp_open = false;
++	}
++	if (cal_mapped) {
++		(void)command("the calibration's page, unmapped for the ADM", APR_SVC_ADM, ADM_CMD_SHARED_MEM_UNMAP_REGIONS, &cal_handle,
++		    sizeof(cal_handle), 0, NULL);
++		cal_mapped = false;
++	}
++	if (mic_port_on) {
++		(void)command("the port 0xb037, stopped", APR_SVC_AFE, AFE_PORT_CMD_DEVICE_STOP, stop, sizeof(stop), 0, NULL);
++		mic_port_on = false;
++	}
++	if (mic_mapped) {
++		(void)command("our periods, unmapped", APR_SVC_ASM, ASM_CMD_SHARED_MEM_UNMAP_REGIONS, &mic_map_handle,
++		    sizeof(mic_map_handle), 0, NULL);
++		mic_mapped = false;
++	}
++	apollo_adsp_apr_events_second(NULL);
++	if (memory_taken) {
++		apollo_audio_dsp_memory_put();
++		memory_taken = false;
++	}
++}
++
++/* ---- apollo_mic=4: the microphone for iOS -------------------------------------------------------------- */
++
++/*
++ * What the microphone hears goes into a ring, and /dev/hakios-mic gives it to iOS's audio server
++ * (HakiosAudio.driver's device "Codec", userland/src/audio_plugin.c: codec_open() opens it read-only and
++ * non-blocking, codec_read() reads what is there): 16-bit samples, one channel, 48 kHz -- the POCO's device,
++ * the same contract. The path is up only while the device is open (the audio server opens it when its input
++ * starts and closes it when it stops), and a read never waits: it gives what has come, keeping the reader
++ * about 40 ms behind the DSP (it comes in 20 ms periods), and nothing until that much is there; the audio
++ * server makes up the rest with silence.
++ */
++#define RING_FRAMES             16384           /* 341 ms; a power of two */
++#define RING_KEEP               1920            /* 40 ms: how far behind the DSP a reader is kept */
++#define RING_MOST               4800            /* 100 ms: more than this waiting, and the oldest is skipped */
++
++static int16_t *ring;
++static volatile uint64_t ring_written;          /* frames put into the ring since the device was made */
++static uint64_t ring_read;                      /* frames taken from it (one reader: the audio server) */
++static bool ring_primed;                        /* the reader is RING_KEEP behind; false after it ran dry */
++static uint64_t ring_skipped, ring_dry;         /* frames skipped, reads that found too little: said when iOS stops */
++static volatile uint32_t ios_wants;             /* the device is open */
++static volatile bool stopping;                  /* the run ends (apollo_mic_dsp_down()) */
++
++static void
++ring_put(const int16_t *samples, uint32_t count)
++{
++	uint64_t at = ring_written;
++
++	for (uint32_t i = 0; i < count; i++) {
++		ring[(at + i) % RING_FRAMES] = samples[i];
++	}
++	__atomic_store_n(&ring_written, at + count, __ATOMIC_RELEASE);
++}
++
++static int
++mic_dev_read(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	uint64_t written = __atomic_load_n(&ring_written, __ATOMIC_ACQUIRE), avail, want;
++	int error = 0;
++
++	if (ring == NULL || uio_resid(uio) < 2) {
++		return 0;
++	}
++	want = (uint64_t)uio_resid(uio) / 2;
++	avail = written - ring_read;
++	if (avail > RING_MOST) {
++		ring_skipped += avail - RING_KEEP;
++		ring_read = written - RING_KEEP;
++		avail = RING_KEEP;
++	}
++	if (!ring_primed) {
++		if (avail < RING_KEEP) {
++			return 0;
++		}
++		ring_primed = true;
++	}
++	if (avail < want) {
++		ring_dry++;
++		ring_primed = false;
++	}
++	while (want > 0 && avail > 0 && error == 0) {
++		uint64_t at = ring_read % RING_FRAMES, n = want < avail ? want : avail;
++
++		n = n < RING_FRAMES - at ? n : RING_FRAMES - at;
++		error = uiomove((caddr_t)&ring[at], (int)(n * 2), uio);
++		ring_read += n;
++		want -= n;
++		avail -= n;
++	}
++	return error;
++}
++
++static int
++mic_dev_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	ios_wants = 1;
++	return 0;
++}
++
++/* (on the last close) */
++static int
++mic_dev_close(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	ios_wants = 0;
++	return 0;
++}
++
++static const struct cdevsw mic_cdevsw = {
++	.d_open = mic_dev_open, .d_close = mic_dev_close, .d_read = mic_dev_read, .d_write = eno_rdwrt,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++/* ---- listening ---------------------------------------------------------------------------------------------- */
++
++static uint32_t mic_secs = 10;
++static int16_t mono[MIC_PERIOD_FRAMES];         /* a period made one channel (path 1), for iOS */
++
++/* what a second's samples come to: their level in tenths of a dBFS, by a table of halvings (good enough to tell loud from quiet) */
++struct loudness {
++	int64_t sum;
++	uint64_t squares;
++	uint32_t peak;
++};
++
++static void
++level_add(struct loudness *l, int32_t v)
++{
++	uint32_t a = (uint32_t)(v < 0 ? -v : v);
++
++	l->sum += v;
++	l->squares += (uint64_t)((int64_t)v * v);
++	l->peak = a > l->peak ? a : l->peak;
++}
++
++static int
++level_db10(const struct loudness *l, uint32_t frames, uint32_t *rms_out)
++{
++	uint64_t mean_square = l->squares / frames;
++	uint32_t rms = 0, r;
++	int tenths = 0;
++
++	while ((uint64_t)(rms + 1) * (rms + 1) <= mean_square) {
++		rms++;
++	}
++	*rms_out = rms;
++	if (rms == 0) {
++		return -999;
++	}
++	r = rms;
++	while (r < 16384) {
++		r *= 2;
++		tenths -= 60;   /* 6.02 dB a halving, near enough */
++	}
++	return tenths - (int)((32768 - r) * 60 / 16384);
++}
++
++/*
++ * The stream run, read for apollo_mic_secs (for_ios: while iOS has the device open): how loud it is, every
++ * second (for iOS: the first three, then every 30th) -- what iOS gets, and on path 1 each microphone's
++ * channel as well; for iOS into the ring (path 1: the two channels made one, apollo_mic_mix).
++ */
++static void
++listen(bool for_ios)
++{
++	uint32_t run[3] = { 0, 0, 0 }, frames = 0, seconds = 0, periods = 0, empty = 0;
++	struct loudness levels[3];                 /* what iOS gets; path 1: channel 0 (the top microphone), channel 1 (the main one) */
++	unsigned next = 0;
++	bool unmuted = false, settled = false;
++	uint64_t began = mach_absolute_time(), now, elapsed_ms;
++	struct hakios_apr_answer answer;
++
++	bool first_said = false;
++	uint64_t last_line_ms = 0;
++
++	bzero(levels, sizeof(levels));
++	read_ready = 0;
++	reads_done = read_errors = 0;
++	first_read_ms = first_read_status = first_read_bytes = first_error_status = 0;
++	if (!apollo_adsp_apr(APR_SVC_ASM, MIC_STREAM_PORT, 0, ASM_SESSION_CMD_RUN_V2, run, sizeof(run), APR_WAIT_MS, &answer) ||
++	    answer.opcode != APR_BASIC_RSP_RESULT || answer.words[1] != 0) {
++		say("apollo mic: the session, run: REFUSED OR NO ANSWER (%#x %#x)\n", answer.opcode, answer.words[1]);
++		return;
++	}
++	say("apollo mic: the session %u, run: done\n", mic_session);
++	listen_began = mach_absolute_time();
++	for (unsigned p = 0; p < MIC_PERIODS; p++) {
++		if (!mic_read(p)) {
++			say("apollo mic: a read could not be sent\n");
++			return;
++		}
++	}
++	if (for_ios) {
++		say("apollo mic: LISTENING for iOS (path %u%s): %u reads of 20 ms given to the DSP\n", mic_path,
++		    mic_path != 1 ? "" : mic_mix == 1 ? ", the main microphone" : mic_mix == 2 ? ", the top microphone" :
++		    ", the two microphones averaged", MIC_PERIODS);
++	} else {
++		say("apollo mic: LISTENING (path %u): %u reads of 20 ms given to the DSP; for %u s\n", mic_path, MIC_PERIODS, mic_secs);
++	}
++	for (;;) {
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &now);
++		elapsed_ms = now / NSEC_PER_MSEC;
++		if (!unmuted && elapsed_ms >= 100) {            /* TX_MACRO_AMIC_UNMUTE_DELAY_MS */
++			unmuted = dec_unmute(0) && dec_unmute(1);
++		}
++		if (!settled && elapsed_ms >= 300) {            /* TX_MACRO_AMIC_HPF_DELAY_MS */
++			settled = dec_settled(0) && dec_settled(1);
++		}
++		if (!first_said && first_read_ms != 0) {
++			say("apollo mic: the first read came back %u ms after the reads were given: %s, status %#x (%s), %u bytes\n",
++			    first_read_ms - 1, first_read_status == 0 ? "data" : "AN ERROR", first_read_status,
++			    first_read_status < 21 ? dsp_error(first_read_status) : "?", first_read_bytes);
++			first_said = true;
++		} else if (!first_said && elapsed_ms >= 1000 && first_read_ms == 0 && reads_done == 0) {
++			say("apollo mic: NO READ CAME BACK in 1 s (session %u, %u reads given)\n", mic_session, MIC_PERIODS);
++			first_said = true;
++		}
++		if (elapsed_ms >= last_line_ms + 1000) {
++			if (frames == 0 && elapsed_ms >= 1000 && (!for_ios || seconds <= 3)) {
++				/* (a second without a sample: what came back instead) */
++				say("apollo mic: a second without samples: %u periods back, %u empty; reads %u, errors %u (the first: %#x)\n",
++				    periods, empty, reads_done, read_errors, first_error_status);
++				periods = empty = 0;
++			}
++			last_line_ms = elapsed_ms;
++		}
++		if ((for_ios ? (!ios_wants || stopping) : elapsed_ms >= mic_secs * 1000ull) || broken) {
++			break;
++		}
++		if (!(read_ready & (1u << next))) {
++			if (elapsed_ms > 1500 && reads_done == 0) {
++				say("apollo mic: NO READ HAS COME BACK in 1.5 s\n");
++				break;
++			}
++			sleep_ms(2);
++			continue;
++		}
++		OSBitAndAtomic(~(1u << next), &read_ready);
++		{
++			int16_t *samples = (int16_t *)(mic_memory + 4096 * next);
++			uint32_t got = read_sizes[next] / (2 * channels);
++
++			for (vm_offset_t line = (vm_offset_t)samples; line < (vm_offset_t)samples + MIC_PERIOD_BYTES; line += 64) {
++				__asm__ volatile ("dc ivac, %0" : : "r" (line));
++			}
++			__asm__ volatile ("dsb sy");
++			got = got > MIC_PERIOD_FRAMES ? MIC_PERIOD_FRAMES : got;
++			empty += got == 0;
++			for (uint32_t i = 0; i < got; i++) {
++				int32_t v;
++
++				if (channels == 1) {
++					v = samples[i];
++				} else {
++					int32_t top = samples[2 * i], primary = samples[2 * i + 1];
++
++					level_add(&levels[1], top);
++					level_add(&levels[2], primary);
++					v = mic_mix == 1 ? primary : mic_mix == 2 ? top : (top + primary) / 2;
++				}
++				mono[i] = (int16_t)v;
++				level_add(&levels[0], v);
++			}
++			frames += got;
++			if (for_ios) {
++				ring_put(mono, got);
++			}
++		}
++		periods++;
++		(void)mic_read(next);
++		next = (next + 1) % MIC_PERIODS;
++		if (frames >= MIC_RATE) {
++			uint32_t rms[3] = { 0, 0, 0 };
++			int db10[3];
++
++			for (unsigned c = 0; c < 3; c++) {
++				db10[c] = level_db10(&levels[c], frames, &rms[c]);
++			}
++			seconds++;
++			if (!for_ios || seconds <= 3 || seconds % 30 == 0) {
++				say("apollo mic: second %u: %u frames (%u periods, %u empty), level %d.%d dBFS (rms %u), peak %u, mean %lld; "
++				    "reads %u, errors %u%s%s\n", seconds, frames, periods, empty, db10[0] / 10,
++				    db10[0] < 0 ? -db10[0] % 10 : db10[0] % 10, rms[0], levels[0].peak, levels[0].sum / (int64_t)frames,
++				    reads_done, read_errors, unmuted ? "" : " (muted)", settled ? "" : " (settling)");
++				if (channels == 2) {
++					say("apollo mic:   the top microphone (channel 0) %d.%d dBFS (rms %u, peak %u, mean %lld); the main one "
++					    "(channel 1) %d.%d dBFS (rms %u, peak %u, mean %lld)\n", db10[1] / 10,
++					    db10[1] < 0 ? -db10[1] % 10 : db10[1] % 10, rms[1], levels[1].peak, levels[1].sum / (int64_t)frames,
++					    db10[2] / 10, db10[2] < 0 ? -db10[2] % 10 : db10[2] % 10, rms[2], levels[2].peak,
++					    levels[2].sum / (int64_t)frames);
++				}
++			}
++			frames = periods = empty = 0;
++			bzero(levels, sizeof(levels));
++		}
++	}
++}
++
++static void
++undo(void)
++{
++	dsp_off();
++	dec_off(1);
++	dec_off(0);
++	master_off();
++	tx_clocks_off();
++	pins_restore();
++	reset_restore();
++	clocks_off();
++}
++
++/* Everything up to the stream's run, in a recording's order; false (and `broken') if any of it fails. */
++static bool
++path_up_once(void)
++{
++	if (mic_path == 1 && level >= 3 && !mic_fw_load()) {
++		say("apollo mic: without Xiaomi's data path 1 cannot be set up: path 0 (voice-rec-mic) for the rest of the run\n");
++		mic_path = 0;
++	}
++	channels = mic_path == 1 ? 2 : 1;
++	if (!clocks_on()) {
++		say("apollo mic: the clocks were not all given: the blocks are not touched\n");
++		return false;
++	}
++	if (!reset_release() || !pins_on() || !tx_clocks_on()) {
++		return false;
++	}
++	if (!quiet) {
++		master_look();          /* (its clock running now: what the master was before it is started) */
++	}
++	if (!master_on()) {
++		return false;
++	}
++	sleep_ms(5);    /* ("5 ms for SoundWire's auto-enumeration", wcd938x_bind()) */
++	if ((codec_device = codec_wait()) == 0) {
++		return false;
++	}
++	to_all(SWRS_SCP_INT_STATUS_MASK_1, 0x04);       /* (swrm_runtime_resume(): to all, an ordinary command id) */
++	if (!quiet) {
++		codec_look();
++	}
++	if (level < 3) {
++		return true;
++	}
++	/* the stream and path, the port's format and start, the codec's widgets */
++	/*
++	 * Path 1 in Android's order: the port (the DPCM back end, prepared first: afe_port_start()) before the device
++	 * path and its calibration (the front end's prepare: adm_open(), adm_matrix_map() and send_adm_cal()); path 0
++	 * as it was brought up
++	 */
++	return bolero_look() && codec_init() && (mic_path == 1 ? dsp_port_on() && dsp_path_on() : dsp_path_on() && dsp_port_on()) &&
++	       decimators_on() &&
++	       (!adc_on || (adc1_on() && (mic_path != 1 || adc4_on()))) && datapath_on();
++}
++
++/*
++ * Path 1 that fails -- the DSP refusing Xiaomi's topology, its calibration or the path, or anything else -- is
++ * undone and path 0 set up in its place, and kept for the rest of the run: a microphone, rather than none.
++ */
++static bool
++path_up(void)
++{
++	if (path_up_once()) {
++		return true;
++	}
++	if (mic_path != 1 || level < 3 || stopping) {
++		return false;
++	}
++	say("apollo mic: PATH 1 (Android's handset-mic, Xiaomi's processing) FAILED (last: %s): undone, and path 0 (voice-rec-mic) "
++	    "set up in its place for the rest of the run\n", last_write);
++	/*
++	 * All of it undone as at a recording's end (the stream, the COPP, the port, both decimators, the master reset,
++	 * the clocks, the pins, the codec back in reset: its ADCs and mic biases with it), a second for the DSP to be
++	 * done with whatever it did not answer, then path 0 from the start, as a fresh recording sets it up -- on
++	 * session 3, which nothing of path 1 was routed to, in case the DSP kept path 1's routing
++	 */
++	undo();
++	broken = false;
++	mic_path = 0;
++	mic_session = MIC_SESSION_FALLBACK;
++	restart_port = true;
++	sleep_ms(1000);
++	return path_up_once();
++}
++
++/*
++ * apollo_mic=4: the path up whenever iOS opens /dev/hakios-mic, down when it closes it; after three
++ * recordings that broke off, no more until the run ends.
++ */
++static void
++for_ios(void)
++{
++	int major = cdevsw_add(-1, &mic_cdevsw);
++	unsigned recordings = 0, failures = 0;
++
++	ring = kalloc_data(RING_FRAMES * sizeof(int16_t), Z_WAITOK | Z_ZERO);
++	if (ring == NULL || major < 0 ||
++	    devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-mic") == NULL) {
++		say("apollo mic: /dev/hakios-mic cannot be made\n");
++		return;
++	}
++	say("apollo mic: THE MICROPHONE IS IOS'S (/dev/hakios-mic) from here on, until the run ends: it listens only while iOS "
++	    "records\n");
++	while (!stopping) {
++		uint64_t began, ns;
++		bool failed;
++
++		if (!ios_wants) {
++			sleep_ms(20);
++			continue;
++		}
++		lck_mtx_lock(&mic_lock);
++		if (stopping) {
++			lck_mtx_unlock(&mic_lock);
++			break;
++		}
++		recordings++;
++		quiet = recordings > 1;
++		ring_primed = false;
++		ring_skipped = ring_dry = 0;
++		ring_read = __atomic_load_n(&ring_written, __ATOMIC_ACQUIRE);
++		began = mach_absolute_time();
++		say("apollo mic: iOS records (%u): the path up%s\n", recordings,
++		    quiet ? " (the lines that say all went well are not said again)" : "");
++		if (path_up()) {
++			listen(true);
++		}
++		failed = broken;
++		absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
++		say("apollo mic: iOS's recording %u %s after %llu.%llu s; last: %s; %llu frames skipped as too late, %llu reads found "
++		    "too little\n", recordings, failed ? "BROKE OFF" : "ended", ns / NSEC_PER_SEC, ns % NSEC_PER_SEC / (NSEC_PER_SEC / 10),
++		    last_write, ring_skipped, ring_dry);
++		undo();
++		lck_mtx_unlock(&mic_lock);
++		if (failed) {
++			broken = false;
++			if (++failures >= 3) {
++				say("apollo mic: three recordings broke off: the microphone stays off until the run ends\n");
++				break;
++			}
++			/* (not again until iOS has closed the device and opened it again) */
++			while (ios_wants && !stopping) {
++				sleep_ms(20);
++			}
++		}
++	}
++}
++
++static void
++mic_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	say("apollo mic: level %u, path %u: %s\n", level, mic_path,
++	    level == 1 ? "a look, after the LPASS's votes and clocks; nothing written" :
++	    level == 2 ? "the codec brought up to answer on SoundWire, nothing of it set; then all undone" :
++	    level == 3 ? "the microphones, as Android records from them, listened to; then all undone" :
++	    "the microphones for iOS (/dev/hakios-mic), up while iOS records");
++	if (level == 4) {
++		for_ios();
++	} else {
++		lck_mtx_lock(&mic_lock);
++		if (level == 1) {
++			if (clocks_on()) {
++				sleep_ms(10);
++				look();
++			} else {
++				say("apollo mic: the clocks were not all given: the blocks are not touched\n");
++			}
++		} else {
++			if (path_up() && level >= 3) {
++				listen(false);
++			}
++			say("apollo mic: %s; last: %s\n", broken ? "STOPPED" : level >= 3 ? "listened" : "done", last_write);
++		}
++		undo();
++		lck_mtx_unlock(&mic_lock);
++	}
++	running = false;
++	say("apollo mic: done\n");
++	thread_terminate(current_thread());
++}
++
++/* The DSP's audio services are up (hakios.apollo_adsp.c, right after apollo_sound_dsp_up()). */
++void
++apollo_mic_dsp_up(void)
++{
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("apollo_mic", &level, sizeof(level)) || level == 0) {
++		return;
++	}
++	level = level > 4 ? 4 : level;
++	PE_parse_boot_argn("apollo_mic_secs", &mic_secs, sizeof(mic_secs));
++	PE_parse_boot_argn("apollo_mic_path", &mic_path, sizeof(mic_path));
++	PE_parse_boot_argn("apollo_mic_mix", &mic_mix, sizeof(mic_mix));
++	PE_parse_boot_argn("apollo_mic_pan", &pan_setting, sizeof(pan_setting));
++	PE_parse_boot_argn("apollo_mic_ns", &ns_setting, sizeof(ns_setting));
++	PE_parse_boot_argn("apollo_mic_drc", &drc_setting, sizeof(drc_setting));
++	PE_parse_boot_argn("apollo_mic_input", &smic_input, sizeof(smic_input));
++	PE_parse_boot_argn("apollo_mic_adc", &adc_on, sizeof(adc_on));
++	PE_parse_boot_argn("apollo_mic_test", &test_bits, sizeof(test_bits));
++	mic_secs = mic_secs < 1 ? 1 : mic_secs > 600 ? 600 : mic_secs;
++	mic_path = mic_path == 0 ? 0 : 1;
++	mic_mix = mic_mix > 2 ? 0 : mic_mix;
++	running = true;
++	if (kernel_thread_start(mic_thread, NULL, &thread) != KERN_SUCCESS) {
++		running = false;
++		return;
++	}
++	thread_set_thread_name(thread, "apollo mic");
++	thread_deallocate(thread);
++}
++
++/* The DSP is about to be shut down (apollo_adsp_stop()): what was asked for given back while it still listens. */
++void
++apollo_mic_dsp_down(void)
++{
++	stopping = true;
++	if (running) {
++		lck_mtx_lock(&mic_lock);
++		undo();
++		lck_mtx_unlock(&mic_lock);
++	}
++}
++
++/*
++ * Any way back to the loader (apollo_adsp_quiesce()): one processor, no lock, no sleep. The codec is put back
++ * into reset if it was let out (one register: its mic biases go with it), and every line of the run is said again.
++ */
++void
++apollo_mic_quiesce(void)
++{
++	if (reset_taken && tlmm_32.base != 0) {
++		wr(tlmm_32.base + TLMM_IO, 0);
++	}
++	if (kept_count == 0) {
++		return;
++	}
++	for (const char *c = "apollo mic: what happened in this run, again:\n"; *c != 0; c++) {
++		loader_log_putc(*c);
++	}
++	for (unsigned i = kept_count > KEPT_LINES ? kept_count - KEPT_LINES : 0; i < kept_count; i++) {
++		const char *line = kept[i % KEPT_LINES];
++
++		loader_log_putc('>');
++		loader_log_putc(' ');
++		for (const char *c = line; *c != 0; c++) {
++			loader_log_putc(*c);
++		}
++		if (line[0] == 0 || line[strlen(line) - 1] != '\n') {
++			loader_log_putc('\n');
++		}
++	}
++}
+--- /dev/null
++++ b/bsd/dev/sweet_haptic.c
+@@ -0,0 +1,1339 @@
++/* apollo (xnu 0146): the vibration motor (an AW8697 on serial engine 11's I2C) -- the Mi 10T port github.com/enesuzun2002/hakios-apollo
++ * (HackiOS for apollo; devices/mi-10t/xnu/files/bsd/dev/hakios.apollo_haptic.c; APSL 2.0), with which it plays iOS's haptics on this
++ * phone. Its warnings are not looked at (as with SweetWLAN.cpp). Changed here, each marked "apollo:": the includes (this tree's headers
++ * beside it in bsd/dev); no pause after each line while the chip is brought up (that was for their loader's log; ours is the
++ * kernel's, flushed by sweet_ufs.c); the bring-up waits for the root and the boot's own files, which hold its waveforms
++ * (/usr/local/fw/aw8697_haptic.bin, through hakios_image_file() in sweet_audio_glue.c); the RPMh vote through sweet_rpmh.c.
++ */
++#pragma clang diagnostic ignored "-Weverything"
++/*
++ * The vibration motor of the Xiaomi Mi 10T (apollo): a linear resonant actuator driven by an Awinic AW8697 (chip ID
++ * 0x97 in register 0), Android's "aw8697_haptic" (Xiaomi's driver drivers/input/misc/aw8697_haptic/aw8697.c of the
++ * apollo-q-oss kernel). This is hakios.haptic.c's service (what iOS plays on its "Actuator" device arrives at
++ * /dev/apollo-haptic as samples and is played as Android's waveforms), for another chip on another bus. From the
++ * phone's own device tree (//soc/i2c@a8c000/aw8697_haptic@5A):
++ *
++ *   I2C        the serial engine 11 = the sixth of the second QUPv3 wrapper (qupv3_se11_i2c at 0xa8c000; the
++ *              wrapper's core at 0xac0000): function qup11 (1) on GPIO 60 data and 61 clock, 2 mA, no pull, address
++ *              0x5a; 400 kHz through the serial engine's FIFO as in hakios.apollo_cs35l41.c
++ *   reset      GPIO 130, high = running (Android's hw_reset: low 5 ms, high 5 ms)
++ *   interrupt  GPIO 129, pulled up (not used: polled)
++ *   effects    Android's RAM waveforms, aw8697_haptic.bin (fw/ of the small image): 1..10 short (Android's effects
++ *              0..9: vib_effect_id_boundary 0xa), 11 the one Android repeats forever for a long vibration
++ *
++ * Nothing here is done unless the boot-arg apollo_haptic=N asks for it (N as redwood's haptic=N):
++ *
++ *   1  a look, reading only: the pins, and whether the chip answers (its ID, 0x97). Out of the firmware the reset
++ *      pin is an input with a pull-down: the chip is held in reset and does not answer.
++ *   2  ... and the reset released as Android's driver releases it, and the chip's registers read (nothing written)
++ *   3  ... and Android's configuration written (aw8697_haptic_init), Android's waveforms loaded into the chip's RAM
++ *      and read back; then standby. Nothing moves.
++ *   4  ... and one short effect played (apollo_haptic_effect=N, default 1: Android's effect 0)
++ *   5  ... configured and loaded as for 3, and the motor for iOS until the run ends: /dev/apollo-haptic (mode 0666)
++ *      takes int16 mono 48 kHz samples as /dev/hakios-haptic does; a waveform of iOS's (a stretch of samples after
++ *      a pause) is a tap (waveform 1), one that goes on for longer than a tap the looping waveform (11) until it
++ *      ends -- HAPTIC_MAX_MS at most, then the motor rests as long. The gain follows the loudness (gain_for()).
++ *      Taps and vibrations together drive the motor HAPTIC_MAX_MS at most in any DUTY_WINDOW_MS (2 s): past that
++ *      it is stopped and rests HAPTIC_MAX_MS, and nothing starts until the window has room again.
++ *
++ * Limits, whatever asks: Android's own values only (gain 0x80 at the most, its boost settings, its waveforms); no
++ * effect longer than HAPTIC_MAX_MS, no more than HAPTIC_MAX_MS of driving in any DUTY_WINDOW_MS; any fault the chip
++ * reports (boost short circuit or over-voltage, under-voltage, over-current, over-temperature), a byte nobody acknowledges or a RAM that does not read back, and the chip is put
++ * into reset for the rest of the run. At the run's end and on a panic's way out the chip goes back into reset.
++ *
++ * Taken from Android's driver (aw8697.c, apollo-q-oss), function by function:
++ *   aw8697_hw_reset            reset low 5 ms, high 5 ms
++ *   aw8697_read_chipid         REG_ID (0x00) = 0x97, then aw8697_haptic_softreset: REG_ID <- 0xaa, 1 ms
++ *   aw8697_haptic_init         standby; PWMDBG[6:5] = 2 (24 kHz); BSTDBG1..3 <- DT vib_bstdbg 0x30 0xeb 0xd4; TSET <-
++ *                              0x12; R_SPARE <- 0x68; ANADBG[3:2] = 3; BSTCFG[2:0] = 5 (3.5 A); motor protection off
++ *                              (DETCTRL[5] = 1, PWMPRC[7] = 0, PRLVL[7] = 0); BST_AUTO[2] = 0; offset calibration;
++ *                              ADCTEST[6] = 1 (vbat hardware compensation); BEMF_VTH <- DT vib_bemf_config
++ *   aw8697_container_update    RAMINIT (SYSCTRL[5]) on; BASE_ADDRH/L <- the file's bytes 2, 3; FIFO_AE/AF from the
++ *                              base address; RAMADDRH/L <- the same; the file from byte 4 on into RAMDATA; RAMINIT off
++ *   aw8697_ram_loaded          the file's first two bytes: the sum of all the others (16 bits)
++ *   aw8697_haptic_play_effect_seq / _play_mode / _play_go / _set_wav_seq / _set_wav_loop /
++ *   _set_repeat_wav_seq / _set_gain / _set_bst_vol
++ *                              WAVSEQ1 (0x07) <- waveform, WAVSEQ2 <- 0, WAVLOOP1 (0x0f) <- 0 (once) or 0xf0 (forever),
++ *                              SYSCTRL: RAM mode, active, boost (once) or bypass (looped); DATDBG (0x39) <- gain;
++ *                              BSTDBG4[5:1] <- DT vib_bst_vol_ram 0x11; GO (0x05) <- 1
++ *   aw8697_haptic_stop         GO <- 0, until GLB_STATE (0x46) & 0xf is 0, then SYSCTRL[0] = 1 (standby)
++ */
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/thread.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <miscfs/devfs/devfs.h>
++#include <sys/conf.h>
++#include <sys/systm.h>
++#include <sys/uio.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include "hakios.apollo_input.h"   /* apollo: this tree's, beside it */
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern kern_return_t thread_terminate(thread_t thread);
++extern void loader_log_putc(char c);
++extern const uint8_t *hakios_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
++
++static uint32_t stage;
++static bool broken, released, leaving, prepared;
++
++/* every line to the loader's log as well (and to the console when that may be written) */
++extern bool apollo_rpmh_bcm_vote(const char *name, uint32_t ab, uint32_t ib);    /* hakios.apollo_cpufreq.c */
++extern void apollo_cmd_db_dump(void);
++static bool bringing_up;                /* the chip's bring-up: every line waits pause_ms */
++static uint32_t pause_ms = 0;          /* apollo: their 400 gave their loader's log time; none needed here */
++static uint32_t start_after_ms = 15000;  /* (the start's flood of lines over first: apollo_haptic_after=MS) */
++static int say(const char *format, ...) __printflike(1, 2);
++
++static int
++say(const char *format, ...)
++{
++	char line[300];
++	va_list list;
++	int length;
++
++	va_start(list, format);
++	length = vsnprintf(line, sizeof(line), format, list);
++	va_end(list);
++	for (const char *c = line; *c != 0; c++) {
++		loader_log_putc(*c);
++	}
++	if (!leaving && ml_get_interrupts_enabled()) {
++		printf("%s", line);
++		/*
++		 * The first runs reset the phone without a word (25 October): while the chip is being brought up, every line
++		 * is given time to reach the loader before the next access (apollo_haptic_pause=MS, 0: none).
++		 */
++		if (bringing_up && pause_ms) {
++			delay_for_interval(pause_ms, 1000 * NSEC_PER_USEC);
++		}
++	}
++	return length;
++}
++
++static inline uint32_t
++rd(vm_offset_t address)
++{
++	return *(volatile uint32_t *)address;
++}
++
++static inline void
++wr(vm_offset_t address, uint32_t value)
++{
++	*(volatile uint32_t *)address = value;
++}
++
++static void
++spin_us(uint32_t us)
++{
++	uint64_t until;
++
++	nanoseconds_to_absolutetime((uint64_t)us * NSEC_PER_USEC, &until);
++	until += mach_absolute_time();
++	while (mach_absolute_time() < until) {
++	}
++}
++
++static void
++sleep_us(uint32_t us)
++{
++	if (leaving) {
++		spin_us(us);
++	} else {
++		delay_for_interval(us, NSEC_PER_USEC);
++	}
++}
++
++static void
++wait_ms(uint32_t ms)
++{
++	if (leaving) {
++		spin_us(ms * 1000);
++	} else {
++		delay_for_interval(ms, NSEC_PER_MSEC);
++	}
++}
++
++/* ---- pins (TLMM, south tile: one page per pin, mapped one pair at a time) ------------------------------------ */
++
++#define TLMM_SOUTH_PHYS         0x0f500000UL
++#define PIN_SDA                 60
++#define PIN_SCL                 61
++#define PIN_INT                 129
++#define PIN_RESET               130
++#define FUNCTION_QUP11          1       /* pinctrl-kona.c: GPIO 60 and 61, the function after gpio */
++
++static vm_offset_t pins_i2c;            /* pages of GPIO 60 and 61 */
++static vm_offset_t pins_rst;            /* pages of GPIO 129 and 130 */
++
++static vm_offset_t
++pin(unsigned n)
++{
++	return n < PIN_INT ? pins_i2c + 0x1000UL * (n - PIN_SDA) : pins_rst + 0x1000UL * (n - PIN_INT);
++}
++
++static void
++show_pins(void)
++{
++	static const struct {
++		unsigned pin;
++		const char *what;
++	} pins[] = { { PIN_SDA, "I2C data" }, { PIN_SCL, "I2C clock" }, { PIN_RESET, "reset" }, { PIN_INT, "interrupt" } };
++
++	for (unsigned i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
++		uint32_t cfg, io;
++
++		say("apollo haptic: about to read gpio%u's configuration at %#lx\n", pins[i].pin,
++		    TLMM_SOUTH_PHYS + 0x1000UL * pins[i].pin);
++		cfg = rd(pin(pins[i].pin));
++		io = rd(pin(pins[i].pin) + 4);
++
++		say("apollo haptic: gpio%u (%s): function %u, pull %u, %u mA, %s, reads %u\n", pins[i].pin, pins[i].what,
++		    (cfg >> 2) & 15, cfg & 3, (((cfg >> 6) & 7) + 1) * 2, (cfg & (1u << 9)) ? (io & 2 ? "drives high" : "drives low") :
++		    "input", io & 1);
++	}
++}
++
++/* the reset pin as an output of the GPIO function, driving `high' (2 mA, no pull) */
++static void
++reset_pin(bool high)
++{
++	wr(pin(PIN_RESET) + 4, high ? 2 : 0);
++	wr(pin(PIN_RESET), 1u << 9);
++	released = high;
++}
++
++static bool
++reset_is_high(void)
++{
++	uint32_t cfg = rd(pin(PIN_RESET)), io = rd(pin(PIN_RESET) + 4);
++
++	return (cfg & (1u << 9)) && (io & 2);
++}
++
++/* ---- clocks (GCC, kona; the second QUPv3 wrapper's sixth serial engine) -------------------------------------- */
++
++#define GCC_PHYS                0x00100000UL
++#define GCC_SIZE                0x60000UL
++#define GCC_VOTE                0x52008         /* gcc-kona.c: enable_reg of all the wrapper 1 clocks below */
++#define VOTE_QUP1_CORE_2X       (1u << 18)      /* gcc_qupv3_wrap1_core_2x_clk: halt 0x23140 */
++#define VOTE_QUP1_CORE          (1u << 19)      /* gcc_qupv3_wrap1_core_clk: halt 0x23138 */
++#define VOTE_QUP1_M_AHB         (1u << 20)      /* gcc_qupv3_wrap_1_m_ahb_clk: halt 0x18004 */
++#define VOTE_QUP1_S_AHB         (1u << 21)      /* gcc_qupv3_wrap_1_s_ahb_clk: halt 0x18008 (hwcg bit 1) */
++#define VOTE_QUP1_S3            (1u << 25)      /* gcc_qupv3_wrap1_s3_clk: halt 0x1839c */
++#define QUP1_CORE_2X_CBCR       0x23140
++#define QUP1_CORE_CBCR          0x23138
++#define QUP1_M_AHB_CBCR         0x18004
++#define QUP1_S_AHB_CBCR         0x18008
++#define QUP1_S3_CBCR            0x1839c
++#define QUP1_S3_RCG             0x183a0         /* gcc_qupv3_wrap1_s3_clk_src cmd_rcgr; cfg +4; DFS: +0x14, levels at +0x1c, +0x5c, +0x9c */
++/*
++ * (The first version enabled wrapper 1's serial engine *5* -- 0x185fc, vote bit 27 -- for serial engine 11 = 0xa8c000, the
++ * fourth of the wrapper's engines, S3: its own clock stayed off. The phone's DT agrees with S3: i2c@a8c000's clocks are
++ * GCC 112 = GCC_QUPV3_WRAP1_S3_CLK, 134 = WRAP_1_M_AHB, 135 = WRAP_1_S_AHB, in the kona clock header of apollo-q-oss.)
++ */
++#define WRAPPER1_PHYS           0x00ac0000UL    /* qupv3_1_geni_se@ac0000 */
++#define WRAPPER_HW_VER          0x04            /* qcom-geni-se.c: QUP_HW_VER_REG */
++#define CLOCK_OFF               (1u << 31)
++#define CLOCK_HW_CTL            (1u << 1)
++#define XO_HZ                   19200000u
++
++static vm_offset_t gcc, wrapper;
++
++static uint32_t
++rcg_rate(uint32_t cfg, uint32_t m, uint32_t not_n_minus_m)
++{
++	static const uint32_t parent[8] = { XO_HZ, 600000000, 0, 0, 0, 0, 300000000, 0 };
++	uint64_t hz = parent[cfg >> 8 & 7];
++	uint32_t divider = cfg & 0x1f, mode = cfg >> 12 & 3;
++
++	if (divider) {
++		hz = hz * 2 / (divider + 1);
++	}
++	if (mode) {
++		uint32_t n = (~not_n_minus_m & 0xffff) + (m & 0xffff);
++
++		if (n) {
++			hz = hz * (m & 0xffff) / n;
++		}
++	}
++	return (uint32_t)hz;
++}
++
++/* a branch's CLK_OFF bit (a branch the hardware gates, by its HW_CTL bit, is idle then, not off) */
++static bool
++branch_on(uint32_t cbcr)
++{
++	uint32_t v = rd(gcc + cbcr);
++
++	return !(v & CLOCK_OFF) || (cbcr == QUP1_S_AHB_CBCR && (v & CLOCK_HW_CTL));
++}
++
++/* the wrapper's bus and core clocks (m_ahb, s_ahb, core, core_2x): voted, then each read back (up to 10 ms) */
++static int
++bus_clocks_on(void)
++{
++	apollo_gcc_vote(gcc + GCC_VOTE, VOTE_QUP1_CORE_2X | VOTE_QUP1_CORE | VOTE_QUP1_M_AHB | VOTE_QUP1_S_AHB);    /* (locked: shared register) */
++	for (int i = 0; i < 1000; i++) {
++		if (branch_on(QUP1_CORE_2X_CBCR) && branch_on(QUP1_CORE_CBCR) && branch_on(QUP1_M_AHB_CBCR) && branch_on(QUP1_S_AHB_CBCR)) {
++			return 0;
++		}
++		sleep_us(10);
++	}
++	say("apollo haptic: the wrapper's clocks stay off: core_2x %#x core %#x m_ahb %#x s_ahb %#x (vote reads %#x)\n",
++	    rd(gcc + QUP1_CORE_2X_CBCR), rd(gcc + QUP1_CORE_CBCR), rd(gcc + QUP1_M_AHB_CBCR), rd(gcc + QUP1_S_AHB_CBCR),
++	    rd(gcc + GCC_VOTE));
++	return -1;
++}
++
++/* the serial engine's clock: XO's 19.2 MHz, the rate i2c-qcom-geni.c's table is for; which preset gives it */
++static int
++se_clock_on(uint32_t *select)
++{
++	*select = 0;
++	if (rd(gcc + QUP1_S3_RCG + 0x14) & 1) {
++		int found = -1;
++
++		for (uint32_t lvl = 0; lvl < 8 && found < 0; lvl++) {
++			if (rcg_rate(rd(gcc + QUP1_S3_RCG + 0x1c + 4 * lvl), rd(gcc + QUP1_S3_RCG + 0x5c + 4 * lvl),
++			    rd(gcc + QUP1_S3_RCG + 0x9c + 4 * lvl)) == XO_HZ) {
++				found = (int)lvl;
++			}
++		}
++		if (found < 0) {
++			say("apollo haptic: serial engine 11 has no 19.2 MHz preset\n");
++			return -1;
++		}
++		*select = (uint32_t)found;
++	} else {
++		wr(gcc + QUP1_S3_RCG + 4, (rd(gcc + QUP1_S3_RCG + 4) & ~0x371fu) | 1);
++		wr(gcc + QUP1_S3_RCG, rd(gcc + QUP1_S3_RCG) | 1);
++		for (int i = 0; i < 500 && (rd(gcc + QUP1_S3_RCG) & 1); i++) {
++			sleep_us(10);
++		}
++		if (rd(gcc + QUP1_S3_RCG) & 1) {
++			say("apollo haptic: the serial engine's clock does not take its configuration (%#x)\n", rd(gcc + QUP1_S3_RCG));
++			return -1;
++		}
++	}
++	apollo_gcc_vote(gcc + GCC_VOTE, VOTE_QUP1_S3);
++	for (int i = 0; i < 1000; i++) {
++		if (branch_on(QUP1_S3_CBCR)) {
++			return 0;
++		}
++		sleep_us(10);
++	}
++	say("apollo haptic: serial engine 11's clock stays off: %#x\n", rd(gcc + QUP1_S3_CBCR));
++	return -1;
++}
++
++/* ---- I2C through the serial engine (i2c-qcom-geni.c; as in hakios.apollo_cs35l41.c) ----------------------------------- */
++
++#define SE_PHYS                 0x00a8c000UL    /* the sixth serial engine of the second QUPv3 wrapper */
++#define SE_SIZE                 0x4000UL
++#define GENI_FORCE_DEFAULT      0x020
++#define GENI_OUTPUT_CTRL        0x024
++#define GENI_CGC_CTRL           0x028
++#define GENI_STATUS             0x040
++#define GENI_SER_M_CLK_CFG      0x048
++#define GENI_IF_DISABLE_RO      0x064
++#define GENI_FW_REVISION_RO     0x068           /* [15:8] protocol: 3 = I2C */
++#define GENI_CLK_SEL            0x07c
++#define GENI_BYTE_GRAN          0x254
++#define GENI_DMA_MODE_EN        0x258
++#define GENI_TX_PACKING_CFG0    0x260
++#define GENI_TX_PACKING_CFG1    0x264
++#define I2C_TX_TRANS_LEN        0x26c
++#define I2C_RX_TRANS_LEN        0x270
++#define I2C_SCL_COUNTERS        0x278
++#define GENI_RX_PACKING_CFG0    0x284
++#define GENI_RX_PACKING_CFG1    0x288
++#define GENI_M_CMD0             0x600
++#define GENI_M_CMD_CTRL         0x604
++#define GENI_M_IRQ_STATUS       0x610
++#define GENI_M_IRQ_EN           0x614
++#define GENI_M_IRQ_CLEAR        0x618
++#define GENI_S_IRQ_CLEAR        0x648
++#define GENI_TX_FIFO            0x700
++#define GENI_RX_FIFO            0x780
++#define GENI_TX_FIFO_STATUS     0x800
++#define GENI_RX_FIFO_STATUS     0x804
++#define GENI_TX_WATERMARK       0x80c
++#define GENI_RX_WATERMARK       0x810
++#define GENI_RX_RFR_WATERMARK   0x814
++#define SE_DMA_TX_IRQ_CLR       0xc44
++#define SE_DMA_RX_IRQ_CLR       0xd44
++#define SE_GSI_EVENT_EN         0xe18
++#define SE_IRQ_EN               0xe1c
++#define SE_HW_PARAM_0           0xe24
++#define SE_DMA_GENERAL_CFG      0xe30
++
++#define I2C_WRITE               1u
++#define I2C_READ                2u
++#define I2C_STOP_STRETCH        (1u << 2)       /* no stop at the end: a repeated start follows */
++#define M_CMD_DONE              (1u << 0)
++#define M_CMD_CANCEL            (1u << 4)
++#define M_CMD_ABORT             (1u << 5)
++#define M_NACK                  (1u << 10)      /* M_GP_IRQ_1: the address or a byte was not acknowledged */
++#define M_ERRORS                ((1u << 1) | (1u << 2) | (1u << 3) | M_NACK | (1u << 11) | (1u << 12) | (1u << 13) | \
++	                         (1u << 24) | (1u << 25) | (1u << 28) | (1u << 29))
++
++static vm_offset_t se;
++static uint32_t fifo_depth;
++
++static const char *
++i2c_init(uint32_t select)
++{
++	if ((rd(se + GENI_FW_REVISION_RO) >> 8 & 0xff) != 3) {
++		return "serial engine 11 has no I2C firmware";
++	}
++	if (rd(se + GENI_IF_DISABLE_RO) & 1) {
++		return "serial engine 11's FIFO interface is disabled";
++	}
++	fifo_depth = rd(se + SE_HW_PARAM_0) >> 16 & 0x3f;
++	if (fifo_depth < 4) {
++		return "serial engine 11 reports no FIFO";
++	}
++	wr(se + SE_GSI_EVENT_EN, 0);
++	wr(se + GENI_M_IRQ_CLEAR, 0xffffffff);
++	wr(se + GENI_S_IRQ_CLEAR, 0xffffffff);
++	wr(se + SE_DMA_TX_IRQ_CLR, 0xffffffff);
++	wr(se + SE_DMA_RX_IRQ_CLR, 0xffffffff);
++	wr(se + GENI_CGC_CTRL, rd(se + GENI_CGC_CTRL) | 0x7f);
++	wr(se + SE_DMA_GENERAL_CFG, rd(se + SE_DMA_GENERAL_CFG) | 0xf);
++	wr(se + GENI_OUTPUT_CTRL, 0x7f);
++	wr(se + GENI_FORCE_DEFAULT, 1);
++	wr(se + GENI_DMA_MODE_EN, rd(se + GENI_DMA_MODE_EN) & ~1u);
++	wr(se + GENI_RX_WATERMARK, fifo_depth - 3);
++	wr(se + GENI_RX_RFR_WATERMARK, fifo_depth - 2);
++	wr(se + GENI_TX_WATERMARK, 0);
++	wr(se + SE_IRQ_EN, rd(se + SE_IRQ_EN) | 0xf);
++	wr(se + GENI_M_IRQ_EN, rd(se + GENI_M_IRQ_EN) | 0x7fc0007f);
++	wr(se + GENI_TX_PACKING_CFG0, 0x0007f8fe);      /* bytes, the first in the low byte of a word */
++	wr(se + GENI_TX_PACKING_CFG1, 0x000ffefe);
++	wr(se + GENI_RX_PACKING_CFG0, 0x0007f8fe);
++	wr(se + GENI_RX_PACKING_CFG1, 0x000ffefe);
++	wr(se + GENI_BYTE_GRAN, 0);
++	/* 400 kHz from 19.2 MHz (i2c-qcom-geni.c's geni_i2c_clk_map): divider 2, high 5, low 12, cycle 24 */
++	wr(se + GENI_CLK_SEL, select & 7);
++	wr(se + GENI_SER_M_CLK_CFG, 2u << 4 | 1);
++	wr(se + I2C_SCL_COUNTERS, 5u << 20 | 12u << 10 | 24u);
++	return NULL;
++}
++
++static void
++i2c_recover(void)
++{
++	wr(se + GENI_M_CMD_CTRL, 1u << 2);
++	for (int i = 0; i < 200 && !(rd(se + GENI_M_IRQ_STATUS) & M_CMD_CANCEL); i++) {
++		sleep_us(50);
++	}
++	if (!(rd(se + GENI_M_IRQ_STATUS) & M_CMD_CANCEL)) {
++		wr(se + GENI_M_CMD_CTRL, 1u << 1);
++		for (int i = 0; i < 200 && !(rd(se + GENI_M_IRQ_STATUS) & M_CMD_ABORT); i++) {
++			sleep_us(50);
++		}
++	}
++	for (int i = 0; i < 64 && (rd(se + GENI_RX_FIFO_STATUS) & 0x01ffffff); i++) {
++		(void)rd(se + GENI_RX_FIFO);
++	}
++	wr(se + GENI_M_IRQ_CLEAR, 0xffffffff);
++}
++
++static unsigned i2c_failures;
++
++/* One transfer: write `length` bytes of `tx`, or read `length` into `rx`; `stop`: a stop at the end */
++static bool
++i2c_xfer(uint8_t address, const uint8_t *tx, uint8_t *rx, uint32_t length, bool stop)
++{
++	uint32_t sent = 0, received = 0, status = 0, i;
++
++	for (i = 0; i < 200 && (rd(se + GENI_STATUS) & 1); i++) {
++		sleep_us(10);
++	}
++	wr(se + GENI_M_IRQ_CLEAR, 0xffffffff);
++	wr(se + (tx != NULL ? I2C_TX_TRANS_LEN : I2C_RX_TRANS_LEN), length);
++	wr(se + GENI_M_CMD0, (tx != NULL ? I2C_WRITE : I2C_READ) << 27 | (uint32_t)address << 9 | (stop ? 0 : I2C_STOP_STRETCH));
++	for (i = 0; i < 8000; i++) {                    /* 40 ms at most: 33 bytes take 0.8 ms at 400 kHz */
++		while (tx != NULL && sent < length && (rd(se + GENI_TX_FIFO_STATUS) & 0x0fffffff) + 1 < fifo_depth) {
++			uint32_t word = 0;
++
++			for (int j = 0; j < 4 && sent < length; j++, sent++) {
++				word |= (uint32_t)tx[sent] << (8 * j);
++			}
++			wr(se + GENI_TX_FIFO, word);
++		}
++		if (rx != NULL) {
++			uint32_t words = rd(se + GENI_RX_FIFO_STATUS) & 0x01ffffff;
++
++			while (words--) {
++				uint32_t word = rd(se + GENI_RX_FIFO);
++
++				for (int j = 0; j < 4 && received < length; j++) {
++					rx[received++] = (uint8_t)(word >> (8 * j));
++				}
++			}
++		}
++		status = rd(se + GENI_M_IRQ_STATUS);
++		if (status & M_ERRORS) {
++			break;
++		}
++		if ((status & M_CMD_DONE) && (rx == NULL || received == length)) {
++			wr(se + GENI_M_IRQ_CLEAR, status);
++			return true;
++		}
++		sleep_us(5);
++	}
++	if (i2c_failures++ < 8) {
++		say("apollo haptic: I2C %s of %u bytes at %#x failed: status %#x%s (sent %u, received %u)\n", tx ? "write" : "read",
++		    length, address, status, (status & M_NACK) ? ", NOT ACKNOWLEDGED" : "", sent, received);
++	}
++	i2c_recover();
++	return false;
++}
++
++/* ---- the chip's registers: 8 bits, the address counts up (but for the RAM's data port) ---------------------------- */
++
++#define AW_ADDRESS              0x5a
++
++static bool
++regs_read(uint8_t reg, uint8_t *values, unsigned count)
++{
++	return i2c_xfer(AW_ADDRESS, &reg, NULL, 1, false) && i2c_xfer(AW_ADDRESS, NULL, values, count, true);
++}
++
++static bool
++regs_write(uint8_t reg, const uint8_t *values, unsigned count)
++{
++	uint8_t buffer[40];
++
++	if (count > sizeof(buffer) - 1) {
++		return false;
++	}
++	buffer[0] = reg;
++	memcpy(buffer + 1, values, count);
++	return i2c_xfer(AW_ADDRESS, buffer, NULL, count + 1, true);
++}
++
++/* ---- the chip (aw8697_reg.h) ------------------------------------------------------------------------------- */
++
++#define AW_ID                   0x00            /* read: 0x97; write 0xaa: a soft reset */
++#define AW_SYSST                0x01
++#define AW_SYSINT               0x02            /* read: cleared; [7] boost, [6] over-voltage, [5] UVLO, [2] OC, [1] OT */
++#define AW_SYSINTM              0x03            /* [5] UVLO masked */
++#define AW_SYSCTRL              0x04            /* [5] RAMINIT, [3:2] play mode (0 RAM), [1] boost (0 bypass), [0] standby */
++#define AW_GO                   0x05
++#define AW_WAVSEQ1              0x07
++#define AW_WAVSEQ2              0x08
++#define AW_WAVLOOP1             0x0f            /* [7:4] how often the first is repeated, 15: forever */
++#define AW_PWMPRC               0x2d            /* [7] the motor's protection */
++#define AW_PWMDBG               0x2e            /* [6:5] the PWM rate: 2 is 24 kHz */
++#define AW_BSTDBG1              0x31
++#define AW_BSTDBG2              0x32
++#define AW_BSTDBG3              0x33
++#define AW_BSTCFG               0x34            /* [2:0] the boost's peak current: 5 is 3.5 A */
++#define AW_ANADBG               0x35            /* [3:2] the over-current limit: 3 is 4.65 A */
++#define AW_DATDBG               0x39            /* the gain */
++#define AW_BSTDBG4              0x3a            /* [5:1] the boost's voltage */
++#define AW_PRLVL                0x3e            /* [7] the protection */
++#define AW_BASEADDRH            0x21
++#define AW_BASEADDRL            0x22
++#define AW_FIFO_AEH             0x23
++#define AW_FIFO_AEL             0x24
++#define AW_FIFO_AFH             0x25
++#define AW_FIFO_AFL             0x26
++#define AW_RAMADDRH             0x40
++#define AW_RAMADDRL             0x41
++#define AW_RAMDATA              0x42
++#define AW_GLB_STATE            0x46            /* [3:0] 0: standby */
++#define AW_BST_AUTO             0x47            /* [2] automatic boost */
++#define AW_TSET                 0x4d
++#define AW_R_SPARE              0x5d
++#define AW_DETCTRL              0x5f            /* [5] protection: no action, [0] the offset diagnosis */
++#define AW_ADCTEST              0x66            /* [6] vbat compensation in hardware */
++#define AW_BEMF_VTHH_H          0x74
++#define AW_CHIPID               0x97
++
++#define SYSINT_FAULTS           0xe6
++#define HAPTIC_MAX_MS           1000
++#define DUTY_WINDOW_MS          2000            /* at most HAPTIC_MAX_MS of driving (taps and vibrations) in any window this long */
++#define DUTY_SLOT_MS            100             /* the window kept as so many slots of driving time; one more than it takes, so */
++#define DUTY_SLOTS              (DUTY_WINDOW_MS / DUTY_SLOT_MS + 1)     /* that the slots always cover the whole window */
++#define ANDROID_GAIN            0x80            /* aw8697_haptic_effect_strength(): the strongest level */
++#define BST_VOL_RAM             0x11            /* DT vib_bst_vol_ram */
++
++static void
++give_up(const char *why)
++{
++	broken = true;
++	say("apollo haptic: %s: THE CHIP IS PUT INTO RESET (gpio%u low) and nothing more is done\n", why, PIN_RESET);
++	if (pins_rst != 0) {
++		reset_pin(false);
++	}
++}
++
++static bool
++get(uint8_t reg, uint8_t *value)
++{
++	if (!regs_read(reg, value, 1)) {
++		say("apollo haptic: %#04x NOT READ\n", reg);
++		return false;
++	}
++	return true;
++}
++
++/* One register written and read back; a value that reads back differently is said (some bits may not be the host's), not fatal. */
++static bool
++put(uint8_t reg, uint8_t value)
++{
++	uint8_t after = 0;
++
++	if (broken) {
++		return false;
++	}
++	if (!regs_write(reg, &value, 1)) {
++		say("apollo haptic: %#04x <- %#04x NOT ACKNOWLEDGED\n", reg, value);
++		give_up("a write was not acknowledged");
++		return false;
++	}
++	if (!regs_read(reg, &after, 1)) {
++		give_up("a register could not be read back");
++		return false;
++	}
++	say("apollo haptic: %#04x <- %#04x, reads %#04x%s\n", reg, value, after, after == value ? "" : ": DIFFERENT");
++	return true;
++}
++
++/* A register's bits `mask' set to `value' (the others as they are), as aw8697_i2c_write_bits(). */
++static bool
++upd(uint8_t reg, uint8_t mask, uint8_t value)
++{
++	uint8_t old = 0;
++
++	if (broken || !get(reg, &old)) {
++		give_up("a register could not be read");
++		return false;
++	}
++	return put(reg, (uint8_t)((old & ~mask) | (value & mask)));
++}
++
++/* The chip's interrupt flags (reading clears them): false, and the chip given up on, if one is a fault. */
++static bool
++healthy(const char *when)
++{
++	uint8_t flags = 0;
++
++	if (!get(AW_SYSINT, &flags)) {
++		give_up("the flags could not be read");
++		return false;
++	}
++	/*
++	 * Under-voltage alone is not a fault: Xiaomi's aw8697.c masks the UVLO interrupt in standby (aw8697_haptic_play_mode(),
++	 * SYSINTM_UVLO_OFF) and only logs it otherwise ("chip uvlo int error"); the chip showed it right after its
++	 * configuration, at rest (25 October).
++	 */
++	if (flags & 0x20) {
++		say("apollo haptic: %s: the chip reports under-voltage (%#04x): told, not a fault (as Xiaomi's driver)\n", when, flags);
++	}
++	/*
++	 * Nor a boost error: Xiaomi's aw8697.c switches that interrupt off (aw8697_interrupt_setup(): SYSINTM BSTERR_OFF) and
++	 * never looks at it; the chip raised it on the first tap of a run (25 October) and the motor was given up on for nothing.
++	 */
++	if (flags & 0x80) {
++		static unsigned told;
++
++		if (told++ < 4) {
++			say("apollo haptic: %s: the chip reports a boost error (%#04x): told, not a fault (Xiaomi's driver masks it)\n", when,
++			    flags);
++		}
++	}
++	if (flags & SYSINT_FAULTS & ~0xa0) {
++		say("apollo haptic: %s: the chip reports %#04x:%s%s%s%s%s\n", when, flags, flags & 0x80 ? " BOOST ERROR" : "",
++		    flags & 0x40 ? " OVER-VOLTAGE" : "", flags & 0x20 ? " UNDER-VOLTAGE" : "", flags & 0x04 ? " OVER-CURRENT" : "",
++		    flags & 0x02 ? " OVER-TEMPERATURE" : "");
++		give_up("a fault");
++		return false;
++	}
++	return true;
++}
++
++static bool
++chip_answers(void)
++{
++	uint8_t id = 0;
++
++	if (!regs_read(AW_ID, &id, 1)) {
++		say("apollo haptic: nobody answers at %#x on the bus of gpio%u/%u\n", AW_ADDRESS, PIN_SDA, PIN_SCL);
++		return false;
++	}
++	say("apollo haptic: the chip at %#x says %#04x%s\n", AW_ADDRESS, id, id == AW_CHIPID ? ", an AW8697" : ": NOT THE AW8697 EXPECTED");
++	return id == AW_CHIPID;
++}
++
++/* the registers as they are (not the interrupt flags, the RTP and RAM data ports: reading them has effects), nothing written */
++static void
++show_registers(void)
++{
++	for (unsigned base = 0; base < 0x80; base += 8) {
++		uint8_t values[8];
++		bool ok = true;
++
++		for (unsigned i = 0; i < 8; i++) {
++			unsigned reg = base + i;
++
++			values[i] = 0;
++			if (reg == AW_SYSINT || reg == 0x06 || reg == AW_RAMDATA) {
++				continue;
++			}
++			ok &= get((uint8_t)reg, &values[i]);
++		}
++		say("apollo haptic: %#04x: %02x %02x %02x %02x %02x %02x %02x %02x\n", base, values[0], values[1], values[2], values[3],
++		    values[4], values[5], values[6], values[7]);
++		if (!ok) {
++			return;
++		}
++	}
++}
++
++/* aw8697_hw_reset(): low 5 ms, high 5 ms */
++static void
++hardware_reset(void)
++{
++	/* aw8697_hw_reset() with pinctrl: aw8697_reset_active (output high), 5 ms, aw8697_reset_reset (output low), 5 ms, active */
++	say("apollo haptic: the reset is released: gpio%u high, low for 5 ms, then high\n", PIN_RESET);
++	wr(pin(PIN_INT), 3);                    /* aw8697_gpio_int: gpio, 2 mA, pull-up, input */
++	reset_pin(true);
++	wait_ms(5);
++	reset_pin(false);
++	wait_ms(5);
++	reset_pin(true);
++	wait_ms(5);
++}
++
++/* aw8697_haptic_play_mode(STANDBY) */
++static bool
++to_standby(void)
++{
++	return upd(AW_SYSINTM, 0x20, 0x20) && upd(AW_SYSCTRL, 0x01, 0x01);
++}
++
++/* aw8697_haptic_init(): Android's configuration */
++static bool
++configure(void)
++{
++	static const uint8_t bemf[4] = { 0x00, 0x08, 0x03, 0xf8 };     /* DT vib_bemf_config */
++	uint8_t id = 0;
++
++	say("apollo haptic: Android's configuration is written\n");
++	if (!regs_write(AW_ID, (const uint8_t[]){ 0xaa }, 1)) {         /* aw8697_haptic_softreset() */
++		give_up("the soft reset was not acknowledged");
++		return false;
++	}
++	wait_ms(2);
++	if (!get(AW_ID, &id) || id != AW_CHIPID) {
++		give_up("the chip does not answer after its soft reset");
++		return false;
++	}
++	if (!to_standby() || !upd(AW_PWMDBG, 0x60, 2 << 5) ||
++	    !put(AW_BSTDBG1, 0x30) || !put(AW_BSTDBG2, 0xeb) || !put(AW_BSTDBG3, 0xd4) ||    /* DT vib_bstdbg */
++	    !put(AW_TSET, 0x12) || !put(AW_R_SPARE, 0x68) ||                                 /* DT vib_tset, vib_r_spare */
++	    !upd(AW_ANADBG, 0x0c, 3 << 2) || !upd(AW_BSTCFG, 0x07, 5) ||
++	    !upd(AW_DETCTRL, 0x20, 0x20) || !upd(AW_PWMPRC, 0x80, 0) || !upd(AW_PRLVL, 0x80, 0) ||  /* the motor protection off */
++	    !upd(AW_BST_AUTO, 0x04, 0)) {
++		return false;
++	}
++	/* aw8697_haptic_offset_calibration(): RAMINIT on, the diagnosis run, RAMINIT off */
++	if (!upd(AW_SYSCTRL, 0x20, 0x20) || !upd(AW_DETCTRL, 0x01, 0x01)) {
++		return false;
++	}
++	for (unsigned i = 0; i < 500; i++) {
++		uint8_t value = 1;
++
++		if (!get(AW_DETCTRL, &value) || !(value & 1)) {
++			break;
++		}
++		wait_ms(1);
++	}
++	if (!upd(AW_SYSCTRL, 0x20, 0) || !upd(AW_ADCTEST, 0x40, 0x40)) {
++		return false;
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		if (!put((uint8_t)(AW_BEMF_VTHH_H + i), bemf[i])) {
++			return false;
++		}
++	}
++	return upd(AW_BSTDBG4, 0x3e, BST_VOL_RAM << 1) && healthy("after the configuration");
++}
++
++static uint32_t states_seen;           /* the GLB_STATE states seen by the last wait, a bit each */
++
++/* until the chip says it is in standby (GLB_STATE 0), at most `ms' */
++static bool
++wait_standby(unsigned ms)
++{
++	states_seen = 0;
++	for (unsigned waited = 0; waited <= ms; waited += 2) {
++		uint8_t state = 0xff;
++
++		if (!get(AW_GLB_STATE, &state)) {
++			return false;
++		}
++		states_seen |= 1u << (state & 0x0f);
++		if ((state & 0x0f) == 0) {
++			return true;
++		}
++		wait_ms(2);
++	}
++	return false;
++}
++
++/*
++ * Android's waveforms into the chip's RAM (aw8697_ram_loaded, aw8697_container_update): the file is a checksum (16
++ * bits, of all that follows), the address the RAM's contents begin at, and those contents from byte 4 on -- a
++ * version byte, the start and end address of each waveform, the waveforms. Read back the same way and compared.
++ */
++static bool
++load_waveforms(void)
++{
++	uint64_t size = 0;
++	const uint8_t *file = hakios_image_file("fw", "aw8697_haptic.bin", &size, NULL);
++	uint16_t sum = 0;
++	uint32_t base, length, ae, af;
++	uint8_t address[2], back[32];
++	bool ok = false;
++
++	if (file == NULL || size < 8) {
++		say("apollo haptic: no aw8697_haptic.bin in fw/ of the small image\n");
++		return false;
++	}
++	for (uint64_t i = 2; i < size; i++) {
++		sum = (uint16_t)(sum + file[i]);
++	}
++	if (sum != (uint16_t)(file[0] << 8 | file[1])) {
++		say("apollo haptic: aw8697_haptic.bin does not add up (%#x, it says %#x): not loaded\n", sum, file[0] << 8 | file[1]);
++		goto out;
++	}
++	base = (uint32_t)(file[2] << 8 | file[3]);
++	length = (uint32_t)size - 4;
++	ae = base >> 2;
++	af = base - (base >> 2);
++	say("apollo haptic: Android's waveforms: %u bytes from %#x on\n", length, base);
++	if (!wait_standby(250) || !upd(AW_SYSCTRL, 0x20, 0x20)) {       /* RAMINIT */
++		give_up("the RAM could not be opened");
++		goto out;
++	}
++	address[0] = file[2];
++	address[1] = file[3];
++	if (!put(AW_BASEADDRH, address[0]) || !put(AW_BASEADDRL, address[1]) ||
++	    !put(AW_FIFO_AEH, (uint8_t)(ae >> 8)) || !put(AW_FIFO_AEL, (uint8_t)ae) ||
++	    !put(AW_FIFO_AFH, (uint8_t)(af >> 8)) || !put(AW_FIFO_AFL, (uint8_t)af) ||
++	    !regs_write(AW_RAMADDRH, address, 2)) {
++		give_up("the RAM's address could not be set");
++		goto out;
++	}
++	for (uint32_t at = 0; at < length; at += 32) {
++		unsigned n = length - at < 32 ? length - at : 32;
++
++		if (!regs_write(AW_RAMDATA, file + 4 + at, n)) {
++			give_up("the RAM could not be written");
++			goto out;
++		}
++	}
++	if (!regs_write(AW_RAMADDRH, address, 2)) {
++		give_up("the RAM's address could not be set again");
++		goto out;
++	}
++	for (uint32_t at = 0; at < length; at += sizeof(back)) {
++		unsigned n = length - at < sizeof(back) ? length - at : sizeof(back);
++
++		if (!regs_read(AW_RAMDATA, back, n) || memcmp(back, file + 4 + at, n) != 0) {
++			say("apollo haptic: the RAM reads back differently at %#x\n", base + at);
++			give_up("the waveforms did not load");
++			goto out;
++		}
++	}
++	if (!upd(AW_SYSCTRL, 0x20, 0)) {
++		goto out;
++	}
++	say("apollo haptic: Android's waveforms are in the chip's RAM and read back as written\n");
++	ok = healthy("after the waveforms");
++out:
++	/*
++	 * Not freed: hakios_image_file() can hand back the file where it lies in the image itself, not a copy -- freeing
++	 * that panicked the kernel ("kfree: addr ..., size 3861 not found in any zone", 25 October; and with the Wi-Fi's
++	 * shutdown hanging on the way out, it looked like a freeze). 4 KB kept for the run is nothing.
++	 */
++	return ok;
++}
++
++/* GO off, the chip awaited until it is in standby, then put there (aw8697_haptic_stop()) */
++static bool
++halt(void)
++{
++	/* (one that cannot be told -- given up on already, or not answering -- is stopped by its reset line instead) */
++	if (broken || !regs_write(AW_GO, (const uint8_t[]){ 0 }, 1) || !wait_standby(200)) {
++		give_up(broken ? "it cannot be told to stop" : "it does not stop");
++		return false;
++	}
++	return to_standby();            /* (a failure there has put it into reset already: put(), upd()) */
++}
++
++/* A waveform started without waiting for it: once, or (`forever') repeated until halted. */
++static bool
++start_waveform(unsigned waveform, bool forever, uint8_t gain)
++{
++	/*
++	 * The first time iOS played (25 October) the kernel hung on the spot: before each waveform, the serial engine's clocks
++	 * are read back (the GCC's registers are always safe to read), so that an engine whose clocks someone has turned
++	 * off is never touched -- the bus would hang on it.
++	 */
++	if (!branch_on(QUP1_CORE_2X_CBCR) || !branch_on(QUP1_CORE_CBCR) || !branch_on(QUP1_M_AHB_CBCR) || !branch_on(QUP1_S_AHB_CBCR) ||
++	    !branch_on(QUP1_S3_CBCR)) {
++		say("apollo haptic: THE SERIAL ENGINE'S CLOCKS ARE OFF before a waveform (core_2x %#x core %#x m_ahb %#x s_ahb %#x s3 %#x, vote "
++		    "%#x): the engine is not touched\n", rd(gcc + QUP1_CORE_2X_CBCR), rd(gcc + QUP1_CORE_CBCR), rd(gcc + QUP1_M_AHB_CBCR),
++		    rd(gcc + QUP1_S_AHB_CBCR), rd(gcc + QUP1_S3_CBCR), rd(gcc + GCC_VOTE));
++		give_up("the serial engine's clocks are off");  /* (the reset line only: the engine is not touched) */
++		return false;
++	}
++	{
++		static unsigned told;
++
++		if (told++ < 3) {
++			say("apollo haptic: waveform %u (%s, gain %#04x): clocks on, the chip is told\n", waveform, forever ? "repeated" : "once", gain);
++		}
++	}
++	if (!put(AW_WAVSEQ1, (uint8_t)waveform) || !put(AW_WAVSEQ2, 0) || !put(AW_WAVLOOP1, forever ? 0xf0 : 0x00) ||
++	    !upd(AW_SYSCTRL, 0x0f, forever ? 0x00 : 0x02) ||                     /* RAM mode, active, boost (bypass for a loop) */
++	    !get(AW_SYSINT, &(uint8_t){ 0 }) || !upd(AW_SYSINTM, 0x20, 0) ||    /* (the flags cleared, UVLO watched) */
++	    !put(AW_DATDBG, gain)) {
++		return false;
++	}
++	if (!regs_write(AW_GO, (const uint8_t[]){ 1 }, 1)) {
++		give_up("the start was not acknowledged");
++		return false;
++	}
++	return true;
++}
++
++/* One waveform played once (Android's effect `effect' - 1), stopped at HAPTIC_MAX_MS at the latest. */
++static bool
++play_effect(unsigned effect)
++{
++	uint64_t began = mach_absolute_time(), ended;
++	bool done;
++
++	say("apollo haptic: waveform %u is played once, at Android's gain %#x\n", effect, ANDROID_GAIN);
++	if (!wait_standby(250) || !start_waveform(effect, false, ANDROID_GAIN)) {
++		return false;
++	}
++	wait_ms(2);
++	done = wait_standby(HAPTIC_MAX_MS);
++	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ended);
++	if (!done) {
++		say("apollo haptic: STILL PLAYING after %u ms: stopped\n", HAPTIC_MAX_MS);
++	}
++	if (!halt()) {
++		return false;
++	}
++	say("apollo haptic: the waveform has played: back in standby after %llu ms (states seen meanwhile: %#x, a bit each; 0 is "
++	    "standby)\n", ended / NSEC_PER_MSEC, states_seen);
++	return healthy("after playing");
++}
++
++/* ---- apollo_haptic=5: the motor for iOS (hakios.haptic.c's service) ------------------------------------------- */
++
++#define ACTIVE_US               30000           /* a write that was not silence counts for this long */
++#define SILENT_BELOW            256             /* of 32768: samples no larger are silence */
++#define TAP_US                  60000           /* longer than this, and it is a vibration, not a tap */
++#define SETTLE_US               8000            /* how long iOS's waveform is listened to before a tap: its loudness */
++#define FOLLOW_US               20000           /* how often a vibration's strength follows iOS's */
++
++#define TOLD_EVENTS             24              /* the first so many taps and vibrations are each said */
++
++static volatile uint64_t heard_us;              /* when the last write that was not silence came */
++static volatile uint64_t quiet_us;              /* when the last write that was silence came */
++static volatile uint64_t onset_us;              /* when iOS's last waveform began: the first write not silence after a pause */
++static volatile uint32_t heard_peak;            /* the largest sample of that waveform, or since the service last looked */
++static uint64_t written_frames;
++static unsigned taps, loops, capped;            /* what has been played, for the run's end */
++
++static uint64_t
++now_us(void)
++{
++	uint64_t ns;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_USEC;
++}
++
++/* From the audio server's I/O thread: never waits. */
++static int
++haptic_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	int16_t samples[256];
++	int error = 0;
++
++	while (uio_resid(uio) >= 2) {
++		user_ssize_t bytes = uio_resid(uio);
++		uint32_t peak = 0;
++
++		if (bytes > (user_ssize_t)sizeof(samples)) {
++			bytes = sizeof(samples);
++		}
++		bytes &= ~(user_ssize_t)1;
++		if ((error = uiomove((caddr_t)samples, (int)bytes, uio)) != 0) {
++			break;
++		}
++		for (unsigned i = 0; i < bytes / 2; i++) {
++			uint32_t v = samples[i] < 0 ? (uint32_t)-(int32_t)samples[i] : (uint32_t)samples[i];
++
++			peak = v > peak ? v : peak;
++		}
++		written_frames += (uint64_t)bytes / 2;
++		if (peak > SILENT_BELOW) {
++			uint64_t now = now_us();
++
++			if (heard_us == 0 || quiet_us > heard_us || now - heard_us >= ACTIVE_US) {
++				onset_us = now;
++				heard_peak = 0;
++			}
++			heard_us = now;
++			if (peak > heard_peak) {
++				heard_peak = peak;
++			}
++		} else {
++			quiet_us = now_us();
++		}
++	}
++	return error;
++}
++
++static int
++haptic_open(__unused dev_t dev, __unused int flags, __unused int type, __unused struct proc *p)
++{
++	return 0;
++}
++
++static const struct cdevsw haptic_cdevsw = {
++	.d_open = haptic_open, .d_close = haptic_open, .d_read = eno_rdwrt, .d_write = haptic_write,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++/* the chip's state (GLB_STATE: 0 standby), 0xff if it cannot be read */
++static unsigned
++chip_state(void)
++{
++	uint8_t state = 0xff;
++
++	return get(AW_GLB_STATE, &state) ? state & 0x0f : 0xff;
++}
++
++/*
++ * How strong to play what iOS plays (hakios.haptic.c's reasoning): Android's strongest gain, 0x80, from a third of
++ * full scale up, and below that down to five eighths of it (0x50, Android's medium level) for the softest.
++ */
++static uint8_t
++gain_for(uint32_t peak)
++{
++	uint32_t top = ANDROID_GAIN, low = top * 5 / 8, third = 32767 / 3;
++
++	return (uint8_t)(peak >= third ? top : low + (top - low) * peak / third);
++}
++
++static void
++serve(void)
++{
++	enum { IDLE, TAP, LOOP, REST } state = IDLE;
++	uint64_t since = 0, rest_until = 0, last_look = 0, tap_onset = 0, followed = 0;
++	uint8_t playing_gain = 0;
++	unsigned follows = 0;                   /* how often the vibration playing now has changed strength */
++	uint32_t driven[DUTY_SLOTS] = { 0 };    /* us the motor was driven (a tap or a vibration under way) per DUTY_SLOT_MS */
++	uint64_t duty_slot = now_us() / (DUTY_SLOT_MS * 1000), duty_last = now_us();
++	unsigned duty_cuts = 0;
++	int major = cdevsw_add(-1, &haptic_cdevsw);
++
++	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "apollo-haptic") == NULL) {
++		say("apollo haptic: /dev/apollo-haptic cannot be made\n");
++		return;
++	}
++	say("apollo haptic: THE MOTOR PLAYS WHAT IOS PLAYS ON ITS ACTUATOR (/dev/apollo-haptic) from here on, until the run ends\n");
++	while (!broken) {
++		uint64_t now = now_us();
++		bool active = heard_us != 0 && now - heard_us < ACTIVE_US;
++		uint32_t peak = heard_peak;
++		uint8_t gain = gain_for(peak);
++		uint64_t slot = now / (DUTY_SLOT_MS * 1000), window = 0;
++
++		/*
++		 * The duty budget, across taps and vibrations alike: the time since the last look counts as driving if a tap or a
++		 * vibration was under way (a tap's whole TAP state, more than its waveform: on the safe side); the slots older
++		 * than the window are emptied. Over HAPTIC_MAX_MS in the window: stopped, a rest of HAPTIC_MAX_MS, and nothing
++		 * starts again until the window has room (a single cap per vibration does not stop a stream of short taps).
++		 */
++		for (uint64_t s = duty_slot + 1; s <= slot && s <= duty_slot + DUTY_SLOTS; s++) {
++			driven[s % DUTY_SLOTS] = 0;
++		}
++		duty_slot = slot;
++		if (state == TAP || state == LOOP) {
++			uint64_t spent = now - duty_last;
++
++			driven[slot % DUTY_SLOTS] += spent > DUTY_WINDOW_MS * 1000ull ? DUTY_WINDOW_MS * 1000u : (uint32_t)spent;
++		}
++		duty_last = now;
++		for (unsigned i = 0; i < DUTY_SLOTS; i++) {
++			window += driven[i];
++		}
++		if ((state == TAP || state == LOOP) && window >= HAPTIC_MAX_MS * 1000ull) {
++			if (!halt()) {
++				break;
++			}
++			capped++;
++			rest_until = now + HAPTIC_MAX_MS * 1000ull;
++			if (duty_cuts++ < TOLD_EVENTS) {
++				say("apollo haptic: %llu ms of driving in the last %u ms: the motor is STOPPED and rests %u ms (%u taps, %u "
++				    "vibrations so far)\n", window / 1000, DUTY_WINDOW_MS, HAPTIC_MAX_MS, taps, loops);
++			}
++			state = REST;
++			wait_ms(4);
++			continue;
++		}
++
++		switch (state) {
++		case IDLE:
++		case TAP:
++			/*
++			 * A waveform of iOS's that has begun (after a pause: a tap of a series is a tap of its own) is
++			 * a tap -- once its first milliseconds are heard: a waveform begins softly, and they say how
++			 * loud it is; one that goes on without a pause, a vibration.
++			 */
++			if (active && onset_us != tap_onset && now - onset_us >= SETTLE_US) {
++				uint64_t began = onset_us;
++
++				if (window >= HAPTIC_MAX_MS * 1000ull) {
++					tap_onset = began;      /* (no room in the duty window: this tap is left out, not played late) */
++					break;
++				}
++				if (state == TAP && !wait_standby(0) && !halt()) {
++					break;
++				}
++				if (!start_waveform(1, false, gain ? gain : 1)) {
++					break;
++				}
++				state = TAP;
++				since = now;
++				tap_onset = began;
++				taps++;
++				if (taps + loops <= TOLD_EVENTS) {
++					wait_ms(4);
++					say("apollo haptic: tap %u: iOS's waveform peaks at %u of 32768: Android's waveform 1 at gain %#04x; the "
++					    "chip's state %u\n", taps, peak, gain ? gain : 1, chip_state());
++				}
++				break;
++			}
++			if (state == IDLE) {
++				break;
++			}
++			if (active && quiet_us < tap_onset && now - since > TAP_US) {
++				if (halt() && start_waveform(11, true, gain ? gain : 1)) {
++					state = LOOP;
++					since = followed = now;
++					playing_gain = gain ? gain : 1;
++					follows = 0;
++					loops++;
++					heard_peak = 0;
++					if (taps + loops <= TOLD_EVENTS) {
++						wait_ms(4);
++						say("apollo haptic: vibration %u: iOS goes on playing (peak %u): Android's waveform 11 over and over at "
++						    "gain %#04x, %u ms at most; the chip's state %u\n", loops, peak, gain ? gain : 1,
++						    HAPTIC_MAX_MS, chip_state());
++					}
++				}
++			} else if (!active && now - since > TAP_US) {
++				state = halt() ? IDLE : state;          /* (the tap is over: the chip back into standby) */
++			}
++			break;
++		case LOOP:
++			/* as strong as iOS's waveform is now (Android's gain at full scale, never more) */
++			if (active && now - followed >= FOLLOW_US) {
++				followed = now;
++				heard_peak = 0;
++				if (peak != 0 && (gain > playing_gain + 8 || gain + 8 < playing_gain)) {
++					if (!put(AW_DATDBG, gain)) {
++						break;
++					}
++					playing_gain = gain;
++					follows++;
++				}
++			}
++			if (!active || now - since > HAPTIC_MAX_MS * 1000ull) {
++				bool cut = now - since > HAPTIC_MAX_MS * 1000ull;
++
++				if (cut) {
++					capped++;
++					rest_until = now + HAPTIC_MAX_MS * 1000ull;
++				}
++				if (halt()) {
++					state = rest_until > now ? REST : IDLE;
++					if (taps + loops <= TOLD_EVENTS + 1) {
++						say("apollo haptic: vibration %u: %s after %llu ms (its strength changed %u times, last to gain %#04x); "
++						    "the chip is in standby\n", loops, cut ? "CUT at the limit" : "iOS stopped, and so does the motor",
++						    (now - since) / 1000, follows, playing_gain);
++					}
++				}
++			}
++			break;
++		case REST:
++			if (now >= rest_until) {        /* (and what starts next waits for room in the duty window) */
++				state = IDLE;
++			}
++			break;
++		}
++		if (state != IDLE && state != REST && now - last_look > 50000) {
++			last_look = now;
++			if (!healthy("while playing")) {
++				break;
++			}
++		}
++		wait_ms(4);
++	}
++	say("apollo haptic: the motor is given up on (%u taps and %u vibrations played, %u cut at %u ms)\n", taps, loops, capped,
++	    HAPTIC_MAX_MS);
++}
++
++static bool
++prepare(void)
++{
++	uint32_t select = 0;
++	const char *problem;
++
++	pins_i2c = ml_io_map(TLMM_SOUTH_PHYS + 0x1000UL * PIN_SDA, 0x2000);
++	pins_rst = ml_io_map(TLMM_SOUTH_PHYS + 0x1000UL * PIN_INT, 0x2000);
++	gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
++	se = ml_io_map(SE_PHYS, SE_SIZE);
++	wrapper = ml_io_map(WRAPPER1_PHYS, 0x1000);
++	if (!pins_i2c || !pins_rst || !gcc || !se || !wrapper) {
++		say("apollo haptic: cannot map the registers\n");
++		return false;
++	}
++	show_pins();
++	/*
++	 * Wrapper 1's core clock is RPMh's on this SoC: Linux' geni-se driver votes the interconnect path "qup-core"
++	 * (qup1_core_master -> qup1_core_slave), and in sm8250.c's icc tables that is the BCM "QUP0": it holds the core
++	 * masters of all three wrappers (bcm_qup0.nodes = qup0/1/2_core_master). cmd-db has no "QUP1" on this phone.
++	 */
++	say("apollo haptic: about to vote for the QUP core clocks in RPMh (BCM \"QUP0\", which covers wrapper 1 too)\n");
++	if (!apollo_rpmh_bcm_vote("QUP0", 1, 1)) {
++		say("apollo haptic: RPMh does not take the \"QUP0\" vote: not touching serial engine 11\n");
++		apollo_cmd_db_dump();
++		return false;
++	}
++	say("apollo haptic: about to turn on wrapper 1's bus and core clocks (gcc vote %#x, bits 18-21), then read each back\n", GCC_VOTE);
++	if (bus_clocks_on() != 0) {
++		return false;
++	}
++	say("apollo haptic: wrapper 1's clocks are on (core_2x %#x core %#x m_ahb %#x s_ahb %#x): about to read its version at %#lx\n",
++	    rd(gcc + QUP1_CORE_2X_CBCR), rd(gcc + QUP1_CORE_CBCR), rd(gcc + QUP1_M_AHB_CBCR), rd(gcc + QUP1_S_AHB_CBCR),
++	    WRAPPER1_PHYS + WRAPPER_HW_VER);
++	say("apollo haptic: wrapper 1's version is %#x\n", rd(wrapper + WRAPPER_HW_VER));
++	say("apollo haptic: about to turn on serial engine 11's clock (gcc_qupv3_wrap1_s3_clk, vote bit 25, cbcr %#x)\n", QUP1_S3_CBCR);
++	if (se_clock_on(&select) != 0) {
++		return false;
++	}
++	say("apollo haptic: serial engine 11's clock is on (cbcr %#x)\n", rd(gcc + QUP1_S3_CBCR));
++	say("apollo haptic: about to give gpio%u and gpio%u to qup11\n", PIN_SDA, PIN_SCL);
++	wr(pin(PIN_SDA), FUNCTION_QUP11 << 2 | (2 / 2 - 1) << 6);     /* qup11, 2 mA, no pull */
++	wr(pin(PIN_SCL), FUNCTION_QUP11 << 2 | (2 / 2 - 1) << 6);
++	say("apollo haptic: about to read the serial engine at %#lx (its firmware revision), then set it up\n", SE_PHYS);
++	problem = i2c_init(select);
++	if (problem != NULL) {
++		say("apollo haptic: %s\n", problem);
++		return false;
++	}
++	prepared = true;
++	return true;
++}
++
++static void
++haptic_thread(__unused void *parameter, __unused wait_result_t result)
++{
++	delay_for_interval(start_after_ms, 1000 * NSEC_PER_USEC);
++	/* apollo: the waveforms are a file on the root, which the boot's own files (xnu 0120) write right after it is mounted */
++	for (unsigned waited = 0; waited < 300 && rootvnode == NULLVP; waited++) {
++		delay_for_interval(200, 1000 * NSEC_PER_USEC);
++	}
++	delay_for_interval(3000, 1000 * NSEC_PER_USEC);
++	bringing_up = true;
++	say("apollo haptic: stage %u: %s\n", stage, stage == 1 ? "a look, reading only" : stage == 2 ? "the reset released, registers read" :
++	    stage == 3 ? "the chip configured and its waveforms loaded, nothing played" : stage == 4 ? "one effect played" :
++	    "the motor for iOS");
++	if (!prepare()) {
++		goto done;
++	}
++	if (stage >= 2 && !reset_is_high()) {
++		hardware_reset();
++	}
++	if (!chip_answers()) {
++		say("apollo haptic: (the reset pin %s)\n", reset_is_high() ? "drives high: the chip should answer" :
++		    "does not drive high: the chip is held in reset or not powered");
++		if (released) {
++			give_up("the chip does not answer");
++		}
++	} else {
++		if (stage >= 2) {
++			show_registers();
++		}
++		if (stage >= 3 && configure() && load_waveforms() && to_standby() && stage == 4) {
++			uint32_t effect = 1;
++
++			PE_parse_boot_argn("apollo_haptic_effect", &effect, sizeof(effect));
++			if (effect < 1 || effect > 10) {
++				effect = 1;     /* (the short ones only) */
++			}
++			(void)play_effect(effect);
++		} else if (stage == 5 && !broken) {
++			bringing_up = false;
++			serve();
++		}
++	}
++done:
++	say("apollo haptic: done\n");
++	thread_terminate(current_thread());
++}
++
++void
++apollo_haptic_init(void)
++{
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("apollo_haptic", &stage, sizeof(stage)) || stage == 0) {
++		return;
++	}
++	if (stage > 5) {
++		stage = 5;
++	}
++	PE_parse_boot_argn("apollo_haptic_pause", &pause_ms, sizeof(pause_ms));
++	PE_parse_boot_argn("apollo_haptic_after", &start_after_ms, sizeof(start_after_ms));
++	if (kernel_thread_start(haptic_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "apollo haptic");
++		thread_deallocate(thread);
++	}
++}
++
++/* At the run's end and on a panic's way out: the chip back into reset, if it was let out (no I2C, no lock, no sleep). */
++void
++apollo_haptic_quiesce(void)
++{
++	if (prepared && pins_rst != 0 && (released || reset_is_high())) {
++		leaving = true;
++		reset_pin(false);
++		if (stage == 5) {
++			say("apollo haptic: at the run's end: %u taps and %u vibrations played (%u cut at %u ms), from %llu frames iOS "
++			    "wrote; the chip is held in reset\n", taps, loops, capped, HAPTIC_MAX_MS, written_frames);
++		}
++	}
++}

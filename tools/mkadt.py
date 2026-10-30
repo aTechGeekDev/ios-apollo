@@ -90,15 +90,20 @@ FILE_PREFIXES = ('/usr/local/', '/Library/Wallpaper/', '/private/var/', '/System
 D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
 
 
-def d22ap_product(path=D22AP_ADT):
-    """/product properties of the real D22AP tree, without the syscfg
-    placeholders iBoot would fill in (flag bit set) and the node bookkeeping."""
+def d22ap_product(path=D22AP_ADT, child=None):
+    """/product properties of the real D22AP tree (or of its child node CHILD: None if it
+    has none), without the syscfg placeholders iBoot would fill in (flag bit set) and the
+    node bookkeeping."""
     if not os.path.exists(path):
         print(f'warning: {path} missing, no /product node', file=sys.stderr)
         return None
     root, _ = adt.parse(open(path, 'rb').read())
     for c in root.children:
         if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
+            if child is not None:
+                c = next((g for g in c.children if dict((k, v) for k, f, v in g.props).get('name') == cstr(child)), None)
+                if c is None:
+                    return None
             return [(k, v) for k, f, v in c.props if not f and k not in ('name', 'AAPL,phandle')]
     raise SystemExit(f'{path}: no /product node')
 
@@ -282,7 +287,14 @@ def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_
         # these two at the first boot of a root.
         product_props = [(k, cstr('sRGB') if k in ('artwork-display-gamut', 'display-gamut') else v)
                          for k, v in product_props]
-    product = [node('product', [ph()] + product_props)] if product_props else []
+    # /product/haptics, as the iPhone X has it (xnu 0146; hakios-apollo's mkidentity.py copies it too): MobileGestalt's
+    # DeviceSupportsClosedLoopHaptics. With it iOS plays its vibrations and feedbacks as waveforms on the audio
+    # server's "Actuator" device (userland/audio), which sweet_haptic.c plays on the motor (apollo_haptic=5).
+    haptics = d22ap_product(child='haptics') if product_props else None
+    if product_props and haptics is None:
+        print('warning: the D22AP tree has no /product/haptics: iOS will not play haptics', file=sys.stderr)
+    product = [node('product', [ph()] + product_props, [node('haptics', [ph()] + haptics)] if haptics else [])] \
+        if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the
     # dram-size we expose, so XNU maps it but never allocates into it.

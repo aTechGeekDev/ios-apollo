@@ -1,0 +1,5 @@
+# MobileGestalt's cache of device answers removed, for ONE boot: iOS builds it again from the device tree at that boot
+# (as after every iOS update). Needed when mkadt.py's tree gains something MobileGestalt answers from, which a root
+# made before keeps the old answer to: /product/haptics (xnu 0146: DeviceSupportsClosedLoopHaptics; without it iOS
+# plays no haptics on the audio server's Actuator device). Harmless when the file is not there ("not there").
+-/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist

@@ -17,9 +17,9 @@ Apple's open-source XNU kernel (xnu-8796), patched for the phone, boots the **un
 | Display | iOS drawn by the GPU and copied to the panel (up to 60 frames a second with `sweetfb_hz=60`) |
 | GPU | Adreno 650 up. **Mesa draws with it** (OpenGL ES 3.2, freedreno), and iOS's own renderer (CoreAnimation in backboardd) draws **the whole GUI** on it through the bridge: lock screen, home screen, keyboard, and the blur of Control Center, Spotlight and the App Library (2026-10-26). A backboardd crash on some image uploads has a fix built, not yet tested |
 | Wi-Fi | **Working** (QCA6390, Linux's ath11k built into the kernel, `sweetwifi=12`): iOS's Wi-Fi settings list the networks around; WPA2 networks join from Settings or Control Center; passwords are kept and saved networks join by themselves after a reboot; the signal-strength icon is right; the Wi-Fi switch turns the radio off and on; the internet works in apps and Safari (2026-10-28) |
-| Bluetooth | **The radio works in the kernel** (QCA6390 over the UART of serial engine 6, the phone's own firmware, `sweetbt=5`: it hears the LE devices around, 2026-10-28). iOS's Bluetooth (bluetoothd, Settings) is the next step |
-| Audio | **iOS's sound plays through both speakers** (2026-10-28): the audio DSP started from the phone's own firmware, the tertiary TDM interface and the two CS35L41 amplifiers (kernel drivers of [hakios-apollo](https://github.com/enesuzun2002/hakios-apollo)), and its audio-server plug-in (`userland/audio/`), `apollo_audio=5`; 20 dB under Android's level by default (`apollo_sound_below=`). No microphones or vibration yet |
-| Not yet | Display power, USB networking, battery, Bluetooth in iOS, microphones, vibration, cameras, cellular |
+| Bluetooth | **Working in iOS** (2026-10-30): the switch in Settings and Control Center, scanning, pairing (kept across reboots), music to headphones (A2DP), HFP and AVRCP connect. QCA6390 over the UART of serial engine 6 at 921600 baud with the phone's own firmware (`sweetbt=6`), bluetoothd given the kernel's H4 link by `userland/bt-inject` (`libsweet-bt.dylib`); see NOTES.md for the boot command |
+| Audio | **iOS's sound plays through both speakers** (2026-10-28): the audio DSP started from the phone's own firmware, the tertiary TDM interface and the two CS35L41 amplifiers (kernel drivers of [hakios-apollo](https://github.com/enesuzun2002/hakios-apollo)), and its audio-server plug-in (`userland/audio/`), `apollo_audio=5`; 20 dB under Android's level by default (`apollo_sound_below=`). The main microphone (`apollo_mic=4`) and the vibration motor (`apollo_haptic=5`) are ported (xnu 0146, also from hakios-apollo), not yet tested |
+| Not yet | Display power, USB networking, battery, cameras, cellular |
 
 The first boot of a fresh root runs iOS data migration once (an hour or more); later boots are quick. Day-to-day progress and the next steps are in [`NOTES.md`](NOTES.md).
 
@@ -67,7 +67,7 @@ objcopy -I ihex -O binary novatek_nt36675_j3s_fw01.bin.ihex novatek_nt36675_j3s_
 cd ../..
 ```
 
-GPU, Wi-Fi and Bluetooth firmware, from the phone (in recovery): `tools/pull-gpu-fw.sh`, `tools/pull-wifi-fw.sh` and `tools/pull-bt-fw.sh` (into `research/apollo-gpu/`, `research/apollo-wifi/` and `research/apollo-bt/`; `mkadt.py --bt-fw research/apollo-bt`). The audio DSP's comes out of the Wi-Fi pull's modem copy: `tools/pull-audio-fw.sh`.
+GPU, Wi-Fi and Bluetooth firmware, from the phone (in recovery): `tools/pull-gpu-fw.sh`, `tools/pull-wifi-fw.sh` and `tools/pull-bt-fw.sh` (into `research/apollo-gpu/`, `research/apollo-wifi/` and `research/apollo-bt/`; `mkadt.py --bt-fw research/apollo-bt`). The audio DSP's comes out of the Wi-Fi pull's modem copy: `tools/pull-audio-fw.sh`. The vibration motor's waveforms and the microphone's calibration (Android's `/vendor`): `tools/pull-mic-haptic-fw.sh` (a one-boot list for `/usr/local/fw/`).
 
 **4. Build the boot image** (needs `aarch64-linux-gnu-gcc` and `mkbootimg`):
 
@@ -118,6 +118,9 @@ adb reboot bootloader
 | `sweetwifimac=aa:bb:cc:dd:ee:ff` | the radio's MAC address for `sweetwifi=11/12` (without it, a random locally administered one per boot) |
 | `sweetbt=N` | Bluetooth bring-up steps 1..6 (QCA6390 over the UART of serial engine 6: 1-3 clocks, pins, UART loopback; 4 the chip's ROM answers; 5 firmware, then an LE scan and a classic inquiry in the kernel; 6 the radio stays up for iOS's bluetoothd); needs `mkadt.py --bt-fw research/apollo-bt` from step 5 |
 | `apollo_audio=N` / `apollo_adsp_step=N` | the sound (xnu 0139: the drivers of the Mi 10T port [hakios-apollo](https://github.com/enesuzun2002/hakios-apollo)): 1 the audio DSP up; 2 the tertiary TDM port; 3 a test tone into a stream, amplifiers off; 4 the tone through the CS35L41 amplifiers, 20 dB under Android's level (`apollo_sound_below=` eighths of a dB, `apollo_sound_secs=`); 5 what iOS plays, through `/dev/apollo-audio`: needs the audio server's plug-in on the root once (`mkadt.py --files-from tools/root-files/audio-on.txt` with the `sweet-audio` artifact of `.github/workflows/audio.yml`; xnu 0140 moves iOS's VirtualAudio.plugin back for it; undo: `audio-off.txt`) and `mediaserverd` in `sweetnull` for the plug-in's own lines. `apollo_adsp_step=N`: the DSP's steps 1..N with a log of each. Needs the DSP's firmware on the root once: `tools/pull-audio-fw.sh` and `mkadt.py --files-from research/apollo-audio/files-adsp.txt` for one boot |
+| `apollo_sound_hold=N` | (xnu 0146) while iOS plays, a period the audio DSP hands back waits for a whole 20 ms of iOS's sound as long as more than N periods (default 3) are still queued, instead of being padded with silence (the speakers' stutter); 0 = the old way. Every 5 s while the amplifiers are on, `apollo sound: the feeder` says how many periods came out short, the queue's low point and how far apart iOS's writes came |
+| `apollo_mic=N` | the main microphone (xnu 0146: hakios-apollo's `hakios.apollo_mic.c`, the WCD938x codec over SoundWire, through the DSP; needs `apollo_audio=N`): 1 a look (clocks voted, registers read); 2 the codec brought up and enumerated, then put back; 3 a recording of `apollo_mic_secs` (default 10) with its level in the log; 4 the microphone for iOS (`/dev/hakios-mic`, the audio plug-in's "Codec" device: the path is up only while iOS records). `apollo_mic_path=1` (default) is Android's own recording path with Xiaomi's calibration from `tools/pull-mic-haptic-fw.sh` (falls back to 0, the plain path, without it); their recommended `apollo_mic_ns=1 apollo_mic_drc=0` |
+| `apollo_haptic=N` | the vibration motor (xnu 0146: hakios-apollo's `hakios.apollo_haptic.c`, an AW8697 on serial engine 11's I2C; starts 15 s into the boot): 1 a look; 2 reset released, registers read; 3 configured and Android's waveforms loaded (`aw8697_haptic.bin` from `tools/pull-mic-haptic-fw.sh`); 4 one effect played; 5 the motor for iOS (`/dev/apollo-haptic`, the audio plug-in's "Actuator"). iOS plays haptics only with `/product/haptics` in the device tree (mkadt.py copies it from the iPhone X's) and, on a root made before that, MobileGestalt's cache removed once (`tools/root-files/mgcache-reset.txt`) |
 
 The other boot-args are described in their drivers' sources in `xnu/patches/` and in `NOTES.md`.
 
@@ -126,7 +129,7 @@ The other boot-args are described in their drivers' sources in `xnu/patches/` an
 | Path | What |
 | --- | --- |
 | `shim/` | Boot shim, packed as an Android boot image |
-| `xnu/patches/` | The kernel patches (0001–0140), applied in order by CI |
+| `xnu/patches/` | The kernel patches (0001–0146), applied in order by CI |
 | `wifi/` | HackiOS's Linux layer for the Wi-Fi driver; CI builds Linux's ath11k on it and links it into the kernel |
 | `userland/` | Programs and libraries for the phone: GPU tests, Mesa, the CoreAnimation bridge |
 | `tools/` | Device tree builder, payload packer, iOS root builder, log and crash tools |
