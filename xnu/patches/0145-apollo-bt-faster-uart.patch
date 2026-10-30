@@ -1,0 +1,344 @@
+--- a/bsd/dev/sweet_bt.c
++++ b/bsd/dev/sweet_bt.c
+@@ -19,16 +19,22 @@
+  *   3  write  ... and the UART looped back on itself inside the SoC (nothing reaches the chip)
+  *   4  write  rails, BT_EN, the UART at 115200 baud (H4): HCI reset and the version from the
+  *             chip's ROM; then BT_EN low again and the UART put back
+- *   5  write  ... the firmware (patch, then NVM), reset, the version it runs, the address
++ *   5  write  ... the UART moved to sweetbtbaud (below), the firmware (patch, then NVM), reset, the
++ *             version it runs, the address
+  *             (/chosen mac-address-bluetooth0), and what the radio hears: 3 s of LE scan and
+  *             4 s of classic inquiry; then BT_EN low again
+  *   6  write  as 5 without the scans, and the radio stays up for iOS: an H4 endpoint (the kernel
+  *             control "com.sweet.bluetooth", for bluetoothd) and the registry entry "bluetooth"
+  *             that bluetoothd looks for (iokit/Kernel/arm/SweetBluetooth.cpp)
+  *
+- * The UART stays at 115200 baud throughout, as on umi (the NVM is made to say so). No interrupt
+- * is taken: the FIFOs are polled. Differences from umi: SW_CTRL is an input that is read, as
+- * Android's btpower.c has it (umi drives it high; sweetbtswctrl=1 does as umi does); the firmware
++ * The chip's ROM talks at 115200 baud. From step 5 on (xnu 0145) the UART is moved to boot-arg
++ * sweetbtbaud (default 921600; 115200 keeps it there, as umi does) before the firmware goes in, as
++ * Linux's hci_qca does, and the NVM is made to say the same speed: 115200 carries ~11 KB/s, too
++ * little for A2DP (AAC at 256 kbit/s stuttered, apollo boot 77). Should the new speed not work the
++ * chip is started over at 115200. 921600 is the default because 92 bytes a millisecond still fit
++ * the 128-byte receive FIFO between the worker's 1 ms polls, whether or not the chip heeds RFR.
++ * No interrupt is taken: the FIFOs are polled. Differences from umi: SW_CTRL is an input that is
++ * read, as Android's btpower.c has it (umi drives it high; sweetbtswctrl=1 does as umi does); the firmware
+  * comes from the ADT, not from the kernel's own data; the ADT's address is given to the chip
+  * (0xfc14, as Linux's qca_set_bdaddr), else it keeps the NVM's; a thread, not bsd_init itself.
+  */
+@@ -106,6 +112,10 @@ void sweet_bt_init(void);
+ #define BT_PATCH_MOST   (512u * 1024u)
+ 
+ static uint32_t bt_steps, bt_delay, bt_swctrl_drive;
++static uint32_t bt_baud = 921600;
++static const struct sweet_bt_speed *bt_want;                    /* sweetbtbaud */
++static const struct sweet_bt_speed *bt_speed = &sweet_bt_speeds[0];     /* what the UART runs at */
++static uint32_t bt_uart_div = 4;        /* GENI's clock divider for bt_speed */
+ 
+ /* the UART's registers that steps 3-6 set, put back as they were found afterwards */
+ static const uint32_t bt_uart_regs[] = {
+@@ -156,12 +166,15 @@ bt_file(const char *name, unsigned int *size)
+ 	return prop;
+ }
+ 
+-/* The UART set up as umi's (and Android's) driver has it: 8 bits, no parity, 1 stop bit, words of bytes. */
++/*
++ * The UART set up as umi's (and Android's) driver has it: 8 bits, no parity, 1 stop bit, words of bytes;
++ * the clock divided by bt_uart_div.
++ */
+ static void
+ bt_uart_setup(vm_offset_t uart)
+ {
+-	bt_write(uart, 0x48, 0x41);
+-	bt_write(uart, 0x4c, 0x41);
++	bt_write(uart, 0x48, (bt_uart_div << 4) | 1);
++	bt_write(uart, 0x4c, (bt_uart_div << 4) | 1);
+ 	bt_write(uart, 0x258, 0);
+ 	bt_write(uart, 0x22c, 0);
+ 	bt_write(uart, 0x25c, 2);
+@@ -373,7 +386,7 @@ bt_uart_tx(vm_offset_t uart, const uint8_t *packet, unsigned length)
+ 	bt_write(uart, GENI_M_IRQ_CLR, 0xffffffff);
+ 	bt_write(uart, GENI_TX_LEN, length);
+ 	bt_write(uart, GENI_M_CMD, 1u << 27);
+-	/* ~87 us a byte at 115200 baud: twice that, and 10 ms */
++	/* ~87 us a byte at 115200 baud, the slowest: twice that, and 10 ms */
+ 	for (unsigned elapsed = 0; elapsed < length * 180 + 10000; elapsed++) {
+ 		int rx_error = bt_rx_capture(uart);
+ 		unsigned used;
+@@ -582,12 +595,12 @@ bt_qca_firmware(vm_offset_t uart)
+ 		return E2BIG;
+ 	}
+ 	memcpy(bt_nvm_work, nvm, nvm_size);
+-	if (sweet_bt_qca6390_nvm_prepare(bt_nvm_work, nvm_size)) {
++	if (sweet_bt_qca6390_nvm_prepare(bt_nvm_work, nvm_size, bt_speed->qca)) {
+ 		printf("SWEET BT: the NVM file is not one this knows (no HCI transport record)\n");
+ 		return EINVAL;
+ 	}
+-	printf("SWEET BT: firmware: patch %u bytes, NVM %u bytes, at 115200 baud (about %u s)\n", patch_size, nvm_size,
+-	    (patch_size + nvm_size) / 11000 + 1);
++	printf("SWEET BT: firmware: patch %u bytes, NVM %u bytes, at %u baud (about %u s)\n", patch_size, nvm_size,
++	    bt_speed->baud, (patch_size + nvm_size) * 10 / bt_speed->baud + 1);
+ 	error = bt_qca_download(uart, patch, patch_size, mode == 3);
+ 	if (error) {
+ 		return error;
+@@ -884,7 +897,7 @@ bt_control_setopt(__unused kern_ctl_ref ref, __unused uint32_t unit, __unused vo
+ 		}
+ 		if ((settings->c_ispeed && settings->c_ispeed != 115200) ||
+ 		    (settings->c_ospeed && settings->c_ospeed != 115200)) {
+-			return EINVAL;  /* the UART stays at 115200 */
++			return EINVAL;  /* bluetoothd's own idea of the speed (BT_HCI_TRANSPORT); the kernel picks the UART's */
+ 		}
+ 		lck_mtx_lock(&bt_control_lock);
+ 		bt_control_termios = *settings;
+@@ -1070,13 +1083,13 @@ bt_control_start(vm_offset_t uart)
+ 
+ /* ---- the steps ------------------------------------------------------------------------------------- */
+ 
+-/* SE6's root at 7.3728 MHz (16 x 115200 x 4): GPLL0's even output (parent 6) x 384/15625, dual-edge M/N. */
++/* SE6's root for `speed`: GPLL0's even output (parent 6) x m/n, dual-edge M/N (115200: 7.3728 MHz, 384/15625). */
+ static bool
+-bt_uart_clock(vm_offset_t gcc)
++bt_uart_clock(vm_offset_t gcc, const struct sweet_bt_speed *speed)
+ {
+-	bt_write(gcc, GCC_SE6_M, 384);
+-	bt_write(gcc, GCC_SE6_N, ~(15625u - 384u) & 0xffff);
+-	bt_write(gcc, GCC_SE6_D, ~15625u & 0xffff);
++	bt_write(gcc, GCC_SE6_M, speed->m);
++	bt_write(gcc, GCC_SE6_N, ~((uint32_t)speed->n - speed->m) & 0xffff);
++	bt_write(gcc, GCC_SE6_D, ~(uint32_t)speed->n & 0xffff);
+ 	bt_write(gcc, GCC_SE6_CFG, 0x2601);
+ 	bt_write(gcc, GCC_SE6_CMD, 1);
+ 	for (unsigned i = 0; i < 10000; i++) {
+@@ -1088,6 +1101,45 @@ bt_uart_clock(vm_offset_t gcc)
+ 	return false;
+ }
+ 
++/*
++ * The chip and the UART moved to `speed`, as Linux's qca_set_speed does for the QCA6390: the set-baudrate
++ * vendor command (0xfc48, the speed's QCA index) at the old speed and 300 ms for the chip to take it, then
++ * SE6's clock and divider (bt_speed); whatever came in meanwhile is dropped, and Read Local Version must
++ * then work at the new speed. 0, or an errno (the chip's speed is then not known).
++ */
++static int
++bt_set_speed(vm_offset_t gcc, vm_offset_t uart, const struct sweet_bt_speed *speed)
++{
++	uint8_t event[BT_EVENT_MAX];
++	unsigned length = 0;
++	int error;
++
++	error = bt_hci_command(uart, 0xfc48, &speed->qca, 1, false, event, &length);
++	if (error) {
++		return error;
++	}
++	delay(300000);
++	error = bt_uart_quiesce(uart);
++	if (error) {
++		return error;
++	}
++	if (!bt_uart_clock(gcc, speed)) {
++		return ETIMEDOUT;
++	}
++	bt_speed = speed;
++	bt_uart_div = speed->div;
++	bt_write(uart, 0x48, (bt_uart_div << 4) | 1);
++	bt_write(uart, 0x4c, (bt_uart_div << 4) | 1);
++	memset(&bt_rx_packet, 0, sizeof(bt_rx_packet));
++	bt_rx_head = bt_rx_tail = 0;
++	bt_write(uart, GENI_S_CMD, (1u << 27) | 0x80);      /* reading again; RFR open */
++	error = bt_hci_command(uart, 0x1001, NULL, 0, true, event, &length);
++	if (!error && length != 15) {
++		error = EILSEQ;
++	}
++	return error;
++}
++
+ /* A pin as a GPIO: its config (function 0, drive, pull, output enable) and, for an output, its level. */
+ static void
+ bt_gpio(vm_offset_t tlmm, unsigned pin, uint32_t cfg, bool high)
+@@ -1132,7 +1184,9 @@ bt_chip(vm_offset_t gcc, vm_offset_t tlmm, vm_offset_t uart, unsigned steps)
+ 		delay(1);
+ 	}
+ 	error = i == 10000 ? ETIMEDOUT : bt_uart_quiesce(uart);
+-	if (!error && !bt_uart_clock(gcc)) {
++	bt_speed = &sweet_bt_speeds[0];
++	bt_uart_div = bt_speed->div;
++	if (!error && !bt_uart_clock(gcc, bt_speed)) {
+ 		error = ETIMEDOUT;
+ 	}
+ 	if (!error) {
+@@ -1149,36 +1203,71 @@ bt_chip(vm_offset_t gcc, vm_offset_t tlmm, vm_offset_t uart, unsigned steps)
+ 		printf("SWEET BT: step 4: clocks or rails failed: errno %d\n", error);
+ 		goto put_back;
+ 	}
+-	/* BT_EN low, then high, as Android's btpower.c: 50 ms and more each (umi's 56) */
+-	bt_gpio(tlmm, PIN_BT_EN, 0x241, false);             /* GPIO, 4 mA, pull-down, output */
+-	if (bt_swctrl_drive) {
+-		bt_gpio(tlmm, PIN_SW_CTRL, 0x240, true);    /* as umi: output, high */
+-	} else {
+-		bt_gpio(tlmm, PIN_SW_CTRL, 0x040, false);   /* an input, no pull, as Android */
+-	}
+-	delay(56000);
+-	bt_gpio(tlmm, PIN_BT_EN, 0x241, true);
+-	delay(56000);
+-	printf("SWEET BT: step 4: BT_EN high; SW_CTRL reads %u\n", bt_read(tlmm, TLMM_IO(PIN_SW_CTRL)) & 1);
+-	/* the UART's pins: QUP function 1; RTS (17) pulled down, TX (18) pulled up, as the DT's active state */
+-	for (unsigned pin = 16; pin <= 19; pin++) {
+-		bt_write(tlmm, TLMM_CFG(pin), pin == 17 ? 5u : pin == 18 ? 7u : 4u);
+-	}
+-	bt_uart_setup(uart);
+-	bt_write(uart, GENI_S_CMD, (1u << 27) | 0x80);      /* start reading; RFR open */
+-	memset(&bt_rx_packet, 0, sizeof(bt_rx_packet));
+-	bt_rx_head = bt_rx_tail = 0;
+-	bt_chip_awake = bt_ibs_ack_pending = false;
+-	bt_ibs_wakes = bt_ibs_sleeps = 0;
+-	error = bt_hci_command(uart, 0x0c03, NULL, 0, true, event, &length);
+-	if (!error) {
+-		error = bt_hci_command(uart, 0x1001, NULL, 0, true, event, &length);
+-	}
+-	if (!error && length == 15) {
++	/*
++	 * BT_EN low, then high, as Android's btpower.c: 50 ms and more each (umi's 56). The ROM answers at
++	 * 115200 baud; from step 5 on the UART then goes to sweetbtbaud, and if that, or the firmware at that
++	 * speed, does not work, the chip is started over and everything stays at 115200.
++	 */
++again:
++	for (unsigned attempt = 0;; attempt++) {
++		if (bt_speed != &sweet_bt_speeds[0]) {
++			bt_speed = &sweet_bt_speeds[0];
++			bt_uart_div = bt_speed->div;
++			(void)bt_uart_quiesce(uart);
++			if (!bt_uart_clock(gcc, bt_speed)) {
++				error = ETIMEDOUT;
++				break;
++			}
++		}
++		bt_gpio(tlmm, PIN_BT_EN, 0x241, false);             /* GPIO, 4 mA, pull-down, output */
++		if (bt_swctrl_drive) {
++			bt_gpio(tlmm, PIN_SW_CTRL, 0x240, true);    /* as umi: output, high */
++		} else {
++			bt_gpio(tlmm, PIN_SW_CTRL, 0x040, false);   /* an input, no pull, as Android */
++		}
++		delay(56000);
++		bt_gpio(tlmm, PIN_BT_EN, 0x241, true);
++		delay(56000);
++		printf("SWEET BT: step 4: BT_EN high; SW_CTRL reads %u\n", bt_read(tlmm, TLMM_IO(PIN_SW_CTRL)) & 1);
++		/* the UART's pins: QUP function 1; RTS (17) pulled down, TX (18) pulled up, as the DT's active state */
++		for (unsigned pin = 16; pin <= 19; pin++) {
++			bt_write(tlmm, TLMM_CFG(pin), pin == 17 ? 5u : pin == 18 ? 7u : 4u);
++		}
++		bt_uart_setup(uart);
++		bt_write(uart, GENI_S_CMD, (1u << 27) | 0x80);      /* start reading; RFR open */
++		memset(&bt_rx_packet, 0, sizeof(bt_rx_packet));
++		bt_rx_head = bt_rx_tail = 0;
++		bt_chip_awake = bt_ibs_ack_pending = false;
++		bt_ibs_wakes = bt_ibs_sleeps = 0;
++		error = bt_hci_command(uart, 0x0c03, NULL, 0, true, event, &length);
++		if (!error) {
++			error = bt_hci_command(uart, 0x1001, NULL, 0, true, event, &length);
++		}
++		if (error || length != 15) {
++			break;
++		}
+ 		printf("SWEET BT: step 4: THE CHIP ANSWERS from its ROM: HCI %#x, manufacturer %u, subversion %#x\n",
+ 		    event[7], bt_le16(event + 11), bt_le16(event + 13));
++		if (steps < 5 || attempt || bt_want == NULL || bt_want == bt_speed) {
++			break;
++		}
++		error = bt_set_speed(gcc, uart, bt_want);
++		if (!error) {
++			printf("SWEET BT: the UART now runs at %u baud (sweetbtbaud)\n", bt_speed->baud);
++			break;
++		}
++		printf("SWEET BT: %u baud did not work (errno %d): the chip is started over at 115200\n",
++		    bt_want->baud, error);
++	}
++	if (!error && length == 15) {
+ 		if (steps >= 5) {
+ 			error = bt_qca_firmware(uart);
++			if (error && bt_speed != &sweet_bt_speeds[0]) {
++				printf("SWEET BT: the firmware did not go in at %u baud (errno %d): all again at 115200\n",
++				    bt_speed->baud, error);
++				bt_want = &sweet_bt_speeds[0];
++				goto again;
++			}
+ 			if (!error && steps == 5) {
+ 				error = bt_radio_scan(uart);
+ 			}
+@@ -1310,6 +1399,12 @@ sweet_bt_init(void)
+ 	(void)PE_parse_boot_argn("sweetbt", &bt_steps, sizeof(bt_steps));
+ 	(void)PE_parse_boot_argn("sweetbtdelay", &bt_delay, sizeof(bt_delay));
+ 	(void)PE_parse_boot_argn("sweetbtswctrl", &bt_swctrl_drive, sizeof(bt_swctrl_drive));
++	(void)PE_parse_boot_argn("sweetbtbaud", &bt_baud, sizeof(bt_baud));
++	bt_want = sweet_bt_speed_for(bt_baud);
++	if (bt_want == NULL) {
++		printf("SWEET BT: sweetbtbaud=%u is not a speed this knows; 115200\n", bt_baud);
++		bt_want = &sweet_bt_speeds[0];
++	}
+ 	if (!bt_steps) {
+ 		return;
+ 	}
+--- a/bsd/dev/sweet_bt.h
++++ b/bsd/dev/sweet_bt.h
+@@ -108,12 +108,48 @@ sweet_bt_qca_tlv_ack(const uint8_t *e, size_t n)
+ }
+ 
+ /*
+- * The NVM file (TLV type 2) made to keep the UART at 115200 baud: tag 17 (the HCI transport) has
+- * the baud rate in its byte 1 on the QCA6390 (byte 2 on the older ROME). Every record is checked
+- * before anything is changed. 0, or -1 if the file is not what it should be.
++ * The UART speeds this knows (xnu 0145): the QCA set-baudrate/NVM index (Linux's enum qca_baudrate)
++ * and how SE6 makes it -- its root clock from GPLL0's even output (300 MHz) x m / n, an M/N/D
++ * counter, as Linux's gcc-kona QUP table, and the GENI divider: root = 16 x baud x div.
++ */
++struct sweet_bt_speed {
++	uint32_t baud;
++	uint8_t qca;
++	uint16_t m, n;
++	uint8_t div;
++};
++
++static const struct sweet_bt_speed sweet_bt_speeds[] = {
++	{ 115200, 0, 384, 15625, 4 },   /* 7.3728 MHz, the speed the chip's ROM starts at */
++	{ 230400, 5, 384, 15625, 2 },
++	{ 460800, 7, 384, 15625, 1 },
++	{ 921600, 10, 768, 15625, 1 },  /* 14.7456 MHz */
++	{ 1000000, 11, 4, 75, 1 },      /* 16 MHz */
++	{ 2000000, 13, 8, 75, 1 },      /* 32 MHz */
++	{ 3000000, 14, 4, 25, 1 },      /* 48 MHz */
++	{ 3200000, 17, 64, 375, 1 },    /* 51.2 MHz, Linux's operating speed for the QCA6390 */
++};
++
++/* The entry for `baud`, or NULL. */
++static inline const struct sweet_bt_speed *
++sweet_bt_speed_for(uint32_t baud)
++{
++	for (size_t i = 0; i < sizeof(sweet_bt_speeds) / sizeof(sweet_bt_speeds[0]); i++) {
++		if (sweet_bt_speeds[i].baud == baud) {
++			return &sweet_bt_speeds[i];
++		}
++	}
++	return NULL;
++}
++
++/*
++ * The NVM file (TLV type 2) made to put the UART at the speed with QCA index `qca` once the
++ * firmware runs: tag 17 (the HCI transport) has the baud rate in its byte 1 on the QCA6390 (byte 2
++ * on the older ROME), as Linux's qca_tlv_check_data sets it. Every record is checked before
++ * anything is changed. 0, or -1 if the file is not what it should be.
+  */
+ static inline int
+-sweet_bt_qca6390_nvm_prepare(uint8_t *data, size_t n)
++sweet_bt_qca6390_nvm_prepare(uint8_t *data, size_t n, uint8_t qca)
+ {
+ 	size_t hci = 0;
+ 
+@@ -143,7 +179,7 @@ sweet_bt_qca6390_nvm_prepare(uint8_t *data, size_t n)
+ 	if (!hci) {
+ 		return -1;
+ 	}
+-	data[hci + 1] = 0;              /* QCA_BAUDRATE_115200 */
++	data[hci + 1] = qca;
+ 	return 0;
+ }
+ /*
