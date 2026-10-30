@@ -1,0 +1,65 @@
+--- a/bsd/dev/sweet_bt.c
++++ b/bsd/dev/sweet_bt.c
+@@ -760,8 +760,8 @@ static struct termios bt_control_termios;
+ 
+ /*
+  * bluetoothd's commands answered here on the chip's behalf and never sent (sweet_bt_local_answer): Broadcom vendor
+- * commands, Read/Write Default Erroneous Data Reporting, and those boot-arg sweetbtfake=0xOPCODE[,...] names (up to
+- * 8). Boot-arg sweetbtvsc=0 sends everything to the chip, as before.
++ * commands, Read/Write Default Erroneous Data Reporting, LE Read Periodic Advertiser List Size (0x204a), and those
++ * boot-arg sweetbtfake=0xOPCODE[,...] names (up to 8). Boot-arg sweetbtvsc=0 sends everything to the chip, as before.
+  */
+ static bool bt_answer_here;
+ static uint16_t bt_answer_extra[8];
+@@ -1040,7 +1040,7 @@ bt_control_start(vm_offset_t uart)
+ 			bt_answer_extras = sweet_bt_parse_opcodes(list, bt_answer_extra,
+ 			    sizeof(bt_answer_extra) / sizeof(bt_answer_extra[0]));
+ 		}
+-		printf("SWEET BT: bluetoothd's vendor and erroneous-data-reporting commands %s, %u more opcode(s)\n",
++		printf("SWEET BT: bluetoothd's vendor, erroneous-data-reporting and 0x204a commands %s, %u more opcode(s)\n",
+ 		    bt_answer_here ? "answered here" : "sent to the chip (sweetbtvsc=0)", bt_answer_extras);
+ 	}
+ 	bt_control_termios.c_cflag = CS8 | CREAD | CLOCAL;
+--- a/bsd/dev/sweet_bt.h
++++ b/bsd/dev/sweet_bt.h
+@@ -155,11 +155,20 @@ sweet_bt_qca6390_nvm_prepare(uint8_t *data, size_t n)
+  * (github.com/superboyyy/hakios-arm64e-dada, kernel patch, hakios_dada_wifi.c bt_answer_vendor; APSL 2.0). The Mi 10
+  * port skipped the same init step inside bluetoothd instead (inject_bluetooth.c).
+  *
+- * If the H4 command cmd[0..n) is one to answer here (a vendor command, 0x0c5a, 0x0c5b, or one of extra[0..nextra)),
+- * its Command Complete goes into ev (SWEET_BT_LOCAL_EVENT_MAX bytes) and its length is returned; 0 sends it on:
++ * LE Read Periodic Advertiser List Size (0x204a) is answered here too. It is one of Bluetooth 5's extended
++ * advertising commands, and once a controller has had one of those since reset the specification makes it refuse
++ * the legacy advertising and scanning commands with Command Disallowed (Core 5.x Vol 4 Part E 3.1.1). bluetoothd asks
++ * for it during init (step 0x10b590, OI_HCICMD_ReadPeriodicAdvListSize) but then advertises and scans the legacy way
++ * (enableExtendedScanning=0): the QCA6390 refused 0x2007 and LE Set Scan Parameters 0x200b with 0x0c, and bluetoothd
++ * restarted ("Bluetooth error - restarting", reason 712; apollo boot 75). The Mi 10 port replaced the same step.
++ *
++ * If the H4 command cmd[0..n) is one to answer here (a vendor command, 0x0c5a, 0x0c5b, 0x204a, or one of
++ * extra[0..nextra)), its Command Complete goes into ev (SWEET_BT_LOCAL_EVENT_MAX bytes) and its length is returned;
++ * 0 sends it on:
+  *   vendor: status 0, the first parameter byte echoed (often a sub-opcode) and 8 zero bytes -- bluetoothd's vendor
+  *     command code asserts on an answer with nothing after the status (dada port: aci_vsc.c:135)
+  *   0x0c5a: status 0 and the setting, 0 (off)
++ *   0x204a: status 0 and the list size, 0 (bluetoothd does not use periodic advertising here)
+  *   others: status 0 alone
+  */
+ #define SWEET_BT_LOCAL_EVENT_MAX 16u
+@@ -176,7 +185,7 @@ sweet_bt_local_answer(const uint8_t *cmd, size_t n, const uint16_t *extra, unsig
+ 	}
+ 	op = (uint16_t)(cmd[1] | cmd[2] << 8);
+ 	vendor = (op & 0xfc00) == 0xfc00;
+-	hit = vendor || op == 0x0c5a || op == 0x0c5b;
++	hit = vendor || op == 0x0c5a || op == 0x0c5b || op == 0x204a;
+ 	for (unsigned i = 0; !hit && i < nextra; i++) {
+ 		hit = extra[i] != 0 && extra[i] == op;
+ 	}
+@@ -194,7 +203,7 @@ sweet_bt_local_answer(const uint8_t *cmd, size_t n, const uint16_t *extra, unsig
+ 	if (vendor) {
+ 		ev[7] = n > 4 ? cmd[4] : 0;
+ 		len = 7 + 1 + 8;
+-	} else if (op == 0x0c5a) {
++	} else if (op == 0x0c5a || op == 0x204a) {
+ 		len = 8;
+ 	} else {
+ 		len = 7;

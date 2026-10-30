@@ -2,6 +2,17 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 75 (2026-10-30): BLUETOOTH TURNS ON (Stack Did Start, state On) -- then the chip refuses the legacy LE scan (0x0c) and bluetoothd restarts -> answer 0x204a in the kernel <<<
+
+**Observed (log apollo-boot75.txt; kernel xnu 41022368424 = 0141+0142, sweet-bt 41022365622; boot-74 cmdline).** User: Settings switches from unavailable to on and back to unavailable, over and over.
+- No crash any more (`BT_BAUDRATE=115200` set; 0 `CRASH bluetoothd`).
+- **`SWEET BT: H4: connected (uid 501, unit 1)`** -- first time. bluetoothd runs the whole HCI init on the chip: 0xc03 Reset, 0x1001/0x1002/0x1009/0x1003/0x1004, LE 0x2003/0x2001/0x2002/0x202f/0x2031/0x2024/0x201c/0x200f, **0x204a**, then 0xc33..0xc52 (46 commands to the chip). The kernel answered 0x0c5b and many 0xfcxx/0xfdxx vendor commands; `Supported Commands given octet 18 = 0x8f`.
+- bluetoothd: **`Stack Did Start`**, `Power state change {powerstate: 1}`, **`Update Dynamic Store with state On`**, `managerState 5`, Carplay enabled, endpoints registered.
+- Then `Starting passive scan` -> **`HCI 0x200b refused by the chip: status 0xc`** -> **`btd: Bluetooth error - restarting { build=release, reason=712 }`** -> `H4: disconnected`. Earlier in each session `0x2007 refused ... 0xc` too. Same in all 7 sessions (deterministic).
+**Cause.** bluetoothd's init step 0x10b590 (table slot 0x7fbda8) is `OI_HCICMD_ReadPeriodicAdvListSize` = **0x204a, LE Read Periodic Advertiser List Size**, one of Bluetooth 5's *extended advertising commands*. The Core spec (Vol 4 Part E 3.1.1) makes a controller that has had an extended advertising command since reset refuse every legacy advertising/scanning command (0x2006-0x200c, 0x200d, 0x2007) with Command Disallowed 0x0c. bluetoothd then uses legacy mode (`enableExtendedScanning=0`, `enableExtendedAdvertising=0`), so 0x2007 and 0x200b fail. Apple's Broadcom chips evidently do not enforce this; the QCA6390 does. The Mi 10 port replaced the same init step (its 20F66 slot 0x7fbdb0, "programming initial LE random address in legacy mode") -- consistent.
+**Fix (commit below): `xnu/patches/0143-apollo-bt-keep-legacy-le-mode.patch`** -- `sweet_bt_local_answer` also answers 0x204a locally (Command Complete, status 0, list size 0), so the chip never sees an extended command and stays in legacy mode. 0x2007/0x200b/0x204b still go to the chip. Host tests 20/20 pass (4 new) under ASan/UBSan; 0136+0137+0141+0143 apply cleanly (git apply) and match the edited sources. Kernel log line now reads `vendor, erroneous-data-reporting and 0x204a commands answered here`. No library change (sweet-bt 41022365622 stays).
+**Test (boot 76):** new kernel (xnu run below) + sweet-bt 41022365622, cmdline unchanged. **Expect:** `HCI 0x204a (4 bytes) answered here`, no `refused by the chip: status 0xc` for 0x2007/0x200b, no `Bluetooth error - restarting`, no `H4: disconnected`; Bluetooth stays on, and with something advertising nearby `0x200c` scan enable + LE advertising reports. If another opcode is refused with 0xc, check whether it is an extended command bluetoothd sends in init (same fix) or try `sweetbtfake=`.
+
 ### >>> BOOT 74 (2026-10-30): BlueTool stand-in WORKS, bluetoothd gets to "Starting up StackManager" -- then crashes reading transport-speed (a number, not bytes) <<<
 
 **Observed (log apollo-boot74.txt, kernel xnu 41020774358, sweet-bt 41020778528):**
