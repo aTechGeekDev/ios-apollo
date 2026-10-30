@@ -241,6 +241,13 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int sink = -1;                   /* /dev/hakios-audio */
 static Float64 ticks_per_frame;
 static UInt64 written, refused;         /* frames since the speaker's I/O started */
+/*
+ * sweet (project-BadApple): when the audio server's I/O thread runs late it skips whole cycles; the writes still come
+ * on time, but a piece of the sound is missing, which is heard as a crackle. The speaker's output times (the cycle's
+ * mOutputTime) are followed: a jump is a skipped piece, counted and said (the first ones and with the stop).
+ */
+static Float64 speaker_next = -1;       /* the sample time the next write of the speaker's should be for */
+static UInt64 speaker_jumps, speaker_jumped;    /* how often its times jumped, and by how many frames in all */
 static Boolean inactive[OBJECT_LAST + 1];       /* streams the HAL has switched off */
 static Float32 volume = 1.0f;           /* the speaker's volume control, 0 to 1 (iOS sets it once it routes there) */
 
@@ -898,6 +905,8 @@ start_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unu
 		d->periods = 0;
 		if (d->output != 0) {
 			written = refused = 0;
+			speaker_next = -1;      /* sweet */
+			speaker_jumps = speaker_jumped = 0;
 			say("hakios: audio: playing\n");
 		}
 		if (d->object == OBJECT_CODEC) {
@@ -921,8 +930,9 @@ stop_io(__unused AudioServerPlugInDriverRef driver, AudioObjectID object, __unus
 		if (d->object == OBJECT_CODEC) {
 			codec_close();
 		} else if (d->output != 0) {
-			say("hakios: audio: stopped after %llu.%02llu s (%llu frames not taken by %s)\n", written / HAKIOS_AUDIO_RATE,
-			    written % HAKIOS_AUDIO_RATE * 100 / HAKIOS_AUDIO_RATE, refused, HAKIOS_AUDIO_DEVICE);
+			say("hakios: audio: stopped after %llu.%02llu s (%llu frames not taken by %s; the audio server skipped %llu "
+			    "times, %llu frames in all)\n", written / HAKIOS_AUDIO_RATE, written % HAKIOS_AUDIO_RATE * 100 / HAKIOS_AUDIO_RATE,
+			    refused, HAKIOS_AUDIO_DEVICE, speaker_jumps, speaker_jumped);
 		}
 	}
 	pthread_mutex_unlock(&lock);
@@ -1022,7 +1032,7 @@ actuator_write(const int16_t *samples, UInt32 frames)
 
 static OSStatus
 do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObjectID object, AudioObjectID stream,
-    __unused UInt32 client, UInt32 operation, UInt32 frames, __unused const AudioServerPlugInIOCycleInfo *cycle, void *buffer,
+    __unused UInt32 client, UInt32 operation, UInt32 frames, const AudioServerPlugInIOCycleInfo *cycle, void *buffer,
     __unused void *secondary)
 {
 	const struct device *d = device_of(stream);
@@ -1038,6 +1048,20 @@ do_io_operation(__unused AudioServerPlugInDriverRef driver, __unused AudioObject
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == OBJECT_ACTUATOR_OUTPUT) {
 		actuator_write(buffer, frames);
 	} else if (operation == kAudioServerPlugInIOOperationWriteMix && stream == d->output) {
+		/* sweet: a jump in the output times is a piece the audio server skipped (see speaker_next) */
+		if (cycle != NULL && d->object == OBJECT_SPEAKER) {
+			Float64 at = cycle->mOutputTime.mSampleTime;
+
+			if (speaker_next >= 0 && at != speaker_next) {
+				speaker_jumps++;
+				speaker_jumped += (UInt64)(at > speaker_next ? at - speaker_next : speaker_next - at);
+				if (speaker_jumps <= 12) {
+					say("hakios: audio: the audio server skipped: this write is for %.0f, the last ended at %.0f (%+.0f frames)\n",
+					    at, speaker_next, at - speaker_next);
+				}
+			}
+			speaker_next = at + frames;
+		}
 		/* the kernel takes it all or leaves it: this thread must not wait */
 		if (sink < 0 || write(sink, buffer, (size_t)frames * HAKIOS_AUDIO_FRAME) < 0) {
 			refused += frames;

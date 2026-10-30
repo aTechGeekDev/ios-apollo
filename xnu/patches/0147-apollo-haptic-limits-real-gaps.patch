@@ -1,0 +1,165 @@
+--- a/bsd/dev/sweet_sound.c
++++ b/bsd/dev/sweet_sound.c
+@@ -1111,12 +1111,16 @@
+  * added to the delay. When iOS stops writing (200 ms without a write) the periods are filled with silence again at once,
+  * so the next sound starts with the queue full, as before. What the feeder had to pad while iOS wrote, how low the
+  * queue went and how far apart iOS's writes came are said with the guard's report (every 5 s while the amplifiers are on).
++ * (xnu 0147) A short period counts there only once iOS writes again after it: one padded after iOS's last write (the end of
++ * a sound, boot 79's counts) is no gap in anything that is heard.
+  */
+ static uint32_t hold_low = 3;
+ #define HOLD_WRITING_US         200000ull       /* iOS is writing: its latest write less than 200 ms ago */
+ static volatile uint64_t last_write_us;         /* when iOS's latest write came, silence or not */
+ static volatile uint32_t write_gap_most_us;     /* the most time between two of iOS's writes (under a second) since the report */
+ static uint32_t fed_periods, short_periods, short_frames, least_queued = PERIODS, most_ring, held_most_us;
++static uint32_t pending_periods, pending_frames;        /* (xnu 0147) short ones not counted until iOS writes again */
++static uint64_t pending_at;
+ 
+ /* From the writer's thread, under hakios.audio.c's lock: never waits. */
+ static uint32_t
+@@ -1220,7 +1224,7 @@
+ 	uint32_t gap = write_gap_most_us;
+ 
+ 	if (!quiet && fed_periods != 0) {
+-		say("apollo sound: the feeder%s: %u periods, %u of them short while iOS wrote (%u ms of silence put in); the DSP's queue "
++		say("apollo sound: the feeder%s: %u periods, %u of them short with iOS's sound going on after (%u ms of silence put in); the DSP's queue "
+ 		    "at least %u of %u periods; the ring at most %u frames; a period held %u ms at most; iOS's writes %u ms apart at "
+ 		    "most; %u DSP underflows so far\n", when, fed_periods, short_periods, short_frames / 48, least_queued, PERIODS,
+ 		    most_ring, held_most_us / 1000, gap / 1000, underflows);
+@@ -1302,8 +1306,9 @@
+ 			if (writing) {
+ 				fed_periods++;
+ 				if (n < PERIOD_FRAMES) {
+-					short_periods++;
+-					short_frames += PERIOD_FRAMES - n;
++					pending_periods++;
++					pending_frames += PERIOD_FRAMES - n;
++					pending_at = now;
+ 				}
+ 			}
+ 			if (period_write(p)) {
+@@ -1313,6 +1318,14 @@
+ 				failed++;
+ 			}
+ 		}
++		/* (xnu 0147) a short period was a gap in the sound if iOS wrote after it; else it was a sound's end */
++		if (pending_periods != 0 && last_write_us > pending_at) {
++			short_periods += pending_periods;
++			short_frames += pending_frames;
++			pending_periods = pending_frames = 0;
++		} else if (pending_periods != 0 && now - pending_at > HOLD_WRITING_US) {
++			pending_periods = pending_frames = 0;
++		}
+ 		if (writing && (uint32_t)__builtin_popcount(at_dsp) < least_queued) {
+ 			least_queued = (uint32_t)__builtin_popcount(at_dsp);
+ 		}
+--- a/bsd/dev/sweet_haptic.c
++++ b/bsd/dev/sweet_haptic.c
+@@ -4,6 +4,8 @@
+  * beside it in bsd/dev); no pause after each line while the chip is brought up (that was for their loader's log; ours is the
+  * kernel's, flushed by sweet_ufs.c); the bring-up waits for the root and the boot's own files, which hold its waveforms
+  * (/usr/local/fw/aw8697_haptic.bin, through hakios_image_file() in sweet_audio_glue.c); the RPMh vote through sweet_rpmh.c.
++ * (xnu 0147) The limits for iOS's vibrations are boot-args, and wider by default (see haptic_max_ms below): theirs, 1 s in
++ * any 2 s and a 1 s rest after, cut iOS's ringtone patterns into pieces (boot 79).
+  */
+ #pragma clang diagnostic ignored "-Weverything"
+ /*
+@@ -563,6 +565,13 @@
+ #define DUTY_WINDOW_MS          2000            /* at most HAPTIC_MAX_MS of driving (taps and vibrations) in any window this long */
+ #define DUTY_SLOT_MS            100             /* the window kept as so many slots of driving time; one more than it takes, so */
+ #define DUTY_SLOTS              (DUTY_WINDOW_MS / DUTY_SLOT_MS + 1)     /* that the slots always cover the whole window */
++/*
++ * apollo: (xnu 0147) for iOS (apollo_haptic=5): a vibration is cut after haptic_max_ms (apollo_haptic_max_ms, default 2000),
++ * the motor drives at most haptic_duty_ms in any DUTY_WINDOW_MS (apollo_haptic_duty_ms, default 1800, at most the window),
++ * and rests haptic_rest_ms after a cut (apollo_haptic_rest_ms, default 500). Theirs were HAPTIC_MAX_MS for all three, which
++ * left pieces of iOS's ringtone patterns out (boot 79); Android drives this motor without a pause while the phone rings.
++ */
++static uint32_t haptic_max_ms = 2000, haptic_duty_ms = 1800, haptic_rest_ms = 500;
+ #define ANDROID_GAIN            0x80            /* aw8697_haptic_effect_strength(): the strongest level */
+ #define BST_VOL_RAM             0x11            /* DT vib_bst_vol_ram */
+ 
+@@ -1088,15 +1097,15 @@
+ 		for (unsigned i = 0; i < DUTY_SLOTS; i++) {
+ 			window += driven[i];
+ 		}
+-		if ((state == TAP || state == LOOP) && window >= HAPTIC_MAX_MS * 1000ull) {
++		if ((state == TAP || state == LOOP) && window >= haptic_duty_ms * 1000ull) {      /* apollo: was HAPTIC_MAX_MS */
+ 			if (!halt()) {
+ 				break;
+ 			}
+ 			capped++;
+-			rest_until = now + HAPTIC_MAX_MS * 1000ull;
++			rest_until = now + haptic_rest_ms * 1000ull;
+ 			if (duty_cuts++ < TOLD_EVENTS) {
+ 				say("apollo haptic: %llu ms of driving in the last %u ms: the motor is STOPPED and rests %u ms (%u taps, %u "
+-				    "vibrations so far)\n", window / 1000, DUTY_WINDOW_MS, HAPTIC_MAX_MS, taps, loops);
++				    "vibrations so far)\n", window / 1000, DUTY_WINDOW_MS, haptic_rest_ms, taps, loops);
+ 			}
+ 			state = REST;
+ 			wait_ms(4);
+@@ -1114,7 +1123,7 @@
+ 			if (active && onset_us != tap_onset && now - onset_us >= SETTLE_US) {
+ 				uint64_t began = onset_us;
+ 
+-				if (window >= HAPTIC_MAX_MS * 1000ull) {
++				if (window >= haptic_duty_ms * 1000ull) {      /* apollo: was HAPTIC_MAX_MS */
+ 					tap_onset = began;      /* (no room in the duty window: this tap is left out, not played late) */
+ 					break;
+ 				}
+@@ -1150,7 +1159,7 @@
+ 						wait_ms(4);
+ 						say("apollo haptic: vibration %u: iOS goes on playing (peak %u): Android's waveform 11 over and over at "
+ 						    "gain %#04x, %u ms at most; the chip's state %u\n", loops, peak, gain ? gain : 1,
+-						    HAPTIC_MAX_MS, chip_state());
++						    haptic_max_ms, chip_state());
+ 					}
+ 				}
+ 			} else if (!active && now - since > TAP_US) {
+@@ -1170,12 +1179,12 @@
+ 					follows++;
+ 				}
+ 			}
+-			if (!active || now - since > HAPTIC_MAX_MS * 1000ull) {
+-				bool cut = now - since > HAPTIC_MAX_MS * 1000ull;
++			if (!active || now - since > haptic_max_ms * 1000ull) {        /* apollo: was HAPTIC_MAX_MS */
++				bool cut = now - since > haptic_max_ms * 1000ull;
+ 
+ 				if (cut) {
+ 					capped++;
+-					rest_until = now + HAPTIC_MAX_MS * 1000ull;
++					rest_until = now + haptic_rest_ms * 1000ull;
+ 				}
+ 				if (halt()) {
+ 					state = rest_until > now ? REST : IDLE;
+@@ -1202,7 +1211,7 @@
+ 		wait_ms(4);
+ 	}
+ 	say("apollo haptic: the motor is given up on (%u taps and %u vibrations played, %u cut at %u ms)\n", taps, loops, capped,
+-	    HAPTIC_MAX_MS);
++	    haptic_max_ms);
+ }
+ 
+ static bool
+@@ -1318,6 +1327,13 @@
+ 	}
+ 	PE_parse_boot_argn("apollo_haptic_pause", &pause_ms, sizeof(pause_ms));
+ 	PE_parse_boot_argn("apollo_haptic_after", &start_after_ms, sizeof(start_after_ms));
++	/* apollo: (xnu 0147) the limits for iOS's vibrations */
++	PE_parse_boot_argn("apollo_haptic_max_ms", &haptic_max_ms, sizeof(haptic_max_ms));
++	PE_parse_boot_argn("apollo_haptic_duty_ms", &haptic_duty_ms, sizeof(haptic_duty_ms));
++	PE_parse_boot_argn("apollo_haptic_rest_ms", &haptic_rest_ms, sizeof(haptic_rest_ms));
++	haptic_max_ms = haptic_max_ms < 100 ? 100 : haptic_max_ms > 10000 ? 10000 : haptic_max_ms;
++	haptic_duty_ms = haptic_duty_ms < 100 ? 100 : haptic_duty_ms > DUTY_WINDOW_MS ? DUTY_WINDOW_MS : haptic_duty_ms;
++	haptic_rest_ms = haptic_rest_ms > 10000 ? 10000 : haptic_rest_ms;
+ 	if (kernel_thread_start(haptic_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_set_thread_name(thread, "apollo haptic");
+ 		thread_deallocate(thread);
+@@ -1333,7 +1349,7 @@
+ 		reset_pin(false);
+ 		if (stage == 5) {
+ 			say("apollo haptic: at the run's end: %u taps and %u vibrations played (%u cut at %u ms), from %llu frames iOS "
+-			    "wrote; the chip is held in reset\n", taps, loops, capped, HAPTIC_MAX_MS, written_frames);
++			    "wrote; the chip is held in reset\n", taps, loops, capped, haptic_max_ms, written_frames);
+ 		}
+ 	}
+ }
