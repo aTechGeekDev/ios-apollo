@@ -1,0 +1,29 @@
+--- a/iokit/Kernel/arm/SweetBluetooth.cpp
++++ b/iokit/Kernel/arm/SweetBluetooth.cpp
+@@ -25,6 +25,7 @@ extern "C" int SweetBluetoothPublish(const uint8_t address[6], const uint8_t com
+ extern "C" void SweetBluetoothSetReady(bool ready);
+ 
+ static IOService * bluetooth_service;
++static const uint8_t transport_speed[4] = { 0x00, 0xc2, 0x01, 0x00 };  /* 115200 */
+ 
+ void
+ SweetBluetoothSetReady(bool ready)
+@@ -62,7 +63,17 @@ SweetBluetoothPublish(const uint8_t address[6], const uint8_t commands[64])
+ 	}
+ 	service->setProperty("SweetBluetoothSupportedCommands", data);
+ 	data->release();
+-	service->setProperty("transport-speed", 115200, 32);
++	/*
++	 * Bytes, as every property in Apple's device tree is: bluetoothd reads transport-speed with
++	 * CFDataGetBytes (4 bytes, little-endian), and a number here made it throw
++	 * -[__NSCFNumber getBytes:range:] (apollo boot 74).
++	 */
++	if ((data = OSData::withBytes(transport_speed, sizeof(transport_speed))) == NULL) {
++		service->release();
++		return ENOMEM;
++	}
++	service->setProperty("transport-speed", data);
++	data->release();
+ 	service->setProperty("compatible", "qca,qca6390");
+ 	service->setProperty("SweetBluetoothReady", false);
+ 	if (!service->attach(platform)) {

@@ -9,8 +9,10 @@
  * bluetoothd -- the transport. Its HCI transport is named by the environment variable BT_HCI_TRANSPORT, which
  *   launchd will not let us set in the job's plist (apollo boot 46), so this sets it:
  *   H4:POSIX:com.sweet.bluetooth,115200 makes bluetoothd open the kernel's H4 endpoint (a stream kernel control of
- *   that name; sweet_bt.c logs "SWEET BT: H4: connected"). Boot-arg sweetbthci=STRING overrides it, sweetbthci=0
- *   leaves bluetoothd's environment alone.
+ *   that name; sweet_bt.c logs "SWEET BT: H4: connected"). It also sets BT_BAUDRATE=115200: without it bluetoothd
+ *   reads the registry entry's "transport-speed" with CFDataGetBytes, and kernels before xnu 0142 publish that as
+ *   a number, so bluetoothd died there (-[__NSCFNumber getBytes:range:], apollo boot 74). Boot-arg
+ *   sweetbthci=STRING overrides the transport, sweetbthci=0 leaves bluetoothd's environment alone.
  *
  * BlueTool -- a stand-in. To power the controller on, bluetoothd asks BlueTool (XPC, MachService
  *   com.apple.BlueTool) to RunBuiltinScript "boot"/"init" and waits for the reply's "result" to be 0. Apple's
@@ -543,7 +545,9 @@ sweet_bt_init(void)
 		}
 		if (set_transport) {
 			setenv("BT_HCI_TRANSPORT", transport, 1);
-			say("sweet-bt: bluetoothd: BT_HCI_TRANSPORT=%s (the kernel's H4 endpoint; sweetbt=6)\n", transport);
+			setenv("BT_BAUDRATE", "115200", 0);
+			say("sweet-bt: bluetoothd: BT_HCI_TRANSPORT=%s BT_BAUDRATE=%s (the kernel's H4 endpoint; sweetbt=6)\n",
+			    transport, getenv("BT_BAUDRATE"));
 		}
 		if (boot_arg(arguments, "sweetbtlog", value, sizeof(value)) != NULL && strcmp(value, "1") == 0) {
 			hook_os_log(main_executable());

@@ -2,6 +2,18 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 74 (2026-10-30): BlueTool stand-in WORKS, bluetoothd gets to "Starting up StackManager" -- then crashes reading transport-speed (a number, not bytes) <<<
+
+**Observed (log apollo-boot74.txt, kernel xnu 41020774358, sweet-bt 41020778528):**
+- Kernel: firmware runs, `bluetoothd's vendor and erroneous-data-reporting commands answered here, 0 more opcode(s)` (0141 is in), `THE RADIO IS UP`.
+- BlueTool: `main() at 0x1003b8110 now goes to our responder`, `RunBuiltinScript boot -> result 0`, `init -> result 0`.
+- bluetoothd, further than ever: `Beginning asynchronous power init` -> `Booting chipset` -> `BlueTool finished running boot script` -> `Default power state : 1` -> `Powering on chipset` -> `BlueTool finished running init script` -> `Starting up StackManager` -> `Stack: STACK_OFF -> STACK_BUSY` -> initCoreStack capability lines -> `Searching for transport: "H4"` / `"POSIX"` -> **`*** Terminating app due to uncaught exception 'NSInvalidArgumentException', reason: '-[__NSCFNumber getBytes:range:]: unrecognized selector'`** (CRASH sig 6). launchd restarts it; same crash 7 times. Settings/Control Center show Bluetooth greyed out (the daemon keeps dying). No `H4: connected`, no HCI yet.
+**Cause (from the crash stack, image base 0x102648000):** frame 0x10272f580 = return from `CFDataGetBytes` at 0x1000e757c in bluetoothd's baud lookup 0x1000e74e4 (called by the POSIX H4 opener 0x100066bdc). It does `getenv("BT_BAUDRATE")`; if unset, `IORegistryEntrySearchCFProperty(<"bluetooth">, "IODeviceTree", "transport-speed")` + `CFDataGetBytes(.., 4)`. Our SweetBluetooth.cpp (0136) set `transport-speed` with `setProperty(name, 115200, 32)` = OSNumber -> CFNumber -> the exception. Other registry reads of that entry in bluetoothd: `local-mac-address` (CFData, ours is OSData, fine) and `transport-encoding` (CFData, absent, skipped on NULL). After the baud lookup the opener takes the speed from the transport string (`,115200` wins), then `socket(AF_SYSTEM, SOCK_STREAM, SYSPROTO_CONTROL)` + `ioctl(CTLIOCGINFO)` (0xc0644e03) + connect: our kernel control.
+**Fix (commit below):**
+- `sweet_bt_inject.c`: bluetoothd also gets `BT_BAUDRATE=115200` (not overwriting an existing one), so it never reads the property. Works with the boot-74 kernel.
+- `xnu/patches/0142-apollo-bt-transport-speed-bytes.patch`: `transport-speed` published as OSData `00 c2 01 00` (4 bytes LE), like Apple's device tree. Applies cleanly after 0136 (git apply --check, result identical to the edited file).
+**Test (boot 75):** new `sweet-bt` (bt run below) with either the boot-74 kernel or the new one (xnu run below); cmdline unchanged from boot 74. **Expect:** no NSInvalidArgumentException/CRASH bluetoothd, then `SWEET BT: H4: connected`, `SWEET BT: iOS: HCI 0x.... answered here` and the HCI init, Bluetooth no longer greyed out.
+
 ### >>> BT STAGE 3 (2026-10-30): copy what the two working ports do -- replace BlueTool + answer the vendor commands in the kernel (built for boot 74) <<<
 
 **Research (user asked how other ports got Bluetooth working).** Two public ports have it working:
