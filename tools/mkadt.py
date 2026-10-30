@@ -3,10 +3,13 @@
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
 address comes from the sweet live FDT. Usage:
-  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--p3] [--touch-fw FW.bin] [--gmu-fw a650_gmu.bin]
+  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--p3] [--native-display] [--touch-fw FW.bin] [--gmu-fw a650_gmu.bin]
             [--sqe-fw a650_sqe.fw] [--zap-mdt a650_zap.mdt] [--zap-seg a650_zap.b02] [--wifi-fw DIR|amss.bin] [--wifi-board FILE] [--wifi-mac aa:bb:cc:dd:ee:ff]
             [--bt-fw DIR]
 /product says the display is sRGB, not the iPhone X's P3 (--p3 keeps P3): see build().
+--native-display: /arm-io/disp0's canvas is the panel's own 1080x2400 instead of the iPhone X's
+1125x2436, for boot-arg sweetfb_native=1 (iOS lays out for 360x800 points @3x; the picture 1:1 on
+the panel). Switching either way: tools/root-files/mgcache-reset.txt once, so MobileGestalt asks again.
 --file /usr/local/PATH=LOCAL (as many as wanted) carries a file in /sweet-files; the kernel
 writes it onto the root before launchd starts (xnu 0120-0122, bsd/dev/sweet_files.c): a new
 build of the CoreAnimation bridge or of Mesa without a new root image. --files-from LIST: the
@@ -120,7 +123,7 @@ def node(name, props=(), children=()):
 
 
 def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_extra=(), p3=False, files=(),
-          deletes=(), lists=(), wifi=(), macs=(), bt=(), moves=()):
+          deletes=(), lists=(), wifi=(), macs=(), bt=(), moves=(), native_display=False):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
@@ -228,14 +231,15 @@ def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_
         node('wdt', [ph(), ('no-pmu', u32(1))]),
         # Main display: IOMobileFramebuffer.framework counts /arm-io children
         # with this device_type and reads the canvas size from the node
-        # (the presented iPhone X size, see SweetFramebuffer.cpp);
+        # (the presented iPhone X size, see SweetFramebuffer.cpp; --native-display: the panel's own, for
+        # sweetfb_native=1);
         # the kernel's AppleCLCD matches the compatible string.
         node('disp0', [
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(1125)),
-            ('canvas-height', u32(2436)),
+            ('canvas-width', u32(1080 if native_display else 1125)),
+            ('canvas-height', u32(2400 if native_display else 2436)),
         ])] + (
         # launchd starts wifid only when the device tree has a node named "wlan" or "marconi-wifi"
         # (com.apple.wifid _LimitLoadToDeviceTree; launchd asks io_device_tree_entry_exists_with_name):
@@ -487,7 +491,7 @@ if __name__ == '__main__':
     if files:
         print(f'files for the root: {len(files)}, {sum(len(d) for _, d, _ in files) / 1048576:.1f} MiB', file=sys.stderr)
     root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv, touch_fw=touch_fw, gmu_fw=gmu_fw,
-                 gpu_extra=gpu_extra, p3='--p3' in sys.argv, files=files, deletes=deletes, lists=lists, wifi=wifi, macs=macs, bt=bt,
+                 gpu_extra=gpu_extra, p3='--p3' in sys.argv, native_display='--native-display' in sys.argv, files=files, deletes=deletes, lists=lists, wifi=wifi, macs=macs, bt=bt,
                  moves=moves)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)

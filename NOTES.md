@@ -2,6 +2,15 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 83 (2026-10-30, kernel 41068823015 = 0151, `cpumask=0xf1`): the fade works, 5 cores up; user wants the screen used natively -> test native 1080x2400 (boot 84) <<<
+
+**Observed (log + user):** `SWEET CPU: 5/5 CPUs initialized` (MPIDR 0, 0x400-0x700: cpumask works); `apollo backlight: ... channel 98/99 ... type 0x17, subtype 0x12 ... module A, 12 bits: the firmware left it on at 409 of 4095 (9%)`, fade 300 ms; user: "the fade works". `SWEET FB: 10.0 s`: 12-48 frames/s given (33.7, 37.5, 47.8, 45.2 in use; 19-103 "waited for the GPU"), copy 3.3-3.8 ms average (0150's scaled copy), 13.5 at most. Not better than boot 81 (43-54) with 5 cores instead of 8 -- not compared under the same use, so no conclusion yet.
+**User:** "now have black bars on the top and bottom ... i want the whole display to be used without crops or stretching. as if it was native".
+**Why there is no scale that does it:** every iPhone's screen is ~2.16:1 (X 375x812 pt, 14 Pro 393x852, Pro Max 430x932); the panel is 2.22:1. Any iPhone layout fills it only with bars (0150), a crop (0061) or a stretch (hakios: 1125x2436 -> 1080x2400 non-uniformly). Native = iOS lays out for 1080x2400 itself: 360x800 points @3x, `sweetfb_native=1` (since 0061; 0150's fit is off then, touch 1:1, the copy a plain memcpy again).
+**Known risk (ios-spes NOTES, their 0061, early in their port):** at 360x800 pt UIKit drew a red status bar "rdar:45025538" ("No status bar visual provider for screen": no real iPhone has that size). Whether that still holds with everything else this port has now, and what else (home screen grid, lock screen, Control Center) does at 360x800, is the test. If the status bar is the only problem: an in-process hook choosing the iPhone X's visual provider (needs UIKitCore from the 20H392 shared cache disassembled: not reachable from the agent container).
+**mkadt.py `--native-display`:** /arm-io/disp0 canvas 1080x2400 instead of 1125x2436 (checked with --dump). Switching either way needs `tools/root-files/mgcache-reset.txt` once.
+**Test (boot 84):** 0151's kernel, boot 83's ADT command + `--native-display --files-from tools/root-files/mgcache-reset.txt`, cmdline + `sweetfb_native=1`. Back: drop all three (with the mgcache reset once more).
+
 ### >>> BOOT 82 (2026-10-30, 0150's kernel, `cpumask=0xf1` without `cpus=`): Apple logo, then half of it, then black with sound -> xnu 0151 <<<
 
 **Observed (user):** "the apple logo appeared for a bit then half of it then all i have is a black screen with audio". **Cause (from the code):** 0065/0078's machine_routines.c set `cpu_boot_arg = 1` whenever `cpus=` was absent, so `cpumask=0xf1` alone started ONE core; iOS gave no frames on it (sound still played). My suggestion, not a fault of 0149/0150 (0150's fit scaling is still untested).
