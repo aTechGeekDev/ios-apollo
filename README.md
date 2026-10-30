@@ -115,6 +115,7 @@ adb reboot bootloader
 | `sweetgpulevel=N` | The GPU's speed: 1 = 305 MHz (the default) .. 6 = 587 MHz (its top; for the UI's frame rate) |
 | `sweetddr=0` | (xnu 0148) Leave the memory bus where the boot chain put it; by default it is voted to its top (`SWEET RPMH: THE MEMORY BUS IS VOTED TO ITS TOP: a core copies N MB/s (it was M)`) |
 | `sweetfb_fit=0` | (xnu 0150) Show the centre 1080x2400 of iOS's 1125x2436 picture 1:1 (cropped, as before) instead of the whole picture scaled by 24/25 with 31 black lines above and below; touch follows either way |
+| `sweetfb_height=N` | (xnu 0152) Present 1125xN instead of 1125x2436 (2400-2600). `2502` = 375x834 points, scaled by 24/25 onto the whole panel (no bars, one scale both ways); build the ADT with `mkadt.py --display-height N` and reset MobileGestalt's cache once (`tools/root-files/mgcache-reset.txt`) |
 | `apollo_backlight=P` | (xnu 0151) The panel's light (PM8150L WLED, hakios's driver; on by default): `0` leaves it alone (display off blanks at once), `P` 1-100 sets P%, absent keeps the firmware's level. Display off/on fades it out/in over `apollo_backlight_fade_ms` (default 300) |
 | `sweetfb_stats=N` | (xnu 0148) Every N seconds (10; 0 never) `SWEET FB:` says how many frames iOS gave and how many reached the panel a second, the copy's time, and late or skipped vsyncs |
 | `sweetnull=A,B,...` | Copy what these programs print into the kernel log |
@@ -135,7 +136,7 @@ The other boot-args are described in their drivers' sources in `xnu/patches/` an
 | Path | What |
 | --- | --- |
 | `shim/` | Boot shim, packed as an Android boot image |
-| `xnu/patches/` | The kernel patches (0001–0151), applied in order by CI |
+| `xnu/patches/` | The kernel patches (0001–0152), applied in order by CI |
 | `wifi/` | HackiOS's Linux layer for the Wi-Fi driver; CI builds Linux's ath11k on it and links it into the kernel |
 | `userland/` | Programs and libraries for the phone: GPU tests, Mesa, the CoreAnimation bridge |
 | `tools/` | Device tree builder, payload packer, iOS root builder, log and crash tools |

@@ -1,0 +1,126 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -50,6 +50,14 @@
+  * looked zoomed in). Boot-arg sweetfb_fit=0: the crop as before. SweetHID.cpp
+  * maps the touches the same way.
+  *
++ * (xnu 0152) Boot-arg sweetfb_height=N (2400 to 2600): the presented display
++ * is 1125xN instead of 1125x2436. sweetfb_height=2502 = 375x834 points @3x,
++ * which 24/25 scales to 1080x2401.9: the whole panel, at one scale both ways
++ * (as the iPhone 12 mini shows its 1125x2436 on 1080x2340), its first and last
++ * lines of the picture left out; the panel's 20:9 needs no bars. Width stays
++ * 375 points, so iOS keeps the iPhone X's layouts across (status bar, Control
++ * Center); only the height is the panel's.
++ *
+  * (xnu 0151) Display off fades the panel's light out (the PM8150L's WLED,
+  * bsd/dev/sweet_backlight.c: apollo_backlight_fade_ms, default 300) and only
+  * then blanks the panel; display on draws the latest frame first and fades the
+@@ -161,7 +169,9 @@
+ 	uint32_t      fStatSwaps, fStatShown, fStatBusy, fStatTicks, fStatSkipped;
+ 	/* (xnu 0150) the presented display scaled onto the panel (sweetfb_fit, default 1) */
+ 	bool          fFit;
+-	uint32_t      fFitBand, fFitHeight;     /* black lines above it; the lines it takes */
++	int32_t       fFitBand;                 /* black lines above it (0152: < 0: lines of it left out above) */
++	uint32_t      fFitHeight;               /* the lines it takes, scaled (0152: may be more than the panel's) */
++	uint32_t      fFitTop, fFitEnd;         /* (0152) the panel lines it shows: [fFitTop, fFitEnd) */
+ 	uint32_t     *fXMap;                    /* a panel column's source column, for one layer */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -297,6 +307,11 @@
+ 	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
++		/* (xnu 0152) another height, e.g. 2502 (375x834 points): the panel filled */
++		uint32_t height = 0;
++		if (PE_parse_boot_argn("sweetfb_height", &height, sizeof(height)) && height >= 2400 && height <= 2600) {
++			fLogicalH = height;
++		}
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+@@ -305,8 +320,12 @@
+ 	PE_parse_boot_argn("sweetfb_fit", &fit, sizeof(fit));
+ 	fFitHeight = fLogicalH * SWEET_FB_FIT_NUM / SWEET_FB_FIT_DEN;
+ 	fFit = fit != 0 && fLogicalW != fWidth && fLogicalW * SWEET_FB_FIT_NUM / SWEET_FB_FIT_DEN == fWidth &&
+-	    fFitHeight <= fHeight;
+-	fFitBand = fFit ? (fHeight - fFitHeight) / 2 : 0;
++	    fFitHeight <= fHeight + 8;
++	/* (0152) centred; taller than the panel: the lines over left out, the odd one above (a floor, not C's truncation) */
++	fFitBand = ((int32_t)fHeight - (int32_t)fFitHeight - ((int32_t)fFitHeight > (int32_t)fHeight ? 1 : 0)) / 2;
++	fFitBand = fFit ? fFitBand : 0;
++	fFitTop = fFitBand > 0 ? (uint32_t)fFitBand : 0;
++	fFitEnd = fFitBand + (int32_t)fFitHeight < (int32_t)fHeight ? (uint32_t)(fFitBand + (int32_t)fFitHeight) : fHeight;
+ 	fXMap = fFit ? (uint32_t *)IOMallocData(fWidth * sizeof(uint32_t)) : NULL;
+ 	if (fFit && fXMap == NULL) {
+ 		fFit = false;
+@@ -606,7 +625,7 @@
+ 	if (fFit) {
+ 		/* (xnu 0150) the lines above and below the scaled picture, black (writes only) */
+ 		for (uint32_t band = 0; band < 2; band++) {
+-			uint32_t from = band == 0 ? 0 : fFitBand + fFitHeight, to = band == 0 ? fFitBand : fHeight;
++			uint32_t from = band == 0 ? 0 : fFitEnd, to = band == 0 ? fFitTop : fHeight;
+ 
+ 			for (uint32_t y = from; y < to; y++) {
+ 				volatile uint64_t *line = (volatile uint64_t *)(fPixels + (uint64_t)y * fRowBytes);
+@@ -692,17 +711,18 @@
+ 			    s->memory != NULL && end <= s->memory->getLength()) {
+ 				uint32_t px0 = (uint32_t)dx * SWEET_FB_FIT_NUM / SWEET_FB_FIT_DEN;
+ 				uint32_t px1 = (uint32_t)(dx + w) * SWEET_FB_FIT_NUM / SWEET_FB_FIT_DEN;
+-				uint32_t py0 = (uint32_t)dy * SWEET_FB_FIT_NUM / SWEET_FB_FIT_DEN + fFitBand;
+-				uint32_t py1 = (uint32_t)(dy + h) * SWEET_FB_FIT_NUM / SWEET_FB_FIT_DEN + fFitBand;
++				int32_t qy0 = (int32_t)((uint32_t)dy * SWEET_FB_FIT_NUM / SWEET_FB_FIT_DEN) + fFitBand;
++				int32_t qy1 = (int32_t)((uint32_t)(dy + h) * SWEET_FB_FIT_NUM / SWEET_FB_FIT_DEN) + fFitBand;
++				uint32_t py0 = qy0 < (int32_t)fFitTop ? fFitTop : (uint32_t)qy0;
++				uint32_t py1 = qy1 > (int32_t)fFitEnd ? fFitEnd : qy1 < 0 ? 0 : (uint32_t)qy1;
+ 
+ 				px1 = px1 > fWidth ? fWidth : px1;
+-				py1 = py1 > fFitBand + fFitHeight ? fFitBand + fFitHeight : py1;
+ 				for (uint32_t px = px0; px < px1; px++) {
+ 					int32_t xs = (int32_t)(px * SWEET_FB_FIT_DEN / SWEET_FB_FIT_NUM) - dx;
+ 					fXMap[px - px0] = (uint32_t)(sx + (xs < 0 ? 0 : xs >= w ? w - 1 : xs));
+ 				}
+ 				for (uint32_t py = py0; py < py1; py++) {
+-					int32_t ys = (int32_t)((py - fFitBand) * SWEET_FB_FIT_DEN / SWEET_FB_FIT_NUM) - dy;
++					int32_t ys = ((int32_t)py - fFitBand) * SWEET_FB_FIT_DEN / SWEET_FB_FIT_NUM - dy;
+ 					const uint32_t *from = (const uint32_t *)(src + start +
+ 					    (uint64_t)(sy + (ys < 0 ? 0 : ys >= h ? h - 1 : ys)) * row);
+ 					uint32_t *to = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes) + px0;
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -369,6 +369,7 @@
+ 	IOLock *fLock;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
+ 	bool fFit;              /* (xnu 0150) the display scaled by 24/25 onto the panel (SweetFramebuffer.cpp) */
++	int fFitBand;           /* (xnu 0152) black lines above it: 31 for 2436 lines, -1 for 2502 */
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+@@ -437,11 +438,19 @@
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = native ? 1080 : 1125;
+ 	fLogicalH = native ? 2400 : 2436;
++	/* (xnu 0152) the presented height of SweetFramebuffer.cpp's sweetfb_height, read the same way */
++	int height = 0;
++	if (!native && PE_parse_boot_argn("sweetfb_height", &height, sizeof(height)) && height >= 2400 && height <= 2600) {
++		fLogicalH = height;
++	}
+ 	fOffX = (fLogicalW - 1080) / 2;
+ 	fOffY = (fLogicalH - 2400) / 2;
+ 	int fit = 1;
+ 	PE_parse_boot_argn("sweetfb_fit", &fit, sizeof(fit));
+ 	fFit = !native && fit != 0;
++	/* (0152) the lines above the scaled picture, as SweetFramebuffer.cpp's fFitBand (< 0: lines of it left out) */
++	int scaled = fLogicalH * 24 / 25;
++	fFitBand = (2400 - scaled - (scaled > 2400 ? 1 : 0)) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -475,7 +484,7 @@
+ 		 * (xnu 0150) The display is the whole 1125x2436 scaled by 24/25 onto the panel, 2338 lines with 31 black
+ 		 * above: across, the panel's width is the display's; down, the line in the picture scaled back.
+ 		 */
+-		int64_t ly = ((int64_t)y - 31) * 25 / 24;
++		int64_t ly = ((int64_t)y - fFitBand) * 25 / 24;
+ 
+ 		ly = ly < 0 ? 0 : ly > fLogicalH - 1 ? fLogicalH - 1 : ly;
+ 		nx = (IOFixed)(((int64_t)x << 16) / 1080);
