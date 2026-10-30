@@ -12,7 +12,7 @@
 - SweetFramebuffer.cpp: no vsync notifications while the display is off and dark; a frame the GPU is still drawing is looked at again after 0.5 ms (IODelay, blocks) instead of 2 ms (boot 83: 19-103 such waits per 10 s, each able to miss a vsync).
 **Checks:** validate-repo 153 OK; the series reproduces the three series-created files; sweet_cpufreq.c compiles against stub headers (-Wall -Wextra: only the host's uint64_t/%llu mismatch).
 **Risks (guesses):** the low memory-bus vote's real bandwidth is unknown (if the panel flickers or tears when idle: `sweetddrlow=0x2000` or `sweetddr=2`); the governor could cost frames on short bursts (then `sweetcpugov=0` to compare).
-**Test:** after boot 85 (0152), the same command with 0153's kernel; grep `SWEET CPUFREQ`. Compare `SWEET FB: 10.0 s` fps with boot 83/85 and how warm the phone gets.
+**Build:** commit c7d70f0, xnu run **41075524561** (main). **Test:** after boot 85 (0152), the same command with 0153's kernel; grep `SWEET CPUFREQ`. Compare `SWEET FB: 10.0 s` fps with boot 83/85 and how warm the phone gets.
 
 ### >>> BOOT 84 (2026-10-30, native 360x800 pt, `sweetfb_native=1 --native-display`): red rdar status bar, Control Center off; user: "i still want what i said" -> xnu 0152 (375x834 pt) <<<
 
