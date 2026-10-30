@@ -1,158 +1,282 @@
 # project-BadApple
 
-**Apple's iOS 16 on the Xiaomi Mi 10T 5G / Mi 10T Pro 5G (`apollo`, Snapdragon 865).**
+**Apple's iOS 16 running natively on the Xiaomi Mi 10T 5G / Mi 10T Pro 5G** (`apollo`, Snapdragon 865).
 
-Apple's open-source XNU kernel (xnu-8796), patched for the phone, boots the **unmodified iOS 16.7.16 (20H392) userland of the iPhone X**: launchd, the system daemons, backboardd, SpringBoard and the stock apps. No emulator, no Android underneath.
+Apple's open-source XNU kernel (xnu-8796), patched for this phone, boots the **unmodified iOS 16.7.16 (20H392) system of the iPhone X**: launchd, the system daemons, the window server, SpringBoard and the stock apps. No emulator, and no Android underneath.
 
-> Experimental, not a daily-use OS. Apple's security model is mostly switched off, and installing the iOS root **erases Android's `userdata` partition**.
+> [!WARNING]
+> This is an experiment, not a daily-use phone OS. Most of Apple's security model is switched off, and installing the iOS root **erases Android's `userdata` partition**.
 
-## Status (2026-10-28)
+---
 
-| | |
-| --- | --- |
-| Boot | Stock bootloader → `fastboot boot` shim → XNU → iOS from `userdata` → **lock screen**, home screen, Control Center, Settings, app switcher, home gesture; **wallpapers and widgets** (app extensions registered, 2026-10-26) |
-| CPU | All 8 cores, clocked up (1804 / 2419 / 2841 MHz) |
-| Touch | Working (Novatek NT36675 over SPI, firmware loaded at every boot) |
-| Buttons | Power, volume up, volume down |
-| Display | iOS drawn by the GPU and copied to the panel (up to 60 frames a second with `sweetfb_hz=60`) |
-| GPU | Adreno 650 up. **Mesa draws with it** (OpenGL ES 3.2, freedreno), and iOS's own renderer (CoreAnimation in backboardd) draws **the whole GUI** on it through the bridge: lock screen, home screen, keyboard, and the blur of Control Center, Spotlight and the App Library (2026-10-26). A backboardd crash on some image uploads has a fix built, not yet tested |
-| Wi-Fi | **Working** (QCA6390, Linux's ath11k built into the kernel, `sweetwifi=12`): iOS's Wi-Fi settings list the networks around; WPA2 networks join from Settings or Control Center; passwords are kept and saved networks join by themselves after a reboot; the signal-strength icon is right; the Wi-Fi switch turns the radio off and on; the internet works in apps and Safari (2026-10-28) |
-| Bluetooth | **Working in iOS** (2026-10-30): the switch in Settings and Control Center, scanning, pairing (kept across reboots), music to headphones (A2DP), HFP and AVRCP connect. QCA6390 over the UART of serial engine 6 at 921600 baud with the phone's own firmware (`sweetbt=6`), bluetoothd given the kernel's H4 link by `userland/bt-inject` (`libsweet-bt.dylib`); see NOTES.md for the boot command |
-| Audio | **iOS's sound plays through both speakers** (2026-10-28): the audio DSP started from the phone's own firmware, the tertiary TDM interface and the two CS35L41 amplifiers (kernel drivers of [hakios-apollo](https://github.com/enesuzun2002/hakios-apollo)), and its audio-server plug-in (`userland/audio/`), `apollo_audio=5`; 20 dB under Android's level by default (`apollo_sound_below=`). The main microphone (`apollo_mic=4`) and the vibration motor (`apollo_haptic=5`) are ported (xnu 0146, also from hakios-apollo), not yet tested |
-| Not yet | Display power, USB networking, battery, cameras, cellular |
+## Contents
 
-The first boot of a fresh root runs iOS data migration once (an hour or more); later boots are quick. Day-to-day progress and the next steps are in [`NOTES.md`](NOTES.md).
+1. [Progress](#progress)
+2. [Being worked on now](#being-worked-on-now)
+3. [How it boots](#how-it-boots)
+4. [Getting started](#getting-started)
+5. [Boot options](#boot-options)
+6. [Firmware](#firmware)
+7. [Repository layout](#repository-layout)
+8. [Credits and license](#credits-and-license)
+
+---
+
+## Progress
+
+**Overall: `██████░░░░` 63%** (updated 2026-10-30)
+
+The percentages are rough estimates of how much of each part works on the phone today.
+
+| Area | Progress | Status | Details |
+| --- | --- | --- | --- |
+| Boot to the iOS home screen | `██████████` 100% | ✅ Works | Stock bootloader → `fastboot boot` shim → XNU → iOS root in `userdata` → lock screen, home screen, Control Center, Settings, app switcher, home gesture, wallpapers, widgets |
+| Touch | `█████████░` 95% | ✅ Works | Novatek NT36675 over SPI; its firmware is loaded at every boot |
+| Buttons | `██████████` 100% | ✅ Works | Power, volume up, volume down |
+| Wi-Fi | `█████████░` 95% | ✅ Works | QCA6390 with Linux's ath11k built into the kernel: scan, WPA2, saved networks, signal bars, on/off switch, internet in apps and Safari |
+| Bluetooth | `█████████░` 90% | ✅ Works | QCA6390 over UART at 921600 baud: on/off, scan, pairing (kept across reboots), music to headphones (A2DP), HFP and AVRCP |
+| Speakers | `████████░░` 85% | ✅ Works | Audio DSP + two CS35L41 amplifiers (drivers from hakios-apollo); an occasional crackle remains |
+| Vibration | `███████░░░` 75% | ✅ Works | AW8697 motor: taps and ringtone patterns; duty-cycle limits protect the motor |
+| GPU drawing | `███████░░░` 75% | ✅ Works | Adreno 650 runs Mesa (OpenGL ES 3.2, freedreno); iOS's CoreAnimation draws the whole UI on it through a bridge, blur and materials included |
+| CPU | `████████░░` 85% | 🧪 Testing | All 8 cores (or a chosen set with `cpumask`); a load-following clock governor with a temperature limit (xnu 0153) is built, not yet booted |
+| Smoothness (goal: 60 fps) | `██████░░░░` 65% | 🚧 In progress | 33–54 fps measured in normal use; the copy to the panel takes ~3.5 ms on its own thread; backboardd's GL work is the main cost |
+| Screen fit | `███████░░░` 70% | 🧪 Testing | iOS draws an iPhone X-sized picture; the default scales it by 0.96 with thin black bars; a full-panel 375×834-point mode (xnu 0152) is built, not yet booted |
+| Backlight / brightness | `███████░░░` 70% | 🧪 Testing | Smooth fade on lock/unlock works; the brightness slider (xnu 0154) is built, not yet booted |
+| Heat / power use | `████░░░░░░` 40% | 🧪 Testing | Cores were pinned at top speed; xnu 0153 adds a governor, a 75 °C limit and a memory-bus vote that drops when idle |
+| Microphone | `███░░░░░░░` 30% | ⏸️ Parked | The WCD938x codec comes up and iOS opens it, but the recording is silent |
+| Battery / charging status | `░░░░░░░░░░` 0% | ❌ Not started |  |
+| Sleep / standby | `░░░░░░░░░░` 0% | ❌ Not started | The panel goes dark when locked, but the phone never suspends |
+| USB, cameras, cellular, sensors, GPS, fingerprint | `░░░░░░░░░░` 0% | ❌ Not started |  |
+
+Status key: ✅ works on the phone · 🧪 built, waiting for a test boot · 🚧 in progress · ⏸️ parked · ❌ not started.
+
+The detailed engineering log, with every boot's results, is [`NOTES.md`](NOTES.md).
+
+---
+
+## Being worked on now
+
+| Patch | What it does | State |
+| --- | --- | --- |
+| **0152** | Full-panel mode: iOS draws 375×834 points, scaled by 0.96 onto the whole 1080×2400 panel (no bars, no stretching) | Built, not booted |
+| **0153** | CPU clocks follow the load, big cores are capped above 75 °C, the memory bus drops when idle, no screen refresh while the screen is off | Built, not booted |
+| **0154** | iOS's brightness slider drives the backlight (`AppleARMBacklight` service), with iOS's own fades | Built, not booted |
+| Next | Screen-type hooks if anything still looks off in full-panel mode; GPU clock scaling; frame-rate profiling; the microphone | Planned |
+
+---
 
 ## How it boots
 
 ```
 Xiaomi bootloader (unlocked)
-  -> fastboot boot shim-boot.img     (temporary; nothing is flashed to boot)
-     -> shim: loads XNU + Apple Device Tree + boot-args
-        -> XNU -> UFS driver -> iOS root (HFS+) in userdata
-           -> launchd -> daemons -> backboardd + SpringBoard
+  └─ fastboot boot shim-boot.img        temporary: nothing is flashed to boot
+     └─ shim                            loads XNU, an Apple Device Tree and boot options
+        └─ XNU kernel + drivers         UFS storage, display, touch, GPU, Wi-Fi, Bluetooth, audio …
+           └─ iOS root (HFS+)           in the userdata partition
+              └─ launchd → daemons → backboardd + SpringBoard → apps
 ```
 
-There is no serial port. The kernel draws its console on the bootloader's framebuffer and keeps a 4 MiB log at the end of `userdata`, readable from recovery.
+- **Nothing permanent is flashed** except the iOS root in `userdata`. Every boot is a temporary `fastboot boot`; rebooting without it starts Android's boot chain as usual.
+- **There is no serial port.** The kernel keeps a 4 MiB log at the end of `userdata`, read back from recovery with `tools/sweet-log-pull.sh`.
+- **The first boot of a new root** runs iOS's data migration once (an hour or more). Later boots take about a minute.
 
-## Build and boot
+---
 
-You need an **unlocked** phone, a Linux PC and a GitHub account (the kernel builds on GitHub's macOS runners). **Everything on `userdata` is lost.** Bootloaders, recovery, modem and persist are never touched.
+## Getting started
 
-**0. Back up the phone.** From a temporary recovery with adb, pull at least `persist`, `modemst1`, `modemst2`, `fsg`, `fsc`, `boot`, `dtbo` and `vbmeta`, and keep them out of git. Then extract the stock DTB for the shim:
+### What you need
+
+| | |
+| --- | --- |
+| Phone | Mi 10T / 10T Pro (`apollo`) with an **unlocked bootloader** |
+| Computer | Linux with `adb`, `fastboot`, `python3`, `aarch64-linux-gnu-gcc`, `mkbootimg`, and the GitHub CLI (`gh`) |
+| GitHub | The kernel and the iOS programs build on GitHub Actions' macOS runners |
+| Recovery | A recovery image with `adb` (OrangeFox works) at `recovery/recovery.img`, booted temporarily |
+
+> [!CAUTION]
+> Everything on `userdata` (Android's apps and files) is lost. Bootloaders, recovery, modem and `persist` are never touched.
+
+### Step 1: back up the phone
+
+From the temporary recovery, pull at least `persist`, `modemst1`, `modemst2`, `fsg`, `fsc`, `boot`, `dtbo` and `vbmeta`, and keep them out of git. Then extract the stock device tree for the shim:
 
 ```sh
 python3 tools/unpack_bootv2.py backup/boot.img dtb/boot_unpacked
 ```
 
-**1. Build the kernel and the phone programs** (on GitHub Actions):
+### Step 2: build the kernel and the iOS programs
 
 ```sh
-python3 tools/validate-repo.py                 # patch-series check, seconds
-gh workflow run xnu.yml                        # the kernel
-gh workflow run userland.yml                   # GPU tests, Mesa, CoreAnimation bridge
-gh run watch KERNEL_RUN_ID --exit-status     # wait for it (gh run list -w xnu.yml shows the ID)
-gh run download KERNEL_RUN_ID -n xnu-kernel -D xnu/out
+python3 tools/validate-repo.py               # checks the patch series in seconds
+gh workflow run xnu.yml                      # the kernel
+gh workflow run userland.yml                 # Mesa, the CoreAnimation bridge, GPU tests
+gh workflow run audio.yml                    # the audio plug-in
+gh workflow run bt.yml                       # the Bluetooth library
+gh run list -w xnu.yml                       # find the run ID, then:
+gh run watch RUN_ID --exit-status
+gh run download RUN_ID -n xnu-kernel -D xnu/out
 gh run download USERLAND_RUN_ID -n sweet-userland -D sweet-userland
+gh run download BT_RUN_ID -n sweet-bt -D sweet-bt
 ```
 
-**2. Build and flash the iOS root.** `tools/build-ios-root.sh` downloads the iPhone X IPSW's disk images, builds the root, adds the programs and (after asking) flashes it. Details: [`userland/README.md`](userland/README.md).
+### Step 3: build and install the iOS root
 
-**3. Get the firmware** (not in git). Touch firmware, from Xiaomi's kernel source:
+`tools/build-ios-root.sh` downloads the iPhone X IPSW's disk images, builds the root, adds the programs and, after asking, writes it to `userdata`. Details are in [`userland/README.md`](userland/README.md).
 
-```sh
-mkdir -p research/apollo-fw && cd research/apollo-fw
-curl -LO https://raw.githubusercontent.com/MiCode/Xiaomi_Kernel_OpenSource/apollo-q-oss/firmware/novatek_nt36675_j3s_fw01.bin.ihex
-objcopy -I ihex -O binary novatek_nt36675_j3s_fw01.bin.ihex novatek_nt36675_j3s_fw01.bin
-cd ../..
-```
+### Step 4: get the firmware
 
-GPU, Wi-Fi and Bluetooth firmware, from the phone (in recovery): `tools/pull-gpu-fw.sh`, `tools/pull-wifi-fw.sh` and `tools/pull-bt-fw.sh` (into `research/apollo-gpu/`, `research/apollo-wifi/` and `research/apollo-bt/`; `mkadt.py --bt-fw research/apollo-bt`). The audio DSP's comes out of the Wi-Fi pull's modem copy: `tools/pull-audio-fw.sh`. The vibration motor's waveforms and the microphone's calibration (Android's `/vendor`): `tools/pull-mic-haptic-fw.sh` (a one-boot list for `/usr/local/fw/`).
+The firmware comes from Xiaomi and Qualcomm and is never stored in git. See [Firmware](#firmware) for each file and the tool that fetches it.
 
-**4. Build the boot image** (needs `aarch64-linux-gnu-gcc` and `mkbootimg`):
+### Step 5: build the boot image and boot
 
 ```sh
 python3 tools/mkadt.py shim/out/apollo.adt --highmem \
     --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
     --gmu-fw research/apollo-gpu/a650_gmu.bin --sqe-fw research/apollo-gpu/a650_sqe.fw \
     --zap-mdt research/apollo-gpu/a650_zap.mdt --zap-seg research/apollo-gpu/a650_zap.b02 \
-    --wifi-fw research/apollo-wifi
+    --wifi-fw research/apollo-wifi --bt-fw research/apollo-bt \
+    --file /usr/local/lib/libsweet-gl.dylib=sweet-userland/lib/libsweet-gl.dylib \
+    --file /usr/local/lib/libsweet-bt.dylib=sweet-bt/lib/libsweet-bt.dylib \
+    --files-from tools/root-files/files.txt --files-from tools/root-files/bt-on.txt
 python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/apollo.adt shim/out/payload.bin \
-    --cmdline 'debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1'
-shim/build.sh ../shim/out/payload.bin          # -> shim/out/shim-boot.img
-```
-
-For the GPU-drawn GUI add `sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd` to `--cmdline` (the bridge library must be on the root), and for the Wi-Fi test `sweetwifi=11`.
-
-**5. Boot:**
-
-```sh
+    --cmdline 'debug=0xc serial=3 cpumask=0xf1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetgpulevel=6 sweetwifi=12 apollo_audio=5 apollo_sound_gain=0 apollo_sound_below=80 apollo_mic=4 apollo_haptic=5 sweetbt=6 sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd;/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool sweetnull=backboardd,SpringBoard,bluetoothd,BlueTool,mediaserverd'
+shim/build.sh ../shim/out/payload.bin        # → shim/out/shim-boot.img
 fastboot boot shim/out/shim-boot.img
 ```
 
-**6. Read the kernel log:**
+This is the full-featured setup: GPU-drawn UI at 60 Hz, Wi-Fi, Bluetooth, sound, vibration. For a minimal first boot, drop everything after `sweetfb_noconsole=1` and use `cpus=1` instead of `cpumask=0xf1`.
+
+> [!NOTE]
+> Sound, the audio plug-in and some firmware go onto the root with one-boot file lists (`--files-from …`). See [Firmware](#firmware) and `tools/root-files/`.
+
+### Step 6: read the kernel log
 
 ```sh
-fastboot boot recovery/recovery.img            # temporary recovery with adb
+fastboot boot recovery/recovery.img && adb wait-for-recovery
 tools/sweet-log-pull.sh logs/boot.txt
 adb reboot bootloader
 ```
 
 `tools/sweet-crash.py` turns crash reports in the log into function names.
 
-## Useful boot-args
+---
 
-| Boot-arg | Effect |
+## Boot options
+
+Boot options (boot-args) go in `--cmdline`. The most useful ones are below. Each driver's source in `xnu/patches/` documents the rest.
+
+### Core
+
+| Option | Effect |
 | --- | --- |
-| `cpus=N` | Cores to start (`cpus=1` is the safe fallback) |
-| `cpumask=M` | (xnu 0151) Instead of `cpus=`: the cores to start, bit n = ADT cpu n (0-3 A55, 4-6 A77, 7 the 2.84 GHz A77; bit 0 must be set), e.g. `0xf1` = core 0 + the four A77s; not together with `cpus=` |
-| `sweetfb_noconsole=1` | Don't draw kernel text over the GUI |
-| `sweetfb_hz=N` | How often the screen is updated (default 10; 60 for smooth animation) |
-| `ufslogsecs=1` | Flush the log every second (for hangs) |
-| `sweettouch=0`, `sweetkeys=0` | Turn off touch or buttons |
-| `sweetcpufreq=N` | Cap the CPU clock at N MHz (0 = leave as the bootloader set it) |
-| `sweetcpugov=0` | (xnu 0153) Every CPU domain at its top for good instead of the load-following governor (default on) |
-| `sweetthermal=T` | (xnu 0153) Lower the gold/prime (and at T+5 silver) cores' top clock while the hottest core sensor is over T °C (default 75; 0 = no limit) |
-| `sweetcpustats=N` | (xnu 0153) Every N s a `SWEET CPUFREQ` line: clocks, busiest core, temperatures, memory bus (default 10; 0 = never) |
-| `sweetddr=N` / `sweetddrlow=V` | (xnu 0148/0153) Memory bus vote: 0 none, 1 top while busy and V (default 0x800) when quiet (default), 2 always top |
-| `sweetgpu=22 sweetgpukeep=1` | Bring up the GPU and keep it on for programs |
-| `sweetgpulevel=N` | The GPU's speed: 1 = 305 MHz (the default) .. 6 = 587 MHz (its top; for the UI's frame rate) |
-| `sweetddr=0` | (xnu 0148) Leave the memory bus where the boot chain put it; by default it is voted to its top (`SWEET RPMH: THE MEMORY BUS IS VOTED TO ITS TOP: a core copies N MB/s (it was M)`) |
-| `sweetfb_fit=0` | (xnu 0150) Show the centre 1080x2400 of iOS's 1125x2436 picture 1:1 (cropped, as before) instead of the whole picture scaled by 24/25 with 31 black lines above and below; touch follows either way |
-| `sweetfb_height=N` | (xnu 0152) Present 1125xN instead of 1125x2436 (2400-2600). `2502` = 375x834 points, scaled by 24/25 onto the whole panel (no bars, one scale both ways); build the ADT with `mkadt.py --display-height N` and reset MobileGestalt's cache once (`tools/root-files/mgcache-reset.txt`) |
-| `apollo_backlight=P` | (xnu 0151) The panel's light (PM8150L WLED, hakios's driver; on by default): `0` leaves it alone (display off blanks at once), `P` 1-100 sets P%, absent keeps the firmware's level. Display off/on fades it out/in over `apollo_backlight_fade_ms` (default 300) |
-| `sweetbacklight=0` | (xnu 0154) No AppleARMBacklight service: iOS's brightness slider does not reach the WLED |
-| `sweetfb_stats=N` | (xnu 0148) Every N seconds (10; 0 never) `SWEET FB:` says how many frames iOS gave and how many reached the panel a second, the copy's time, and late or skipped vsyncs |
-| `sweetnull=A,B,...` | Copy what these programs print into the kernel log |
-| `sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd` | Load the CoreAnimation bridge (GPU drawing) into the window server |
-| `sweetgl=0` | Keep CoreAnimation's software renderer |
-| `sweetwifi=N` | Wi-Fi bring-up steps 1..12 (QCA6390: power, PCIe link, SMMU, firmware boot, QRTR, firmware handshake, board data + M3, calibration; 11 = Linux's ath11k driver brings the radio up, scans, and goes down again; 12 = the driver stays up as `en0` for iOS's Wi-Fi); needs `mkadt.py --wifi-fw research/apollo-wifi` from step 4 |
-| `sweetwifimac=aa:bb:cc:dd:ee:ff` | the radio's MAC address for `sweetwifi=11/12` (without it, a random locally administered one per boot) |
-| `sweetbt=N` | Bluetooth bring-up steps 1..6 (QCA6390 over the UART of serial engine 6: 1-3 clocks, pins, UART loopback; 4 the chip's ROM answers; 5 firmware, then an LE scan and a classic inquiry in the kernel; 6 the radio stays up for iOS's bluetoothd); needs `mkadt.py --bt-fw research/apollo-bt` from step 5 |
-| `apollo_audio=N` / `apollo_adsp_step=N` | the sound (xnu 0139: the drivers of the Mi 10T port [hakios-apollo](https://github.com/enesuzun2002/hakios-apollo)): 1 the audio DSP up; 2 the tertiary TDM port; 3 a test tone into a stream, amplifiers off; 4 the tone through the CS35L41 amplifiers, 20 dB under Android's level (`apollo_sound_below=` eighths of a dB, `apollo_sound_secs=`); 5 what iOS plays, through `/dev/apollo-audio`: needs the audio server's plug-in on the root once (`mkadt.py --files-from tools/root-files/audio-on.txt` with the `sweet-audio` artifact of `.github/workflows/audio.yml`; xnu 0140 moves iOS's VirtualAudio.plugin back for it; undo: `audio-off.txt`) and `mediaserverd` in `sweetnull` for the plug-in's own lines. `apollo_adsp_step=N`: the DSP's steps 1..N with a log of each. Needs the DSP's firmware on the root once: `tools/pull-audio-fw.sh` and `mkadt.py --files-from research/apollo-audio/files-adsp.txt` for one boot |
-| `apollo_sound_hold=N` | (xnu 0146) while iOS plays, a period the audio DSP hands back waits for a whole 20 ms of iOS's sound as long as more than N periods (default 3) are still queued, instead of being padded with silence (the speakers' stutter); 0 = the old way. Every 5 s while the amplifiers are on, `apollo sound: the feeder` says how many periods came out short, the queue's low point and how far apart iOS's writes came |
-| `apollo_mic=N` | the main microphone (xnu 0146: hakios-apollo's `hakios.apollo_mic.c`, the WCD938x codec over SoundWire, through the DSP; needs `apollo_audio=N`): 1 a look (clocks voted, registers read); 2 the codec brought up and enumerated, then put back; 3 a recording of `apollo_mic_secs` (default 10) with its level in the log; 4 the microphone for iOS (`/dev/hakios-mic`, the audio plug-in's "Codec" device: the path is up only while iOS records). `apollo_mic_path=1` (default) is Android's own recording path with Xiaomi's calibration from `tools/pull-mic-haptic-fw.sh` (falls back to 0, the plain path, without it); their recommended `apollo_mic_ns=1 apollo_mic_drc=0` |
-| `apollo_haptic=N` | the vibration motor (xnu 0146: hakios-apollo's `hakios.apollo_haptic.c`, an AW8697 on serial engine 11's I2C; starts 15 s into the boot): 1 a look; 2 reset released, registers read; 3 configured and Android's waveforms loaded (`aw8697_haptic.bin` from `tools/pull-mic-haptic-fw.sh`); 4 one effect played; 5 the motor for iOS (`/dev/apollo-haptic`, the audio plug-in's "Actuator"); its limits (xnu 0147): `apollo_haptic_max_ms` (one vibration, default 2000), `apollo_haptic_duty_ms` (driving in any 2 s, default 1800), `apollo_haptic_rest_ms` (after a cut, default 500). iOS plays haptics only with `/product/haptics` in the device tree (mkadt.py copies it from the iPhone X's) and, on a root made before that, MobileGestalt's cache removed once (`tools/root-files/mgcache-reset.txt`) |
+| `cpus=N` | Start N cores (`cpus=1` is the safe fallback) |
+| `cpumask=M` | Start the cores in mask M instead (bit n = core n: 0–3 small, 4–6 big, 7 prime). `0xf1` = core 0 + the four big cores. Not together with `cpus=` |
+| `ufslogsecs=1` | Write the log to storage every second (for hangs) |
+| `sweetnull=A,B,…` | Copy what these programs print into the kernel log |
+| `sweettouch=0`, `sweetkeys=0` | Turn off touch or the buttons |
 
-The other boot-args are described in their drivers' sources in `xnu/patches/` and in `NOTES.md`.
+### Display and backlight
 
-## Repository
-
-| Path | What |
+| Option | Effect |
 | --- | --- |
-| `shim/` | Boot shim, packed as an Android boot image |
-| `xnu/patches/` | The kernel patches (0001–0154), applied in order by CI |
-| `wifi/` | HackiOS's Linux layer for the Wi-Fi driver; CI builds Linux's ath11k on it and links it into the kernel |
-| `userland/` | Programs and libraries for the phone: GPU tests, Mesa, the CoreAnimation bridge |
-| `tools/` | Device tree builder, payload packer, iOS root builder, log and crash tools |
-| `NOTES.md` | Engineering log and current handoff |
+| `sweetfb_hz=N` | Screen refreshes a second (default 10; use 60) |
+| `sweetfb_noconsole=1` | Don't draw kernel text over the UI |
+| `sweetfb_fit=0` | Crop the iPhone X picture instead of scaling it to fit |
+| `sweetfb_height=2502` | Full-panel mode (0152): build the device tree with `mkadt.py --display-height 2502` and add `--files-from tools/root-files/mgcache-reset.txt` on the first boot |
+| `sweetfb_native=1` | iOS draws at 1080×2400 1:1 (360×800 points; iOS shows a red status bar). Needs `mkadt.py --native-display` |
+| `sweetfb_stats=N` | Every N s, a `SWEET FB` line with frames a second and copy time (default 10) |
+| `apollo_backlight=P` | Backlight: `0` leave it alone, `1`–`100` set a level, absent = keep the bootloader's level |
+| `apollo_backlight_fade_ms=N` | Lock/unlock fade length (default 300) |
+| `sweetbacklight=0` | Don't offer the backlight to iOS (the brightness slider does nothing) |
 
-`sweet` / `SWEET` is the kernel's internal machine-config name; it shows up in file, tool and boot-arg names.
+### CPU, memory and heat
 
-Not in git: partition backups, device trees, recovery images, firmware, Apple's files and logs (device serials, calibration data, copyrighted files).
+| Option | Effect |
+| --- | --- |
+| `sweetcpugov=0` | Pin every core at top speed (the old way) instead of following the load |
+| `sweetcpufreq=N` | Cap the CPU clock at N MHz |
+| `sweetthermal=T` | Slow the big cores while the hottest core is over T °C (default 75; 0 = no limit) |
+| `sweetcpustats=N` | Every N s, a `SWEET CPUFREQ` line: clocks, load, temperatures (default 10) |
+| `sweetddr=N` | Memory bus: `0` leave it alone, `1` follow the load (default), `2` always at top |
+| `sweetddrlow=V` | The memory bus's idle level (default `0x800`); raise it if the screen flickers when idle |
 
-## Credits
+### GPU
 
-Apple's open-source releases (xnu, IOHIDFamily, libpthread, hfs), [BearSSL](https://bearssl.org), [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw), [Mesa](https://mesa3d.org), [hakios-apollo](https://github.com/enesuzun2002/hakios-apollo) (the Mi 10T's sound), [HackiOS](https://github.com/oosexgang/hackios-xnu-kernel) (the Mesa and CoreAnimation approach, the Wi-Fi layer) and its [Xiaomi Mi 10 port](https://github.com/JopangJovan/hackios-xnu-kernel-umi) (the QCA6390 bring-up), Linux's ath11k driver and FreeBSD's LinuxKPI (fetched when CI builds the kernel, not kept here), Xiaomi's published kernel source and [OrangeFox Recovery](https://orangefox.download). iOS itself is Apple's and is not distributed here.
+| Option | Effect |
+| --- | --- |
+| `sweetgpu=22 sweetgpukeep=1` | Bring the GPU up and keep it on for iOS |
+| `sweetgpulevel=N` | GPU speed: `1` = 305 MHz (default) … `6` = 587 MHz (best frame rate) |
+| `sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd` | Load the CoreAnimation bridge so iOS draws on the GPU |
+| `sweetgl=0` | Keep iOS's software renderer |
+
+### Wi-Fi and Bluetooth
+
+| Option | Effect |
+| --- | --- |
+| `sweetwifi=12` | Wi-Fi for iOS (1–11 are bring-up test steps) |
+| `sweetwifimac=aa:bb:cc:dd:ee:ff` | Fixed Wi-Fi address (default: random each boot) |
+| `sweetbt=6` | Bluetooth for iOS (1–5 are test steps); needs the `bt-on.txt` list and the `libsweet-bt` injection |
+
+### Sound, vibration and microphone
+
+| Option | Effect |
+| --- | --- |
+| `apollo_audio=5` | Speakers for iOS (1–4 are test steps); needs the audio plug-in on the root once (`--files-from tools/root-files/audio-on.txt`) |
+| `apollo_sound_below=N` | Volume ceiling below Android's level, in eighths of a dB (default 160 = 20 dB) |
+| `apollo_sound_gain=N` | Pre-gain of the limiter, in eighths of a dB (default 96; `0` avoids crackle) |
+| `apollo_haptic=5` | Vibration motor for iOS (1–4 are test steps) |
+| `apollo_haptic_max_ms=N` | Longest single vibration (default 2000) |
+| `apollo_mic=4` | Microphone for iOS (1–3 are test steps); `apollo_mic_path=0` uses the plain path without Xiaomi's tuning |
+
+---
+
+## Firmware
+
+None of these files are in git. Each tool runs with the phone in the temporary recovery.
+
+| Part | Files | How to get them | Goes to |
+| --- | --- | --- | --- |
+| Touch | `novatek_nt36675_j3s_fw01.bin` | Xiaomi's kernel source: `curl` the `.ihex` from `MiCode/Xiaomi_Kernel_OpenSource` (branch `apollo-q-oss`, `firmware/`), then `objcopy -I ihex -O binary` | `research/apollo-fw/` |
+| GPU | `a650_gmu.bin`, `a650_sqe.fw`, `a650_zap.*` | `tools/pull-gpu-fw.sh` | `research/apollo-gpu/` |
+| Wi-Fi | `amss20.bin`, `m3.bin`, `regdb.bin`, `bd_j3sgl.elf` | `tools/pull-wifi-fw.sh` | `research/apollo-wifi/` |
+| Bluetooth | `htbtfw20.tlv`, `htnv20.bin` | `tools/pull-bt-fw.sh` | `research/apollo-bt/` |
+| Audio DSP | `adsp.mdt`, `adsp.b00` … | `tools/pull-audio-fw.sh` (writes a one-boot file list) | onto the root |
+| Vibration and microphone tuning | `aw8697_haptic.bin`, the ACDB-derived `mic_*.bin` | `tools/pull-mic-haptic-fw.sh` (writes a one-boot file list) | onto the root |
+
+---
+
+## Repository layout
+
+| Path | What's inside |
+| --- | --- |
+| `xnu/patches/` | The kernel: patches 0001–0154 on Apple's xnu-8796, applied in order by CI |
+| `shim/` | The boot shim, packed as an Android boot image |
+| `wifi/` | The Linux compatibility layer the Wi-Fi driver (ath11k) is built on |
+| `userland/` | Programs for the phone: Mesa, the CoreAnimation bridge, the audio plug-in, the Bluetooth library, GPU tests ([details](userland/README.md)) |
+| `tools/` | Device tree builder, boot packer, iOS root builder, firmware pullers, log and crash tools |
+| `tools/root-files/` | One-boot file lists that add, move or remove files on the iOS root |
+| `.github/workflows/` | CI: the kernel, the iOS programs, and an analysis job for iOS's system libraries (nothing from Apple is stored) |
+| `NOTES.md` | The engineering log: every boot's result, current state, next steps |
+
+`sweet` / `SWEET` is the kernel's internal machine name; you'll see it in file, tool and option names.
+
+Kept out of git: partition backups, device dumps, firmware, Apple's files, serial numbers and logs.
+
+---
+
+## Credits and license
+
+Built on:
+- **Apple's open-source releases:** xnu, IOHIDFamily, libpthread, hfs.
+- **[hakios-apollo](https://github.com/enesuzun2002/hakios-apollo):** the Mi 10T's sound, microphone, vibration and backlight drivers, and the audio plug-in.
+- **[HackiOS](https://github.com/oosexgang/hackios-xnu-kernel):** the Mesa and CoreAnimation approach and the Wi-Fi layer.
+  - Its [Xiaomi Mi 10 port](https://github.com/JopangJovan/hackios-xnu-kernel-umi): the QCA6390 bring-up.
+- **ios-spes and ios-sailfish:** the brightness service design.
+- **Build and analysis tools:** [blacktop/darwin-xnu-build](https://github.com/blacktop/darwin-xnu-build), [ipsw](https://github.com/blacktop/ipsw).
+- **Graphics:** [Mesa](https://mesa3d.org).
+- **Other code:** [BearSSL](https://bearssl.org); Linux's ath11k driver and FreeBSD's LinuxKPI (fetched at build time, not kept here).
+- **Phone software:** Xiaomi's published kernel source; [OrangeFox Recovery](https://orangefox.download).
+
+iOS itself belongs to Apple and is not distributed here.
 
 MIT License, see [`LICENSE`](LICENSE).
