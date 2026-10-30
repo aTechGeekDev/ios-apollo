@@ -1,0 +1,401 @@
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2851,3 +2851,121 @@
+ 	return true;
+ }
+ #endif /* SWEET */
++
++#if defined(SWEET)
++#include <kern/task.h>
++#include <sys/bsdtask_info.h>          /* MAXTHREADNAMESIZE */
++
++extern char *proc_name_address(void *p);
++
++/*
++ * (xnu 0155) A "top" for sweet_cpufreq.c: the threads that ran most since the last call, with their process and
++ * thread names and the share of one core each had, into `out` (one line). Every thread's run time
++ * (recount_thread_time_mach: user + system) is remembered by thread id in a small table from one call to the
++ * next; a thread first seen counts with its whole run time. The idle threads are left out. Unnamed kernel
++ * threads show the event they were waiting on, unslid (a static variable of their driver: tools/sweet-symbolicate.sh
++ * or nm on the kernel names it). Called every few seconds from one thread; walks the thread list under
++ * tasks_threads_lock (as processor_info's callers do).
++ */
++#define SWEET_TOP_SLOTS         4096u
++#define SWEET_TOP_SHOWN         8u
++static struct {
++	uint64_t tid, last;
++	uint32_t gen;
++} sweet_top_seen[SWEET_TOP_SLOTS];
++static uint32_t sweet_top_gen;
++
++void sweet_cpu_top(char *out, size_t size, uint64_t window_abs);
++
++void
++sweet_cpu_top(char *out, size_t size, uint64_t window_abs)
++{
++	struct {
++		uint64_t delta;
++		char who[56];
++	} best[SWEET_TOP_SHOWN];
++	thread_t thread;
++	unsigned threads_seen = 0;
++	int at = 0;
++
++	bzero(best, sizeof(best));
++	if (++sweet_top_gen == 0) {
++		sweet_top_gen = 1;
++	}
++	lck_mtx_lock(&tasks_threads_lock);
++	queue_iterate(&threads, thread, thread_t, threads) {
++		bool idle = (thread->state & TH_IDLE) != 0;
++		uint64_t now, delta = 0;
++		uint32_t slot = (uint32_t)(thread->thread_id * 0x9e3779b1u) % SWEET_TOP_SLOTS, free_slot = 0xffffffffu;
++		bool found = false;
++
++		for (unsigned i = 0; i < topology_info.num_cpus && !idle; i++) {
++			idle = processor_array[i] != PROCESSOR_NULL && processor_array[i]->idle_thread == thread;
++		}
++		if (idle) {
++			continue;
++		}
++		threads_seen++;
++		now = recount_thread_time_mach(thread);
++		for (unsigned probe = 0; probe < 16; probe++, slot = (slot + 1) % SWEET_TOP_SLOTS) {
++			if (sweet_top_seen[slot].gen != 0 && sweet_top_seen[slot].tid == thread->thread_id) {
++				found = true;
++				break;
++			}
++			/* free: never used, or not seen in this call nor the last (its thread has gone) */
++			if (free_slot == 0xffffffffu && (sweet_top_seen[slot].gen == 0 ||
++			    (sweet_top_seen[slot].gen != sweet_top_gen && sweet_top_seen[slot].gen != sweet_top_gen - 1))) {
++				free_slot = slot;
++			}
++		}
++		if (found) {
++			delta = now - sweet_top_seen[slot].last;
++		} else if (sweet_top_gen > 1) {
++			delta = now;
++		}
++		if (!found && free_slot != 0xffffffffu) {
++			slot = free_slot;
++			found = true;
++			sweet_top_seen[slot].tid = thread->thread_id;
++		}
++		if (found) {
++			sweet_top_seen[slot].last = now;
++			sweet_top_seen[slot].gen = sweet_top_gen;
++		}
++
++		/* into the list of the busiest, in order */
++		unsigned place = SWEET_TOP_SHOWN;
++		while (place > 0 && delta > best[place - 1].delta) {
++			place--;
++		}
++		if (place == SWEET_TOP_SHOWN || delta == 0) {
++			continue;
++		}
++		memmove(&best[place + 1], &best[place], sizeof(best[0]) * (SWEET_TOP_SHOWN - 1 - place));
++		best[place].delta = delta;
++
++		task_t task = get_threadtask(thread);
++		void *proc = task != TASK_NULL ? get_bsdtask_info(task) : NULL;
++		const char *pname = proc != NULL ? proc_name_address(proc) : "?";
++		char tname[MAXTHREADNAMESIZE];
++		tname[0] = '\0';
++		thread_get_thread_name(thread, tname);
++		tname[MAXTHREADNAMESIZE - 1] = '\0';
++		if (tname[0] != '\0') {
++			snprintf(best[place].who, sizeof(best[place].who), "%s/%s", pname, tname);
++		} else if (task == kernel_task && thread->wait_event != 0) {
++			snprintf(best[place].who, sizeof(best[place].who), "%s/ev %#lx", pname,
++			    (unsigned long)VM_KERNEL_UNSLIDE((vm_offset_t)thread->wait_event));
++		} else {
++			snprintf(best[place].who, sizeof(best[place].who), "%s/#%llu", pname, thread->thread_id);
++		}
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++
++	at = snprintf(out, size, "%u threads;", threads_seen);
++	for (unsigned i = 0; i < SWEET_TOP_SHOWN && best[i].delta != 0 && at > 0 && (size_t)at < size; i++) {
++		at += snprintf(out + at, size - (size_t)at, " %s %llu%%", best[i].who,
++		    window_abs != 0 ? best[i].delta * 100 / window_abs : 0);
++	}
++}
++#endif /* SWEET */
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -34,6 +34,9 @@
+  *     a second with every core under 25% busy.
+  *   - Every 10 s (sweetcpustats=N s, 0: never) a line: each domain's average clock and busiest core's
+  *     average share, the hottest sensor, the cap if lowered, the memory bus's share of time at the top.
++ * (xnu 0155) With the stats line a "top": `SWEET TOP: N s: T threads; process/thread P% ...`, the eight threads
++ * that ran most in the window (share of one core; unnamed kernel threads by the unslid event they wait on).
++ * Boot 86 showed cores 40-70% busy with the display off: this says who. sweettop=0: no top line.
+  * Boot-arg sweetcpugov=0: the old way, every domain at its top (or the sweetcpufreq cap) for good.
+  * The governor starts 15 s into the boot (the boot itself at the top).
+  */
+@@ -48,6 +51,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern bool sweet_cpu_sample(unsigned int cpu, uint32_t *mpidr, uint64_t *idle_abs);    /* machine_routines.c */
+ extern int sweet_rpmh_ddr_set(bool top);                                                /* sweet_rpmh.c */
++extern void sweet_cpu_top(char *out, size_t size, uint64_t window_abs);                 /* machine_routines.c (0155) */
+ void sweet_cpufreq_init(void);
+ 
+ #define CPUFREQ_DOMAIN_PA(d)  (0x18591000u + 0x1000u * (d))
+@@ -197,7 +201,7 @@
+ static void
+ cpufreq_governor(__unused void *arg, __unused wait_result_t result)
+ {
+-	uint32_t limit = 75, stats_s = 10;
++	uint32_t limit = 75, stats_s = 10, top = 1;
+ 	uint64_t idle_prev[GOV_CPUS] = { 0 }, at_prev = 0, period_abs, stats_abs, stats_since;
+ 	bool have_prev[GOV_CPUS] = { false };
+ 	unsigned samples = 0, quiet = 0, ddr_top_samples = 0, stat_samples = 0;
+@@ -205,6 +209,7 @@
+ 
+ 	(void)PE_parse_boot_argn("sweetthermal", &limit, sizeof(limit));
+ 	(void)PE_parse_boot_argn("sweetcpustats", &stats_s, sizeof(stats_s));
++	(void)PE_parse_boot_argn("sweettop", &top, sizeof(top));
+ 	nanoseconds_to_absolutetime((uint64_t)GOV_PERIOD_MS * NSEC_PER_MSEC, &period_abs);
+ 	nanoseconds_to_absolutetime((uint64_t)stats_s * NSEC_PER_SEC, &stats_abs);
+ 	delay_for_interval(GOV_START_S * 1000, NSEC_PER_MSEC);
+@@ -328,6 +333,11 @@
+ 			}
+ 			printf("SWEET CPUFREQ: %u s: %s; hottest core %s (sensor %u), GPU %s; memory bus at its top %u%% of the time\n",
+ 			    stats_s, line, temp, which, gpu, ddr_top_samples * 100 / stat_samples);
++			if (top) {
++				static char top_line[700];
++				sweet_cpu_top(top_line, sizeof(top_line), now - stats_since);
++				printf("SWEET TOP: %u s: %s\n", stats_s, top_line);
++			}
+ 			stats_since = now;
+ 			stat_samples = ddr_top_samples = 0;
+ 		}
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -52,6 +52,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
++extern int sweet_display_dark;  /* (xnu 0155) SweetFramebuffer.cpp: the display is off and dark */
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
+ 
+@@ -943,8 +944,9 @@
+ 		}
+ 		if (++looks == 30000u / poll_ms)
+ 			printf("SWEET TOUCH: in the first 30 s of reports: %u edges latched, %u reads\n", edges, reads);
+-		/* every poll_ms while healthy; back off to 1 s while transfers keep failing */
+-		touch_wait_ms(st.errors > 10 ? 1000 : poll_ms);
++		/* every poll_ms while healthy; back off to 1 s while transfers keep failing; (0155) every 100 ms while the
++		 * display is dark (a tap still wakes it; 250 SPI reads a second for nothing kept a core busy) */
++		touch_wait_ms(st.errors > 10 ? 1000 : sweet_display_dark ? 100 : poll_ms);
+ 	}
+ stop:
+ 	printf("SWEET TOUCH: stopped after stage %u (sweettouchstage=N for more)\n", st.stage);
+--- a/bsd/dev/sweet_backlight.c
++++ b/bsd/dev/sweet_backlight.c
+@@ -146,7 +146,7 @@
+ 
+ /* `count` (1 to 4) bytes into the registers from `reg` on; NULL, or what went wrong */
+ static const char *
+-spmi_write(const struct peripheral *p, uint8_t reg, const uint8_t *bytes, uint32_t count)
++spmi_write_once(const struct peripheral *p, uint8_t reg, const uint8_t *bytes, uint32_t count)
+ {
+ 	vm_offset_t channel = p->writes;
+ 	uint64_t start = mach_absolute_time(), interval;
+@@ -169,6 +169,21 @@
+ 	return NULL;
+ }
+ 
++/* (xnu 0155) a write tried up to three times: the arbiter drops one now and then (boot 86: "the transfer was dropped") */
++static const char *
++spmi_write(const struct peripheral *p, uint8_t reg, const uint8_t *bytes, uint32_t count)
++{
++	const char *problem = NULL;
++
++	for (unsigned attempt = 0; attempt < 3; attempt++) {
++		if ((problem = spmi_write_once(p, reg, bytes, count)) == NULL) {
++			break;
++		}
++		delay(50);
++	}
++	return problem;
++}
++
+ /* the peripheral's channel: the first, unless a later one is this system's (as Linux chooses) */
+ static bool
+ find_channel(struct peripheral *p, uint32_t channels)
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -58,6 +58,14 @@
+  * 375 points, so iOS keeps the iPhone X's layouts across (status bar, Control
+  * Center); only the height is the panel's.
+  *
++ * (xnu 0155) The scaling blends instead of picking the nearest pixel (boot 86:
++ * text and rounded corners looked ragged: nearest-pixel 24/25 drops one column
++ * and one line in 25): each panel pixel is the 2x2 blend of the four presented
++ * pixels around its place (bilinear), done as integer arithmetic two channels
++ * at a time (no NEON in the kernel): a line blended between its two source
++ * lines first, then across. More work per frame on the present thread (the
++ * SWEET FB line's copy time says how much); sweetfb_smooth=0: nearest pixel.
++ *
+  * (xnu 0154) The brightness slider: an AppleARMBacklight service under AppleCLCD,
+  * as ios-sailfish 0168 / ios-spes 0145 (same iOS 16.7 and iPhone X identity;
+  * their slider works with it): CoreBrightness (backboardd) takes the service
+@@ -86,6 +94,7 @@
+ extern "C" bool apollo_backlight_fade(bool on, bool wait);      /* bsd/dev/sweet_backlight.c (xnu 0151) */
+ extern "C" void apollo_backlight_brightness(uint32_t value, uint32_t ms);       /* (xnu 0154) */
+ extern "C" uint32_t apollo_backlight_value(void);                               /* (xnu 0154) */
++extern "C" { int sweet_display_dark; }  /* (xnu 0155) off and blanked: sweet_touch.c polls slowly */
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -183,12 +192,17 @@
+ 	uint32_t      fFitHeight;               /* the lines it takes, scaled (0152: may be more than the panel's) */
+ 	uint32_t      fFitTop, fFitEnd;         /* (0152) the panel lines it shows: [fFitTop, fFitEnd) */
+ 	uint32_t     *fXMap;                    /* a panel column's source column, for one layer */
++	uint8_t      *fXWeight;                 /* (0155) and how much of the next column, of 256 (smooth) */
++	uint32_t     *fLine;                    /* (0155) a source line blended between two, for one layer (smooth) */
++	bool          fSmooth;                  /* (0155) sweetfb_smooth, default 1 */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	bool present(const uint8_t *rec);
++	void presentSmooth(uint64_t base, uint64_t row, int32_t sx, int32_t w, int32_t dy, int32_t h,
++	    uint32_t px0, uint32_t px1, uint32_t py0, uint32_t py1);     /* (0155) */
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -401,6 +415,12 @@
+ 	if (fFit && fXMap == NULL) {
+ 		fFit = false;
+ 	}
++	/* (0155) blended, not nearest */
++	int smooth = 1;
++	PE_parse_boot_argn("sweetfb_smooth", &smooth, sizeof(smooth));
++	fXWeight = fFit && smooth ? (uint8_t *)IOMallocData(fWidth) : NULL;
++	fLine = fFit && smooth ? (uint32_t *)IOMallocData((fLogicalW + 4) * sizeof(uint32_t)) : NULL;
++	fSmooth = fXWeight != NULL && fLine != NULL;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -581,6 +601,7 @@
+ 				}
+ 			}
+ 			IOLockLock(fLock);
++			sweet_display_dark = fPowerOff ? 1 : 0;        /* (0155) */
+ 			continue;
+ 		}
+ 		if (fPowerOff) {
+@@ -631,6 +652,80 @@
+ 	}
+ }
+ 
++/* (xnu 0155) p..q by w of 256, each channel; two channels at a time in 16-bit lanes (0xff * 256 fits) */
++static inline uint32_t
++sweet_mix(uint32_t p, uint32_t q, uint32_t w)
++{
++	uint32_t v = 256 - w;
++	uint32_t rb = (((p & 0x00ff00ffu) * v + (q & 0x00ff00ffu) * w) >> 8) & 0x00ff00ffu;
++	uint32_t ag = (((p >> 8) & 0x00ff00ffu) * v + ((q >> 8) & 0x00ff00ffu) * w) & 0xff00ff00u;
++	return rb | ag;
++}
++
++/* the same for two pixels at once */
++static inline uint64_t
++sweet_mix2(uint64_t p, uint64_t q, uint64_t w)
++{
++	const uint64_t m = 0x00ff00ff00ff00ffull;
++	uint64_t v = 256 - w;
++	uint64_t rb = (((p & m) * v + (q & m) * w) >> 8) & m;
++	uint64_t ag = (((p >> 8) & m) * v + ((q >> 8) & m) * w) & ~m;
++	return rb | ag;
++}
++
++/*
++ * (xnu 0155) One layer scaled by 24/25 onto panel columns [px0, px1) and lines [py0, py1), blended: for each panel
++ * line its place in the layer is (py - band) * 25/24 = line + fraction/24; the two lines are blended into fLine
++ * (two pixels at a time; not at all when the fraction is 0), then each panel pixel blends fLine's column fXMap[i]
++ * with the next by fXWeight[i]. `base` is the layer's first byte, `row` its bytes a line, sx/w its columns, dy/h its
++ * place and lines (as present()); `base` already at the layer's first line (sy).
++ */
++void
++AppleCLCD::presentSmooth(uint64_t base, uint64_t row, int32_t sx, int32_t w, int32_t dy, int32_t h,
++    uint32_t px0, uint32_t px1, uint32_t py0, uint32_t py1)
++{
++	uint32_t n = px1 - px0;
++	if (n == 0) {
++		return;
++	}
++	/* the source columns the panel's take: fXMap[0] .. fXMap[n - 1] + 1 (at most the layer's last), from an even one */
++	uint32_t c0 = fXMap[0] & ~1u, c1 = fXMap[n - 1] + 1;
++	if (c1 > (uint32_t)(sx + w - 1)) {
++		c1 = (uint32_t)(sx + w - 1);
++	}
++	for (uint32_t py = py0; py < py1; py++) {
++		int32_t at = ((int32_t)py - fFitBand) * SWEET_FB_FIT_DEN;
++		int32_t ys = at / SWEET_FB_FIT_NUM - dy;
++		uint32_t fraction = (uint32_t)(at % SWEET_FB_FIT_NUM);
++		int32_t ya = ys < 0 ? 0 : ys >= h ? h - 1 : ys;
++		int32_t yb = ya + 1 < h ? ya + 1 : ya;
++		uint32_t wy = yb == ya ? 0 : fraction * 256 / SWEET_FB_FIT_NUM;
++		const uint32_t *a = (const uint32_t *)(base + (uint64_t)ya * row);
++		const uint32_t *line = a;
++
++		if (wy != 0) {
++			const uint32_t *b = (const uint32_t *)(base + (uint64_t)yb * row);
++			uint32_t c = c0;
++			for (; c + 1 <= c1; c += 2) {
++				uint64_t pa, pb;
++				memcpy(&pa, a + c, 8);
++				memcpy(&pb, b + c, 8);
++				uint64_t mixed = sweet_mix2(pa, pb, wy);
++				memcpy(fLine + c, &mixed, 8);
++			}
++			if (c == c1) {          /* an odd one at the end: never a read past the layer's last column */
++				fLine[c] = sweet_mix(a[c], b[c], wy);
++			}
++			line = fLine;
++		}
++		uint32_t *to = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes) + px0;
++		for (uint32_t i = 0; i < n; i++) {
++			uint32_t x = fXMap[i], wx = fXWeight[i];
++			to[i] = wx == 0 ? line[x] : sweet_mix(line[x], line[x + 1], wx);
++		}
++	}
++}
++
+ void
+ AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
+ {
+@@ -803,6 +898,17 @@
+ 				for (uint32_t px = px0; px < px1; px++) {
+ 					int32_t xs = (int32_t)(px * SWEET_FB_FIT_DEN / SWEET_FB_FIT_NUM) - dx;
+ 					fXMap[px - px0] = (uint32_t)(sx + (xs < 0 ? 0 : xs >= w ? w - 1 : xs));
++					if (fSmooth) {
++						/* (0155) px * 25 = 24 * column + fraction: the fraction (of 24) of the next column */
++						uint32_t fraction = px * SWEET_FB_FIT_DEN % SWEET_FB_FIT_NUM;
++						fXWeight[px - px0] = xs < 0 || xs + 1 >= w ? 0 :
++						    (uint8_t)(fraction * 256 / SWEET_FB_FIT_NUM);
++					}
++				}
++				if (fSmooth && (uint32_t)(sx + w) <= fLogicalW + 2) {
++					presentSmooth(src + start + (uint64_t)sy * row, row, sx, w, dy, h, px0, px1, py0, py1);
++					s->release();
++					continue;
+ 				}
+ 				for (uint32_t py = py0; py < py1; py++) {
+ 					int32_t ys = ((int32_t)py - fFitBand) * SWEET_FB_FIT_DEN / SWEET_FB_FIT_NUM - dy;
+@@ -1000,6 +1106,9 @@
+ 				fFB->fFadeStep = 0;
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 				fFB->fLightWanted = !off;       /* (0151) and then the light */
++				if (!off) {
++					sweet_display_dark = 0;
++				}
+ 				fFB->fPresentWanted = true;
+ 				IOLockWakeup(fFB->fLock, &fFB->fPresentWanted, true);
+ 			}

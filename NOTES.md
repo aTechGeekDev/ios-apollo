@@ -2,6 +2,18 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 86 (2026-10-30, kernel 41076836732 = 0154, full-panel 2502): brightness slider WORKS; still hot; text/corners look ragged -> xnu 0155 <<<
+
+**Observed (log + user):** `SWEET BL: backboardd sets brightness 241 ... 92 (fade 0 ms)` as the slider moved; user: "brightness works". Two `apollo backlight: the brightness is not taken: the transfer was dropped` (SPMI drop). Full-panel 375x834 mode ran (no complaint about bars); user: "the output on the display is a bit weird now especially on rounded corners and text" (nearest-pixel 24/25: one column and line in 25 dropped). fps 19-54 (`SWEET FB`), "waited for the GPU" up to 646 per 10 s, copy 3.5-4.3 ms.
+**Heat, measured:** `SWEET CPUFREQ` in use: silver 1804 MHz busiest 80-100%, gold ~2.1-2.3 GHz busiest 63-100%, prime ~2.1-2.6 GHz; hottest core 64-79 C (sensors 10/12 = gold/prime), GPU 55-62 C; the 75 C cap engaged most windows; memory bus at its top 100% of the time. **With the display off (~1 min): silver busiest 70%, gold 63%, prime 40%, cores still 1.5-2.3 GHz** = something keeps ~1.5-2 cores busy all the time; the governor has nothing idle to save. Cause unknown (guesses: our polling kernel threads -- touch reads SPI every 4 ms around the clock --, a userland daemon in a loop).
+**xnu 0155 (`0155-apollo-top-smooth-scale-touch-idle.patch`):**
+- machine_routines.c `sweet_cpu_top()`: a kernel "top": every thread's run time (recount_thread_time_mach) remembered by thread id (4096-slot table) between calls, under tasks_threads_lock; the 8 that ran most, as process/thread name (unnamed kernel threads: `kernel_task/ev 0x...` = the unslid event they wait on, for nm/symbolicate) with % of one core. sweet_cpufreq.c prints it with the stats line: `SWEET TOP: 10 s: N threads; name P% ...` (`sweettop=0` off).
+- sweet_touch.c: polls every 100 ms instead of 4 while the display is off and dark (`sweet_display_dark`, set by SweetFramebuffer after the blank, cleared on power-on).
+- SweetFramebuffer.cpp: bilinear 24/25 scaling (`presentSmooth`): per panel line the two source lines blended into a line buffer (2 pixels per 64-bit SWAR op, skipped when the fraction is 0), then per pixel the two columns (32-bit SWAR, weights of 256 precomputed per column); `sweetfb_smooth=0` = nearest. Blend math checked on the host against a per-channel reference: 0 mismatches in 2M random pairs (both widths). Cost: more copy time per frame (the SWEET FB line will say; guess 5-7 ms vs 3.5-4).
+- sweet_backlight.c: SPMI writes retried up to 3 times (50 us apart).
+**Checks:** validate-repo 155 OK; series reproduces the 4 series-created files; sweet_cpufreq.c / sweet_backlight.c compile against stubs. machine_routines.c / SweetFramebuffer.cpp only by CI.
+**Next, from the SWEET TOP lines:** fix whatever burns the idle cores; then the GPU doing the scaling (no CPU copy: hakios's apollo_gpu_present/page-flip path) for both heat and fps.
+
 ### >>> README rewritten (2026-10-30, commit 6ceff1d; user: "rework the readme.md from scratch, make it simple organized and detailed with progress bars") <<<
 
 Per-area progress bars (my estimates: see the table; overall 63%), "being worked on now" (0152-0154 built, not booted), getting started, boot options grouped by subsystem, firmware table. Keep its Progress table and "Being worked on now" current with each boot.

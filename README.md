@@ -24,7 +24,7 @@ Apple's open-source XNU kernel (xnu-8796), patched for this phone, boots the **u
 
 ## Progress
 
-**Overall: `██████░░░░` 63%** (updated 2026-10-30)
+**Overall: `██████░░░░` 65%** (updated 2026-10-30)
 
 The percentages are rough estimates of how much of each part works on the phone today.
 
@@ -38,11 +38,11 @@ The percentages are rough estimates of how much of each part works on the phone 
 | Speakers | `████████░░` 85% | ✅ Works | Audio DSP + two CS35L41 amplifiers (drivers from hakios-apollo); an occasional crackle remains |
 | Vibration | `███████░░░` 75% | ✅ Works | AW8697 motor: taps and ringtone patterns; duty-cycle limits protect the motor |
 | GPU drawing | `███████░░░` 75% | ✅ Works | Adreno 650 runs Mesa (OpenGL ES 3.2, freedreno); iOS's CoreAnimation draws the whole UI on it through a bridge, blur and materials included |
-| CPU | `████████░░` 85% | 🧪 Testing | All 8 cores (or a chosen set with `cpumask`); a load-following clock governor with a temperature limit (xnu 0153) is built, not yet booted |
-| Smoothness (goal: 60 fps) | `██████░░░░` 65% | 🚧 In progress | 33–54 fps measured in normal use; the copy to the panel takes ~3.5 ms on its own thread; backboardd's GL work is the main cost |
-| Screen fit | `███████░░░` 70% | 🧪 Testing | iOS draws an iPhone X-sized picture; the default scales it by 0.96 with thin black bars; a full-panel 375×834-point mode (xnu 0152) is built, not yet booted |
-| Backlight / brightness | `███████░░░` 70% | 🧪 Testing | Smooth fade on lock/unlock works; the brightness slider (xnu 0154) is built, not yet booted |
-| Heat / power use | `████░░░░░░` 40% | 🧪 Testing | Cores were pinned at top speed; xnu 0153 adds a governor, a 75 °C limit and a memory-bus vote that drops when idle |
+| CPU | `████████░░` 85% | ✅ Works | All 8 cores (or a chosen set with `cpumask`); clocks follow the load with a 75 °C limit on the big cores (xnu 0153, boot 86) |
+| Smoothness (goal: 60 fps) | `██████░░░░` 65% | 🚧 In progress | 19–54 fps measured (boot 86); the copy to the panel takes ~4 ms on its own thread; backboardd's GL work and a busy CPU are the main costs |
+| Screen fit | `████████░░` 80% | 🧪 Testing | Full-panel mode: iOS draws 375×834 points, scaled by 0.96 onto the whole panel (boot 86); smoother, blended scaling for text and corners (xnu 0155) built, not yet booted |
+| Backlight / brightness | `█████████░` 95% | ✅ Works | Brightness slider and Control Center drive the backlight (boot 86); smooth fade on lock/unlock |
+| Heat / power use | `████░░░░░░` 40% | 🚧 In progress | Boot 86: cores stay 40–70% busy even with the screen off, so they never cool down; xnu 0155 adds a per-thread CPU report to find the cause and stops touch polling while dark |
 | Microphone | `███░░░░░░░` 30% | ⏸️ Parked | The WCD938x codec comes up and iOS opens it, but the recording is silent |
 | Battery / charging status | `░░░░░░░░░░` 0% | ❌ Not started |  |
 | Sleep / standby | `░░░░░░░░░░` 0% | ❌ Not started | The panel goes dark when locked, but the phone never suspends |
@@ -58,10 +58,8 @@ The detailed engineering log, with every boot's results, is [`NOTES.md`](NOTES.m
 
 | Patch | What it does | State |
 | --- | --- | --- |
-| **0152** | Full-panel mode: iOS draws 375×834 points, scaled by 0.96 onto the whole 1080×2400 panel (no bars, no stretching) | Built, not booted |
-| **0153** | CPU clocks follow the load, big cores are capped above 75 °C, the memory bus drops when idle, no screen refresh while the screen is off | Built, not booted |
-| **0154** | iOS's brightness slider drives the backlight (`AppleARMBacklight` service), with iOS's own fades | Built, not booted |
-| Next | Screen-type hooks if anything still looks off in full-panel mode; GPU clock scaling; frame-rate profiling; the microphone | Planned |
+| **0155** | A per-thread CPU report every 10 s (`SWEET TOP`) to find what keeps the cores busy; blended (bilinear) screen scaling for clean text and corners; touch polled slowly while the screen is off; backlight writes retried | Built, not booted |
+| Next | Fix whatever `SWEET TOP` shows burning idle CPU; let the GPU do the screen scaling (no CPU copy: cooler and faster); GPU clock scaling; the microphone | Planned |
 
 ---
 
@@ -185,6 +183,7 @@ Boot options (boot-args) go in `--cmdline`. The most useful ones are below. Each
 | `sweetfb_height=2502` | Full-panel mode (0152): build the device tree with `mkadt.py --display-height 2502` and add `--files-from tools/root-files/mgcache-reset.txt` on the first boot |
 | `sweetfb_native=1` | iOS draws at 1080×2400 1:1 (360×800 points; iOS shows a red status bar). Needs `mkadt.py --native-display` |
 | `sweetfb_stats=N` | Every N s, a `SWEET FB` line with frames a second and copy time (default 10) |
+| `sweetfb_smooth=0` | Nearest-pixel scaling instead of the blended (bilinear) default (0155): less CPU, rougher text |
 | `apollo_backlight=P` | Backlight: `0` leave it alone, `1`–`100` set a level, absent = keep the bootloader's level |
 | `apollo_backlight_fade_ms=N` | Lock/unlock fade length (default 300) |
 | `sweetbacklight=0` | Don't offer the backlight to iOS (the brightness slider does nothing) |
@@ -197,6 +196,7 @@ Boot options (boot-args) go in `--cmdline`. The most useful ones are below. Each
 | `sweetcpufreq=N` | Cap the CPU clock at N MHz |
 | `sweetthermal=T` | Slow the big cores while the hottest core is over T °C (default 75; 0 = no limit) |
 | `sweetcpustats=N` | Every N s, a `SWEET CPUFREQ` line: clocks, load, temperatures (default 10) |
+| `sweettop=0` | No `SWEET TOP` line (the 8 threads that used the most CPU, with the stats line; 0155) |
 | `sweetddr=N` | Memory bus: `0` leave it alone, `1` follow the load (default), `2` always at top |
 | `sweetddrlow=V` | The memory bus's idle level (default `0x800`); raise it if the screen flickers when idle |
 
@@ -249,7 +249,7 @@ None of these files are in git. Each tool runs with the phone in the temporary r
 
 | Path | What's inside |
 | --- | --- |
-| `xnu/patches/` | The kernel: patches 0001–0154 on Apple's xnu-8796, applied in order by CI |
+| `xnu/patches/` | The kernel: patches 0001–0155 on Apple's xnu-8796, applied in order by CI |
 | `shim/` | The boot shim, packed as an Android boot image |
 | `wifi/` | The Linux compatibility layer the Wi-Fi driver (ath11k) is built on |
 | `userland/` | Programs for the phone: Mesa, the CoreAnimation bridge, the audio plug-in, the Bluetooth library, GPU tests ([details](userland/README.md)) |
