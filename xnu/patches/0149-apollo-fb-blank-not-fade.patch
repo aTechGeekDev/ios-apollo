@@ -1,0 +1,70 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -38,6 +38,12 @@
+  * a line says how many frames iOS gave and how many reached the panel, the
+  * copy's time, and whether ticks came late or were skipped.
+  *
++ * (xnu 0149) Display off (the lock button, auto-lock): the panel is made black
++ * once, by the present thread, with writes only. The fade before it read every
++ * pixel of the panel's write-combining memory back, halved it and wrote it,
++ * once a tick: reads of that memory are uncached and slow, so the fade crawled
++ * down the screen line by line, and it held the vsync tick up to a second.
++ *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+@@ -129,7 +135,7 @@
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+-	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	uint32_t      fFadeStep;      /* while off: 0 the panel still shows the last frame, 1 to be blacked out, 2 black (0149) */
+ 	/* (xnu 0148) the vsync schedule, the present thread, and what is said every fStatsAbs */
+ 	uint64_t      fPeriodAbs, fNextVsync, fStatsAbs, fStatSince;
+ 	bool          fPresentWanted;
+@@ -352,20 +358,13 @@
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fPowerOff) {
+-		/* Fade out: halve every channel each vsync, then black, then idle. */
+-		uint32_t step = fb->fFadeStep;
+-		if (step <= 6) {
+-			fb->fFadeStep = step + 1;
++		/* (xnu 0149) off: the present thread makes the panel black, once */
++		if (fb->fFadeStep == 0) {
++			fb->fFadeStep = 1;
++			fb->fPresentWanted = true;
++			IOLockWakeup(fb->fLock, &fb->fPresentWanted, true);
+ 		}
+ 		IOLockUnlock(fb->fLock);
+-		if (step <= 6) {
+-			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+-				for (uint32_t x = 0; x < fb->fWidth; x++) {
+-					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+-				}
+-			}
+-		}
+ 		return;
+ 	}
+ 	/* (xnu 0148) the copy is the present thread's: woken here */
+@@ -426,6 +425,19 @@
+ 			IOLockSleep(fLock, &fPresentWanted, THREAD_UNINT);
+ 		}
+ 		fPresentWanted = false;
++		if (fPowerOff && fFadeStep == 1) {
++			/* (xnu 0149) the display off: the panel black, with writes only (its memory is write-combining) */
++			fFadeStep = 2;
++			IOLockUnlock(fLock);
++			for (uint32_t y = 0; y < fHeight; y++) {
++				volatile uint64_t *row = (volatile uint64_t *)(fPixels + (uint64_t)y * fRowBytes);
++				for (uint32_t x = 0; x < fWidth / 2; x++) {
++					row[x] = 0;
++				}
++			}
++			IOLockLock(fLock);
++			continue;
++		}
+ 		if (!fDirty || fPowerOff) {
+ 			continue;
+ 		}

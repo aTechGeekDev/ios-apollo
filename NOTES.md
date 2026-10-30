@@ -2,6 +2,14 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 81 (2026-10-30, kernel 41060666957 = 0148 green, sweetgpulevel=6): copy 2 ms, vsyncs steady, iOS draws 43-53 fps; the lock fade crawls -> xnu 0149 + cpumask <<<
+
+**Log (user grep):** `SWEET RPMH: THE MEMORY BUS IS VOTED TO ITS TOP: a core copies 4066 MB/s (it was 3461 MB/s)` (+17%); `SWEET GPU: step 17: ask for 587 MHz (level 6)`. `SWEET FB: 10.0 s:` with the UI in use: **iOS gave 43-54 frames a second, 38-48 reached the panel**, 38-129 a window waited for the GPU, **the copy 2.0-2.4 ms on average, 3.8-5.1 at most** (so the copy was never the 10-15 ms feared: 0148's move of it is right but not the main gain), 600 vsyncs a window, 0 late except **two windows with 59 skipped and the latest ~990 ms late** (and one window of only 361 ticks): the timer's workloop held for ~1 s = the display-off fade (below). Bridge (`sweet-gl: after N frames`): ~9.4-10.8 ms per frame on average in backboardd's GL path (2.1-2.6 ms handing commands to the GPU, ~0.85 ms waiting), single frames 15-47 ms; 46-132 IOSurfaces had to be copied into textures. **So: CoreAnimation in backboardd is CPU-bound** (10 ms of GL/Mesa work + CA's own per frame) -> under 60 fps whenever a frame takes > 16.7 ms.
+**User:** the lock (display off) fade "draws line by line, really slow, as if not using the GPU"; unlocking lags.
+**Causes:** (1) the fade was ours: SweetFramebuffer halved every pixel of the panel once a tick, reading the write-combining (uncached) panel memory back = very slow, and inside the vsync tick (the ~1 s holds). (2) The CPU topology: mkadt.py gives XNU one homogeneous cluster in core order 0-7 (0-3 Cortex-A55 1.8 GHz, 4-6 A77 2.42 GHz, 7 A77 2.84 GHz); XNU's SMP scheduler gives a woken thread its last core or the lowest-numbered idle one, so backboardd's render thread often runs on an A55 at half speed or less. hakios boots on core 7 and lists 7,6,5,4,3,2,1 (their loader, bootcpu=7) = big cores first. Ours can't reorder simply: 0065 panics unless the boot CPU is logical 0 with MPIDR 0 (our shim boots on core 0). XNU's own `cpumask=` keeps cores by DT position: **`cpumask=0xf1` = core 0 (boot) + cores 4-7**, the other A55s off (cpus= and cpumask= together panic: drop cpus=8). Pixel-count GIC lookup is by MPIDR (pe_fiq.c), so masked cores are safe (guess: not booted yet).
+**xnu 0149 (`0149-apollo-fb-blank-not-fade.patch`):** display off -> the present thread writes the panel black once (64-bit stores, no reads); the vsync tick only wakes it. Display on -> redraw as before.
+**Test (boot 82):** 0149's kernel, boot 81's ADT and cmdline with `cpus=8` replaced by `cpumask=0xf1`. Compare `SWEET FB: 10.0 s` frames a second with boot 81 (43-54); lock: instant black.
+
 ### >>> PERFORMANCE (2026-10-30; user: "I want a performance boost. I NEED THE UI TO BE 60FPS MINIMUM") -> xnu 0148 + sweetgpulevel=6; NOT YET BOOTED <<<
 
 **Read from the code (not measured yet):**
