@@ -2,6 +2,10 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 94 (2026-10-31, kernel 41193711324 = 0162 + userland 41193711326 with libsweet-fix): SCREENSHOTS SAVE (user); Files still without "On My iPhone"; opening Settings froze the display, then it "started going crazy" <<<
+
+The uploaded log `a58b7d53-apollo-boot93.txt` is boot 93's (ScreenshotServic crash at line 9530, no sweet-fix line, no Preferences exec), so the Settings freeze is not in it; boot 94's log asked for.
+
 ### >>> xnu 0162 + libsweet-fix (2026-10-31; kernel run 41193711324, userland run 41193711326 green): screenshots; NOT YET BOOTED <<<
 
 **Boot 93 observed:** `CRASH ScreenshotServic[331] sig 6`, slide 0x3b37c000; symbolicated (ios-re 41193396212): __assert_rtn <- MTLReportFailure.cold <- -[MTLComputePipelineDescriptorInternal setComputeFunction:] <- -[PKMetalResourceHandler newPaintShaderKernelPipelineState] <- PKMetalResourceHandler setup after `newDefaultLibraryWithBundle:error:` (PencilKit, the screenshot markup). There is no MTLDevice on this port, so the library and function are nil.
