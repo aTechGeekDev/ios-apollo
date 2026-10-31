@@ -2,6 +2,11 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 101 (2026-10-31, kernel 41208843768, userland 41210454348): "Persona List failed" is a red herring -> userland 41211919226 mirrors ALL of fileproviderd's os_log <<<
+
+**Observed:** usermanagerd logs nothing about the request (never reached it). ios-re 41211xxxxxx (UserManagement disassembly): "Persona List failed with error %@" is logged by -[... personaAttributesForPersonaType:withError:] / personaAttributesForPersonaUniqueString: after `[UMXPCServer sharedServer] fetchPersonaSynchronous:{kUMUserPersonaTypeKey: type}` over com.apple.mobile.keybagd.UserManager.xpc: a lookup of one persona type (probably enterprise), whose ENOENT is normal on a phone without one. fileproviderd's remaining clues: `discovered extensions: attributes {NSExtensionPointName = (fileprovider-nonui, fileconversion-nonui)}, extensionSet <nil>` while PKHost found 8 matches; `registering: ( )`.
+**Change:** libsweet-fix in fileproviderd: every level mirrored (noise filtered: vouchers, container lookups, APS, xpc_activity), 3000 lines, and os_log_type_enabled hooked to always true (+ _os_log_debug_impl) so debug lines are formatted at all.
+
 ### >>> BOOT 100 (2026-10-31, kernel 41208843768 = first Xcode-16 kernel, userland 41208843715): boots; usermanagerd's personas load; the persona LIST request fails -> userland 41210454348 mirrors usermanagerd's server lines <<<
 
 **Observed:** usermanagerd (UMD_INIT, stdout): user session 501 loaded, `Loaded persona manifest` (version 1, generation 1), personas 99/199/200/1000/100 allocated in the kernel (1000 type 5 uid 501; 200 type 6 uid 501). So the manifest exists. But fileproviderd: `Persona List failed ... NSPOSIXErrorDomain Code=2` (x5), Files: `... Code=1 "Operation not permitted"`; still `registering: ( )`, `sourcesByID: { }`. fileproviderd runs in persona 200 (container lookups: origin/proximate personaid 200). The kernel's persona syscalls never return ENOENT (EPERM: info on another persona without com.apple.private.persona-mgmt). The ENOENT most likely comes from usermanagerd's fetchPersonaListforPid answer; its os_log server lines ("In RDServer: fetchPersonaListforPid ...") were filtered out of the mirror (info level, no keyword) -> keywords "ersona", "RDServer", "UMSyncServer" added.
