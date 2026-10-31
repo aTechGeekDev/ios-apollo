@@ -46,6 +46,8 @@ The percentages are rough estimates of how much of each part works on the phone 
 | Backlight / brightness | `█████████░` 95% | ✅ Works | Brightness slider and Control Center drive the backlight (boot 86); smooth fade on lock/unlock |
 | Heat / power use | `████████░░` 80% | ✅ Works | Acceptable with every service on (boot 92): 0160 holds runaway background processes to 10% of a core; the CPU clocks follow the load with a 75 °C limit |
 | Microphone | `██████████` 100% | ✅ Works | WCD938x codec; recording works (Voice Memos, boot 93: fixed by xnu 0161's sandbox container paths / extension tokens) |
+| Files app | `█████████░` 90% | ✅ Works | "On My iPhone" (boot 104): extensions get container paths (0161), setup counts as finished (0165), and the HFS+ root is reported as APFS to the file provider service (libsweet-fix) |
+| Dynamic Island | `█████████░` 90% | ✅ Works | `mkadt.py --artwork-subtype 2556` (iPhone 14 Pro artwork type through the device tree; boot 104) |
 | Battery / charging status | `░░░░░░░░░░` 0% | ❌ Not started |  |
 | Sleep / standby | `░░░░░░░░░░` 0% | ❌ Not started | The panel goes dark when locked, but the phone never suspends |
 | USB, cameras, cellular, sensors, GPS, fingerprint | `░░░░░░░░░░` 0% | ❌ Not started |  |

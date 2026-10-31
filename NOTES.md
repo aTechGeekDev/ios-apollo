@@ -2,6 +2,12 @@
 
 ## Agent handoff / active work
 
+### >>> 🎉 BOOT 104 (2026-10-31, kernel 41208843768, userland 41214268895, `--artwork-subtype 2556` + mgcache-reset): FILES "ON MY IPHONE" WORKS, DYNAMIC ISLAND WORKS (user) <<<
+
+**Files fix chain (boots 93-104):** sandbox container paths for .appex (0161) -> setup finished (BYSetupAssistantNeedsToRun hook; kernel purplebuddy.sentinel 0165) -> the HFS+ root reported as apfs to fileproviderd/Files/LocalStorageFileProvider (libsweet-fix statfs family). The persona list errors were red herrings.
+**Dynamic Island:** mkadt.py --artwork-subtype 2556 (/product artwork-device-subtype -> MobileGestalt ArtworkDeviceSubType) with mgcache-reset.txt on the first boot. Keep --artwork-subtype 2556 on later boots (without the reset list).
+**Next (user):** jailbreak the existing root in place (Procursus rootless /var/jb + Sileo).
+
 ### >>> BOOT 103 (2026-10-31, kernel 41208843768, userland 41213610351): NO HOME SCREEN -- usermanagerd SIGBUS loop from my statfs hook -> userland 41214268895 <<<
 
 **Observed:** `Data/Stack execution not permitted: usermanagerd[pid 12] at virtual address 0x1fdf7c000, protections were read-write`, `CRASH usermanagerd sig 10 ... pc 0x1fdf7c53c` at every relaunch; no frames. Cause: hook_jump made the libsystem_kernel page holding statfs RW (not X) and then called vm_protect, a stub on that same page.
