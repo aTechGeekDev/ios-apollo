@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Tools
-        run: brew tap blacktop/tap && brew trust blacktop/tap && brew install blacktop/tap/ipsw && ipsw version
+        run: brew tap blacktop/tap && brew trust blacktop/tap && brew install --formula blacktop/tap/ipsw && ipsw version
       - uses: actions/cache@v4
         id: dsc
         with:
