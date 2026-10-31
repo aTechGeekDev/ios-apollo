@@ -2,6 +2,12 @@
 
 ## Agent handoff / active work
 
+### >>> xnu 0164 + libsweet-fix os_log mirror (2026-10-31; kernel 41202590414, userland 41202590436, both green): Files "On My iPhone" diagnosis; NOT YET BOOTED <<<
+
+**Found (ios-re 41202034391, 41202224104, the 20H392 OS image on the runner):** "On My iPhone" is `/System/Library/Frameworks/FileProvider.framework/PlugIns/LocalStorageFileProvider.appex` (extension point com.apple.fileprovider-nonui), listed in launchd.plist's `AppExtensions` with the other providers (PhotosFileProvider, CloudDocs, SMBClientProvider, userfs_provider). fileproviderd is `/System/Library/Frameworks/FileProvider.framework/Support/fileproviderd`. No boot ever showed `exec LocalStorageFileProvider`: fileproviderd never starts it.
+**0164:** kern_exec.c's built-in group = libsweet-fix into ScreenshotServicesService, fileproviderd, Files, LocalStorageFileProvider; mem.c adds `fileproviderd,Files,LocalStorageFile` to sweetnull (unless sweetfix=0 or sweetnull=-). libsweet-fix interposes _os_log_impl/_os_log_error_impl/_os_log_fault_impl/_os_log_debug_impl (weak) in those programs and writes `fixlog: E|F|I|D <format> |args` lines (errors/faults always; others with provider/domain/extension/failure words; 800 a process).
+**Guess to check first:** fileproviderd may wait for "unlocked since boot" from our AppleKeyStore stand-in (SWEET AKS lines) before starting providers.
+
 ### >>> BOOT 95 (2026-10-31, kernel 41194804367 = 0163, userland 41193711326; log `6b7ed251-apollo-boot95.txt`): no GPU hang this boot (0 failed submissions; recovery not exercised); AegirPoster crash loop -> tools/root-files/aegir-off.txt <<<
 
 **Observed:** 72 x `CRASH AegirPoster sig 6`, same stack each time: abort <- libc++abi "terminating due to uncaught exception" <- std::terminate <- _dispatch_client_callout <- __FBSSERIALQUEUE_IS_CALLING_OUT_TO_A_BLOCK__ (ios-re 41197432181; the throw site is not in the backtrace). AegirPoster (the astronomy wallpaper) draws with Metal; since 0161 extensions start, it starts and dies, PosterBoard restarts it. `exec Files` seen; still nothing from fileproviderd / a LocalStorage provider in the log. driverkitd and pkreporter sig 9 once each (as before).
