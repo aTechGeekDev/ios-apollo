@@ -34,6 +34,8 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach.h>
 #include <libkern/OSCacheControl.h>
+#include <sys/mount.h>
+#include <sys/syscall.h>
 
 typedef void (*setter_fn)(id, SEL, id);
 
@@ -236,6 +238,57 @@ hook_jump(const char *name, void *to)
  * SetupDone (launch sentinel, MobileGestalt, dates) and answers YES on this port although Setup was
  * skipped (tools/sweet-root-tweaks.py). In the programs this library is inserted into it answers NO.
  */
+/*
+ * (boot 102) The real Files blocker: fileproviderd logs "Non-eligible device /dev/ufsroot0: non-apfs" and
+ * "Volume /dev/ufsroot0 not eligible to store FP library, skipping": -[FPDVolume isEligibleForFPFS:] wants the
+ * volume's statfs to be writable, MNT_LOCAL and f_fstypename "apfs" (strcasecmp). Our iOS root is HFS+, so no
+ * file provider library, no domain, no "On My iPhone". In the Files programs statfs/fstatfs/getfsstat are done
+ * here on the raw system calls and an "hfs" volume is reported as "apfs" (nothing else changes).
+ */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static void
+fix_fstype(struct statfs *b)
+{
+	if (b != NULL && strcmp(b->f_fstypename, "hfs") == 0) {
+		strlcpy(b->f_fstypename, "apfs", sizeof(b->f_fstypename));
+	}
+}
+
+static int
+fix_statfs(const char *path, struct statfs *buf)
+{
+	int r = syscall(SYS_statfs64, path, buf);
+
+	if (r == 0) {
+		fix_fstype(buf);
+	}
+	return r;
+}
+
+static int
+fix_fstatfs(int fd, struct statfs *buf)
+{
+	int r = syscall(SYS_fstatfs64, fd, buf);
+
+	if (r == 0) {
+		fix_fstype(buf);
+	}
+	return r;
+}
+
+static int
+fix_getfsstat(struct statfs *buf, int bufsize, int flags)
+{
+	int r = syscall(SYS_getfsstat64, buf, bufsize, flags);
+
+	for (int i = 0; buf != NULL && i < r; i++) {
+		fix_fstype(&buf[i]);
+	}
+	return r;
+}
+#pragma clang diagnostic pop
+
 /* fileproviderd: every os_log level counts as enabled, so its debug lines are formatted and reach the mirror */
 static int
 fix_log_enabled(void)
@@ -279,6 +332,11 @@ sweet_fix_init(void)
 			}
 		}
 		if (mirror_on) {
+			int a = hook_jump("statfs", (void *)fix_statfs);
+			int b = hook_jump("fstatfs", (void *)fix_fstatfs);
+			int c = hook_jump("getfsstat", (void *)fix_getfsstat);
+
+			fprintf(stderr, "fixlog: %s: hfs volumes reported as apfs (statfs %d, fstatfs %d, getfsstat %d)\n", me, a, b, c);
 			fprintf(stderr, "fixlog: %s: BYSetupAssistantNeedsToRun -> NO: %s\n", me,
 			    hook_jump("BYSetupAssistantNeedsToRun", (void *)fix_setup_done) ? "hooked" : "NOT FOUND");
 		}
