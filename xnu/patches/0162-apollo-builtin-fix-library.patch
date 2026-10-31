@@ -1,0 +1,40 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5579,17 +5579,35 @@
+  * one; dyld honours it because sweet_amfi.c's "AMFI" policy allows it while
+  * sweetinject is set. After HackiOS's kern.exec_inject (bsd/kern/kern_exec.c).
+  */
++/*
++ * (xnu 0162) Groups every boot gets after sweetinject's own, unless boot-arg
++ * sweetfix=0: libsweet-fix.dylib (userland/fix) works around what iOS 16 does
++ * wrong without a Metal device -- ScreenshotServicesService (the screenshot
++ * preview and its PencilKit markup) aborted in MTLReportFailure building a
++ * compute pipeline from the nil function of a nil device's library (boot 93),
++ * so no screenshot was saved. The library must be on the root
++ * (mkadt.py --file /usr/local/lib/libsweet-fix.dylib=...): dyld ends a
++ * program whose inserted library is missing.
++ */
++#define SWEET_INJECT_BUILTIN    "/usr/local/lib/libsweet-fix.dylib:ScreenshotServicesService"
++
+ static bool
+ sweet_exec_inject(struct image_params *imgp, char *env, size_t size)
+ {
+-	char conf[200];
++	char conf[200 + sizeof(SWEET_INJECT_BUILTIN) + 1];
+ 	const char *path = imgp->ip_strings + strlen(EXECUTABLE_KEY), *name = path;
+ 	size_t namelen;
++	uint32_t fix = 1;
+ 
+-	if (!PE_parse_boot_argn("sweetinject", conf, sizeof(conf)) ||
++	if (!PE_parse_boot_argn("sweetinject", conf, 200) ||
+ 	    strncmp(imgp->ip_strings, EXECUTABLE_KEY, strlen(EXECUTABLE_KEY)) != 0) {
+ 		return false;
+ 	}
++	/* (xnu 0162) the built-in groups after the boot-arg's (the boot line is full) */
++	(void)PE_parse_boot_argn("sweetfix", &fix, sizeof(fix));
++	if (fix != 0) {
++		strlcat(conf, ";" SWEET_INJECT_BUILTIN, sizeof(conf));
++	}
+ 	for (const char *c = path; *c != 0; c++) {
+ 		if (*c == '/') {
+ 			name = c + 1;
