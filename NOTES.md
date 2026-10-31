@@ -2,6 +2,12 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 97 (2026-10-31, kernel 41202590414, userland 41203618358): FILES ROOT CAUSE FOUND -> userland 41206163336 <<<
+
+**Observed (fixlog, hooks worked: "os_log_impl hooked"):** fileproviderd: `[INFO] Not instantiating file providers until setup has been run.` + `[ERROR] denying connection because the device is not set up` (x4); later "file provider server setup", PlugInKit discovery found 8 providers, container lookups for group.com.apple.FileProvider.LocalStorage succeed, but no provider is instantiated. Files: `Could not set domain cache for domain %@ because storageURLs is empty`, `could not find a valid source`.
+**Cause (ios-re 41205680985, 41205812xxx, 41206000xxx):** -[FPDServer _computeUnlockedStatusAndSetup] (FileProviderDaemon 0x1c4a4fa30): MKBGetDeviceLockState/MKBDeviceUnlockedSinceBoot (passes) then `BYSetupAssistantNeedsToRun()` (SetupAssistant 0x1a3af1270) -> YES -> flag +0x79 (isPastBuddy) stays 0, _setup never runs. BYSetupAssistantNeedsToRun: buddyPreferencesInternal `ForceNoBuddy` -> NO; else device class, LaunchSentinelExists, an MG bool answer, date checks -- not com.apple.purplebuddy SetupDone alone.
+**Fix (userland 41206163336 green):** libsweet-fix hooks BYSetupAssistantNeedsToRun -> 0 in fileproviderd/Files/LocalStorageFileProvider (log: `fixlog: fileproviderd: BYSetupAssistantNeedsToRun -> NO: hooked`). Possible wider fix later: find which of BYSetupAssistantNeedsToRun's checks fails (other daemons may gate on it too).
+
 ### >>> BOOT 96 (2026-10-31, kernel 41202590414 = 0164, userland 41202590436): the mirror loads, but interposing only caught the programs' own os_log calls -> userland 41203618358 hooks _os_log_impl in place <<<
 
 **Observed (user's grep):** `|fileproviderd| fixlog: fileproviderd[200]: os_log mirrored`, then one line (`[NOTICE] %s starting for euid %u. |.../fileproviderd |501`); Files: one E line (`could not be converted to DOCDisplayMode`). Nothing from the FileProvider frameworks: dyld's __interpose tuples did not reach shared-cache callers here. No `LocalStorage` exec again.
