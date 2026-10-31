@@ -58,7 +58,7 @@ The detailed engineering log, with every boot's results, is [`NOTES.md`](NOTES.m
 
 | Patch | What it does | State |
 | --- | --- | --- |
-| **0159** + bridge | The GPU scales each frame (smooth filtering) straight into the flip buffers; no CPU copy | Building, not booted |
+| **0159** + bridge | The GPU scales each frame (smooth filtering) straight into the flip buffers; no CPU copy | Built, not booted |
 | **0158** | Memory bus kept at its top (suspect for a sudden reset in boot 88); one more busy daemon off | Built, being tested |
 | Next | Whatever boots 89–90 show: resets, frame rate, GPU clock scaling, the microphone | Planned |
 
