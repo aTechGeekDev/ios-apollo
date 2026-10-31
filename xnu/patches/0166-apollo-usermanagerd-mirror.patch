@@ -1,0 +1,24 @@
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -181,7 +181,7 @@
+ 		 */
+ 		(void)PE_parse_boot_argn("sweetfix", &fix, sizeof(fix));
+ 		if (fix != 0 && strcmp(sweet_null_names, "-") != 0) {
+-			strlcat(sweet_null_names, ",fileproviderd,Files,LocalStorageFile", sizeof(sweet_null_names));
++			strlcat(sweet_null_names, ",fileproviderd,Files,LocalStorageFile,usermanagerd", sizeof(sweet_null_names));
+ 		}
+ 		sweet_null_parsed = 1;
+ 	}
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5589,8 +5589,8 @@
+  * (mkadt.py --file /usr/local/lib/libsweet-fix.dylib=...): dyld ends a
+  * program whose inserted library is missing.
+  */
+-/* (xnu 0164) + the Files app, its daemon and the "On My iPhone" provider: their os_log mirrored (libsweet-fix) */
+-#define SWEET_INJECT_BUILTIN    "/usr/local/lib/libsweet-fix.dylib:ScreenshotServicesService,fileproviderd,Files,LocalStorageFileProvider"
++/* (xnu 0164) + the Files app, its daemon and the "On My iPhone" provider: their os_log mirrored (libsweet-fix); (0166) + usermanagerd */
++#define SWEET_INJECT_BUILTIN    "/usr/local/lib/libsweet-fix.dylib:ScreenshotServicesService,fileproviderd,Files,LocalStorageFileProvider,usermanagerd"
+ 
+ static bool
+ sweet_exec_inject(struct image_params *imgp, char *env, size_t size)

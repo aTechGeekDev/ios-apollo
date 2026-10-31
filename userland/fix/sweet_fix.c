@@ -251,7 +251,7 @@ sweet_fix_init(void)
 	}
 	fprintf(stderr, "sweet-fix: pid %d: %u of %u Metal setters accept a nil function\n", getpid(), done, FIXES);
 	{
-		static const char *const mirrored[] = { "fileproviderd", "Files", "LocalStorageFileProvider", NULL };
+		static const char *const mirrored[] = { "fileproviderd", "Files", "LocalStorageFileProvider", "usermanagerd", NULL };
 		const char *me = getprogname();
 
 		for (int i = 0; me != NULL && mirrored[i] != NULL; i++) {
