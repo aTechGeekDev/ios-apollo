@@ -2,6 +2,12 @@
 
 ## Agent handoff / active work
 
+### >>> xnu 0162 + libsweet-fix (2026-10-31; kernel run 41193711324, userland run 41193711326 green): screenshots; NOT YET BOOTED <<<
+
+**Boot 93 observed:** `CRASH ScreenshotServic[331] sig 6`, slide 0x3b37c000; symbolicated (ios-re 41193396212): __assert_rtn <- MTLReportFailure.cold <- -[MTLComputePipelineDescriptorInternal setComputeFunction:] <- -[PKMetalResourceHandler newPaintShaderKernelPipelineState] <- PKMetalResourceHandler setup after `newDefaultLibraryWithBundle:error:` (PencilKit, the screenshot markup). There is no MTLDevice on this port, so the library and function are nil.
+**Fix:** userland/fix/sweet_fix.c (libsweet-fix.dylib): the Metal descriptor setters setComputeFunction:/setVertexFunction:/setFragmentFunction:/setTileFunction: ignore nil. Inserted by the kernel: xnu 0162 adds a built-in sweetinject group `/usr/local/lib/libsweet-fix.dylib:ScreenshotServicesService` after the boot-arg's (the boot line is 600 of 607 bytes; sweetfix=0 turns it off). **The dylib must be on the root** (`--file /usr/local/lib/libsweet-fix.dylib=sweet-userland/lib/libsweet-fix.dylib`), or dyld ends ScreenshotServicesService.
+**Files "On My iPhone":** boot 93 shows no LocalStorage file-provider process starting at all (no exec, no crash); fileproviderd runs. Next: its os_log lines.
+
 ### >>> BOOT 93 (2026-10-31, kernel 41192358448 = 0161): MICROPHONE WORKS ("the audio recorder ... the mic is 100% working"); Files still has no "On My iPhone", screenshots still crash (no log yet) <<<
 
 ### >>> xnu 0161 (2026-10-31, commit 134ab6b; user: "fix the storage now i cant save screenshots and the files app doesnt show anything"): NOT YET BOOTED <<<
