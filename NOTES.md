@@ -2,6 +2,16 @@
 
 ## Agent handoff / active work
 
+### >>> xnu 0160 (2026-10-31, commit ee2508e, xnu run 41186687753): CPU budget for runaway background processes + touch boost; NOT YET BOOTED <<<
+
+**User after boot 91:** "the phone still heats up after a few minutes, i dont want to disable more services as my goal is to reach a daily drivable state, focus on optimization and performance and mainating heat even at idle I want a stable 60fps everywhere". So boot 92 runs with every service on (`bt-on.txt`: only fairplayd.H2 off); quiet-on/quiet-max stay optional.
+**Boot 91 (observed, all services on, kernel 0159 + bridge 41183892186):** SWEET TOP summed: vmd 4616, coreduetd 2704, launchd 1163, backboardd 516, biomed 423, SpringBoard 209, trustd 190, accessoryupdater 110 (% of a core per 10 s, added up). Busiest cores 64-81% at idle; up to 77 C; 48-58 fps when the processors are free, 20-35 when busy.
+**0160 (machine_routines.c `sweet_cpu_tame`, sweet_cpufreq.c, SweetHID.cpp):**
+- Every 313 governor samples (~5 s) each task's CPU time (recount_task_times) is compared with the last window. A task above `sweettame_enter` (35) % of a core for `sweettame_strikes` (4) windows in a row, not in the foreground (TASK_POLICY_ROLE != FOREGROUND_APPLICATION / GRAPHICS_SERVER) and not exempt by name (launchd, kernel_task, backboardd, SpringBoard, mediaserverd, audiomxd, bluetoothd, BlueTool, wifid, configd, logd, watchdogd, runningboardd, UserEventAgent, securityd, keybagd), is held to `sweettame_held` (10) % of a core with `proc_set_task_ruse_cpu(THROTTLE, pct, 1 s)` (ledger LEDGER_ACTION_BLOCK: its threads wait when the second's share is spent). Permanent for that task; a respawned process (new uniqueid) is judged again. Log: `SWEET TAME: vmd[123] used 96% of a core (more than 35% for 20 s): held to 10% from now on`. `sweettame=0` turns it off.
+- Touch boost: SweetHID calls `sweet_cpufreq_boost(0)` on every finger down/move; every domain goes to its cap (still the thermal cap) for 250 ms (`sweetboost=N`, 0 off).
+- Checked against xnu-8796.141.3 sources (interval in ns; proc_set_task_ruse_cpu takes the task lock itself; called outside tasks_threads_lock). Not compiled locally.
+**Guesses to check in boot 92:** launchd (1163) is exempt, so its share stays; if launchd is busy because vmd/coreduetd crash-loop and respawn, the budget only slows the loop. A held daemon that serves a foreground app over XPC could make that app wait (up to ~0.9 s per second); if something stalls, try `sweettame_held=25` or `sweettame=0` for A/B.
+
 ### >>> BOOT 90 (2026-10-31, kernel 41183691980 = 0159 + bridge 41183892186): GPU SCALING WORKS, no reset; still hot -> quiet-on.txt fixed, quiet-max.txt <<<
 
 **Observed (log `apollo-boot90.txt`, 15644 lines):** `SWEET FLIP: ... frames at 0x9c000000, 0x9c9f8000, 0x9d3f0000 (10452992 bytes each, rows of 4352)`, `SWEET FB: GPU scaling offered (frames 2, 3, 4; rows of 4352)`, `sweet-gl: GPU scaling: the panel's flip frames (surfaces 2 3 4, 1080x2400, rows of 4352 bytes) are render targets; the display's 1125x2502 goes to lines -1..2400`; frames scaled in 0.3-1 ms (13 ms the first); 3000 scaled, 1 left to the processor; `SWEET FB: N page flips, M of them frames the GPU scaled`: 252-490 of 257-494 per 10 s. **No reset this boot** (user). fps 25-55 given, 26-49 shown. User: "it still heats up".

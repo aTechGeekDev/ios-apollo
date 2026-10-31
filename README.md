@@ -42,7 +42,7 @@ The percentages are rough estimates of how much of each part works on the phone 
 | Smoothness (goal: 60 fps) | `███████░░░` 70% | 🚧 In progress | 25–55 fps (boot 90); limited by background iOS daemons and widgets saturating the CPU and the 75 °C limit |
 | Screen fit | `█████████░` 90% | ✅ Works | Full-panel mode: iOS draws 375×834 points; the GPU scales each frame (filtered) into page-flipped screen buffers, no tearing and no CPU copy (boot 90) |
 | Backlight / brightness | `█████████░` 95% | ✅ Works | Brightness slider and Control Center drive the backlight (boot 86); smooth fade on lock/unlock |
-| Heat / power use | `█████░░░░░` 55% | 🚧 In progress | Idle CPU near zero (boot 88); busy daemons switched off with `quiet-on.txt` / `quiet-max.txt`; widgets and trustd still heavy while in use |
+| Heat / power use | `█████░░░░░` 55% | 🚧 In progress | With every service on, vmd/coreduetd/biomed spin the CPU (boot 91); 0160 holds such processes to a small CPU budget instead of switching them off |
 | Microphone | `███░░░░░░░` 30% | ⏸️ Parked | The WCD938x codec comes up and iOS opens it, but the recording is silent |
 | Battery / charging status | `░░░░░░░░░░` 0% | ❌ Not started |  |
 | Sleep / standby | `░░░░░░░░░░` 0% | ❌ Not started | The panel goes dark when locked, but the phone never suspends |
@@ -58,7 +58,8 @@ The detailed engineering log, with every boot's results, is [`NOTES.md`](NOTES.m
 
 | Item | What it does | State |
 | --- | --- | --- |
-| `quiet-on.txt` / `quiet-max.txt` | Switch off background daemons that spin with no cellular or accessories (correct launchd labels now); `quiet-max` also widgets | Ready, not booted |
+| **0160** CPU budget + touch boost | Background processes that keep a core busy (vmd, coreduetd, biomed…) are held to 10% of a core instead of being switched off; a touch runs the CPUs at full speed for 250 ms | Built, not booted |
+| `quiet-on.txt` / `quiet-max.txt` | Optional: switch off background daemons that spin with no cellular or accessories | Optional |
 | **0159** + bridge | The GPU scales each frame straight into the page-flipped screen buffers | ✅ Works (boot 90) |
 | Sudden resets | Seen in boots 88 and 89 (not 90); cause not found yet | Watching |
 | Next | trustd if it keeps spinning; big-core scheduling; GPU clock scaling; the microphone | Planned |
@@ -202,6 +203,8 @@ Boot options (boot-args) go in `--cmdline`. The most useful ones are below. Each
 | `sweetcpustats=N` | Every N s, a `SWEET CPUFREQ` line: clocks, load, temperatures (default 10) |
 | `sweettop=0` | No `SWEET TOP` line (the 8 threads that used the most CPU, with the stats line; 0155) |
 | `sweetddr=N` | Memory bus: `0` leave it alone, `1` follow the load, `2` always at top (default since 0158) |
+| `sweettame=0` | No CPU budget for runaway background processes (0160). Tune with `sweettame_enter=35` (% of a core that counts as runaway), `sweettame_strikes=4` (5 s windows in a row), `sweettame_held=10` (% of a core allowed after) |
+| `sweetboost=N` | After a touch, every CPU at full speed (within the thermal limit) for N ms (default 250; 0 = off) |
 | `sweetddrlow=V` | The memory bus's idle level (default `0x800`); raise it if the screen flickers when idle |
 
 ### GPU
