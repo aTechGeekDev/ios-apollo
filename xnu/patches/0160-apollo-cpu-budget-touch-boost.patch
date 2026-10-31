@@ -1,0 +1,268 @@
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2969,3 +2969,147 @@
+ 	}
+ }
+ #endif /* SWEET */
++
++#if defined(SWEET)
++#include <kern/policy_internal.h>
++#include <mach/task_policy.h>
++
++/*
++ * (xnu 0160) A CPU budget for runaway background processes, from bsd/dev/sweet_cpufreq.c's governor every few seconds.
++ * Boots 88-91: with every service of iOS enabled, voicemail's vmd (no cellular), coreduetd, biomed, accessoryupdaterd and
++ * others each kept a core 30-100% busy for minutes on end, the display on or off: the phone hot, the cores at their
++ * temperature cap, the user interface short of processor time. Rather than switching them off (the phone is to be
++ * usable every day: tools/root-files/quiet-*.txt stay optional), a process that is not in the foreground and not one
++ * the display, sound or radios depend on, and that used more than `enter` percent of a core in each of `strikes`
++ * windows in a row, is held to `held` percent of a core from then on with XNU's own task-wide CPU limit
++ * (proc_set_task_ruse_cpu(TASK_POLICY_RESOURCE_ATTRIBUTE_THROTTLE): its threads wait when its share of each second is
++ * spent -- what posix_spawn's CPU limits and Apple's own background policies use). It keeps running and answering,
++ * only slower; a process started again (a new task) is judged afresh. One line per process held:
++ * `SWEET TAME: vmd[123] used 96% of a core for 20 s: held to 10% from now on`.
++ * Boot-args: sweettame=0 (off), sweettame_enter (35), sweettame_held (10), sweettame_strikes (4).
++ */
++#define SWEET_TAME_SLOTS        512u
++static struct {
++	uint64_t uniqueid, last;
++	uint32_t strikes, gen;
++	bool held;
++} sweet_tame_seen[SWEET_TAME_SLOTS];
++static uint32_t sweet_tame_gen;
++
++static bool
++sweet_tame_exempt(const char *name, int role)
++{
++	static const char *const never[] = {
++		"launchd", "kernel_task", "backboardd", "SpringBoard", "mediaserverd", "audiomxd", "bluetoothd", "BlueTool",
++		"wifid", "configd", "logd", "watchdogd", "runningboardd", "UserEventAgent", "securityd", "keybagd",
++	};
++
++	if (role == TASK_FOREGROUND_APPLICATION || role == TASK_GRAPHICS_SERVER) {
++		return true;
++	}
++	for (unsigned i = 0; i < sizeof(never) / sizeof(never[0]); i++) {
++		if (strncmp(name, never[i], 16) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++void sweet_cpu_tame(uint64_t window_abs);
++
++void
++sweet_cpu_tame(uint64_t window_abs)
++{
++	static uint32_t enabled = 2, enter = 35, held = 10, strikes = 4;
++	struct {
++		task_t task;
++		int pid;
++		uint32_t percent;
++		char name[17];
++	} hold[8];
++	unsigned holds = 0;
++	task_t task;
++
++	if (enabled == 2) {
++		enabled = 1;
++		PE_parse_boot_argn("sweettame", &enabled, sizeof(enabled));
++		PE_parse_boot_argn("sweettame_enter", &enter, sizeof(enter));
++		PE_parse_boot_argn("sweettame_held", &held, sizeof(held));
++		PE_parse_boot_argn("sweettame_strikes", &strikes, sizeof(strikes));
++		held = held < 1 ? 1 : held > 100 ? 100 : held;
++	}
++	if (!enabled || window_abs == 0) {
++		return;
++	}
++	if (++sweet_tame_gen == 0) {
++		sweet_tame_gen = 1;
++	}
++	lck_mtx_lock(&tasks_threads_lock);
++	queue_iterate(&tasks, task, task_t, tasks) {
++		if (task == kernel_task || task->active == 0) {
++			continue;
++		}
++		struct recount_times_mach times = recount_task_times(task);
++		uint64_t now = times.rtm_user + times.rtm_system;
++		uint32_t slot = (uint32_t)(task->task_uniqueid * 0x9e3779b1u) % SWEET_TAME_SLOTS, free_slot = 0xffffffffu;
++		bool found = false;
++
++		for (unsigned probe = 0; probe < 16; probe++, slot = (slot + 1) % SWEET_TAME_SLOTS) {
++			if (sweet_tame_seen[slot].gen != 0 && sweet_tame_seen[slot].uniqueid == task->task_uniqueid) {
++				found = true;
++				break;
++			}
++			if (free_slot == 0xffffffffu && (sweet_tame_seen[slot].gen == 0 ||
++			    (sweet_tame_seen[slot].gen != sweet_tame_gen && sweet_tame_seen[slot].gen != sweet_tame_gen - 1))) {
++				free_slot = slot;
++			}
++		}
++		if (!found) {
++			if (free_slot == 0xffffffffu) {
++				continue;
++			}
++			slot = free_slot;
++			sweet_tame_seen[slot].uniqueid = task->task_uniqueid;
++			sweet_tame_seen[slot].last = now;
++			sweet_tame_seen[slot].strikes = 0;
++			sweet_tame_seen[slot].held = false;
++			sweet_tame_seen[slot].gen = sweet_tame_gen;
++			continue;
++		}
++		uint32_t percent = (uint32_t)((now - sweet_tame_seen[slot].last) * 100 / window_abs);
++		sweet_tame_seen[slot].last = now;
++		sweet_tame_seen[slot].gen = sweet_tame_gen;
++		if (sweet_tame_seen[slot].held) {
++			continue;
++		}
++		sweet_tame_seen[slot].strikes = percent > enter ? sweet_tame_seen[slot].strikes + 1 : 0;
++		if (sweet_tame_seen[slot].strikes < strikes || holds == sizeof(hold) / sizeof(hold[0])) {
++			continue;
++		}
++		void *proc = get_bsdtask_info(task);
++		const char *name = proc != NULL ? proc_name_address(proc) : "?";
++		if (proc == NULL || sweet_tame_exempt(name, proc_get_effective_task_policy(task, TASK_POLICY_ROLE))) {
++			sweet_tame_seen[slot].strikes = 0;
++			continue;
++		}
++		task_reference(task);
++		hold[holds].task = task;
++		hold[holds].pid = task_pid(task);
++		hold[holds].percent = percent;
++		strlcpy(hold[holds].name, name, sizeof(hold[holds].name));
++		holds++;
++		sweet_tame_seen[slot].held = true;
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++
++	for (unsigned i = 0; i < holds; i++) {
++		uint64_t seconds_ns = 0;
++		int error = proc_set_task_ruse_cpu(hold[i].task, TASK_POLICY_RESOURCE_ATTRIBUTE_THROTTLE, (uint8_t)held, NSEC_PER_SEC,
++		    0, 1);
++		absolutetime_to_nanoseconds(window_abs * strikes, &seconds_ns);
++		printf("SWEET TAME: %s[%d] used %u%% of a core (more than %u%% for %llu s): held to %u%% from now on%s\n",
++		    hold[i].name, hold[i].pid, hold[i].percent, enter, seconds_ns / NSEC_PER_SEC, held, error ? " (REFUSED)" : "");
++		task_deallocate(hold[i].task);
++	}
++}
++#endif /* SWEET */
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -37,6 +37,10 @@
+  * (xnu 0155) With the stats line a "top": `SWEET TOP: N s: T threads; process/thread P% ...`, the eight threads
+  * that ran most in the window (share of one core; unnamed kernel threads by the unslid event they wait on).
+  * Boot 86 showed cores 40-70% busy with the display off: this says who. sweettop=0: no top line.
++ * (xnu 0160) Every TAME_EVERY samples (~5 s) machine_routines.c's sweet_cpu_tame() holds runaway background
++ * processes to a small CPU budget (see there). And a touch (SweetHID.cpp: sweet_cpufreq_boost()) puts every domain at
++ * its top (its cap) for BOOST_MS (250; boot-arg sweetboost=N ms, 0 off): an animation that starts with the finger starts
++ * at full speed instead of after the governor has seen the load (as Android's input boost).
+  * Boot-arg sweetcpugov=0: the old way, every domain at its top (or the sweetcpufreq cap) for good.
+  * The governor starts 15 s into the boot (the boot itself at the top).
+  */
+@@ -52,6 +56,8 @@
+ extern bool sweet_cpu_sample(unsigned int cpu, uint32_t *mpidr, uint64_t *idle_abs);    /* machine_routines.c */
+ extern int sweet_rpmh_ddr_set(bool top);                                                /* sweet_rpmh.c */
+ extern void sweet_cpu_top(char *out, size_t size, uint64_t window_abs);                 /* machine_routines.c (0155) */
++extern void sweet_cpu_tame(uint64_t window_abs);                                        /* machine_routines.c (0160) */
++void sweet_cpufreq_boost(uint32_t ms);                                                  /* (0160) SweetHID.cpp's touches */
+ void sweet_cpufreq_init(void);
+ extern void thread_set_thread_name(thread_t thread, const char *name);          /* (0157) */
+ 
+@@ -74,6 +80,8 @@
+ #define GOV_QUIET_SAMPLES     62u         /* ... for this long (~1 s): the memory bus lowered */
+ #define GOV_START_S           15u
+ #define THERMAL_EVERY         16u         /* samples (~256 ms) */
++#define TAME_EVERY            313u        /* samples (~5 s): sweet_cpu_tame() */
++#define BOOST_MS              250u
+ 
+ /*
+  * TSENS v2 (Linux drivers/thermal/qcom/tsens-v2.c; sm8250.dtsi): two controllers, TM regions at 0xc263000 (16
+@@ -98,6 +106,22 @@
+ };
+ 
+ static struct cpufreq_domain cpufreq_dom[CPUFREQ_DOMAINS];
++static volatile uint64_t boost_until;   /* (0160) mach time until which every domain is at its cap */
++static uint32_t boost_ms = BOOST_MS;
++static bool governing;
++
++/* (0160) a touch: every domain at its cap for `ms` (0: the default) from now; anything may call it, it only stores a time */
++void
++sweet_cpufreq_boost(uint32_t ms)
++{
++	uint64_t span;
++
++	if (!governing || boost_ms == 0) {
++		return;
++	}
++	nanoseconds_to_absolutetime((uint64_t)(ms ? ms : boost_ms) * NSEC_PER_MSEC, &span);
++	boost_until = mach_absolute_time() + span;
++}
+ static vm_offset_t tsens0;
+ 
+ static uint32_t
+@@ -211,12 +235,15 @@
+ 	(void)PE_parse_boot_argn("sweetthermal", &limit, sizeof(limit));
+ 	(void)PE_parse_boot_argn("sweetcpustats", &stats_s, sizeof(stats_s));
+ 	(void)PE_parse_boot_argn("sweettop", &top, sizeof(top));
++	(void)PE_parse_boot_argn("sweetboost", &boost_ms, sizeof(boost_ms));
++	uint64_t tame_since = 0;
+ 	nanoseconds_to_absolutetime((uint64_t)GOV_PERIOD_MS * NSEC_PER_MSEC, &period_abs);
+ 	nanoseconds_to_absolutetime((uint64_t)stats_s * NSEC_PER_SEC, &stats_abs);
+ 	delay_for_interval(GOV_START_S * 1000, NSEC_PER_MSEC);
+ 	printf("SWEET CPUFREQ: the governor runs: every %u ms, temperature limit %u C%s, the memory bus following the load\n",
+ 	    GOV_PERIOD_MS, limit, limit ? "" : " (none)");
+-	stats_since = at_prev = mach_absolute_time();
++	stats_since = at_prev = tame_since = mach_absolute_time();
++	governing = true;
+ 
+ 	for (;;) {
+ 		uint64_t now = mach_absolute_time(), span = now - at_prev;
+@@ -257,8 +284,8 @@
+ 			if (dom->base == 0 || dom->n == 0) {
+ 				continue;
+ 			}
+-			if (dom->busiest >= GOV_FULL_PERMILLE) {
+-				want = dom->cap;
++			if (dom->busiest >= GOV_FULL_PERMILLE || now < boost_until) {
++				want = dom->cap;        /* (0160: a touch's boost too) */
+ 			} else {
+ 				uint64_t khz = (uint64_t)dom->khz[dom->level] * dom->busiest * 150 / 100000;
+ 				want = cpufreq_level_for(dom, khz);
+@@ -287,6 +314,12 @@
+ 		ddr_top_samples += ddr_top;
+ 		stat_samples++;
+ 
++		/* (0160) runaway background processes held to a budget */
++		if (samples % TAME_EVERY == TAME_EVERY - 1) {
++			sweet_cpu_tame(now - tame_since);
++			tame_since = now;
++		}
++
+ 		/* the temperature: the gold and prime domains' (and if need be silver's) highest level */
+ 		if (++samples % THERMAL_EVERY == 0 && limit != 0) {
+ 			unsigned which = 0;
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -30,6 +30,8 @@
+ #include "IOHIDUsageTables.h"
+ 
+ extern "C" uint64_t mach_absolute_time(void);
++/* (xnu 0160) bsd/dev/sweet_cpufreq.c: run the CPUs at their cap for a moment after a touch */
++extern "C" void sweet_cpufreq_boost(uint32_t ms);
+ 
+ /* One open client: the user client and its event callback. */
+ class IOHIDEventServiceClient : public OSObject {
+@@ -495,6 +497,11 @@
+ 		IOLockUnlock(fLock);
+ 		return;
+ 	}
++	if (down) {
++		/* (xnu 0160) a finger is down or moving: the frames that answer it are next, so the
++		 * governor does not wait for its next sample to raise the clocks */
++		sweet_cpufreq_boost(0);
++	}
+ 	if (!was && down) {
+ 		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+ 		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
