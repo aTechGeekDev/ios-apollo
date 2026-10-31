@@ -2,6 +2,11 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 96 (2026-10-31, kernel 41202590414 = 0164, userland 41202590436): the mirror loads, but interposing only caught the programs' own os_log calls -> userland 41203618358 hooks _os_log_impl in place <<<
+
+**Observed (user's grep):** `|fileproviderd| fixlog: fileproviderd[200]: os_log mirrored`, then one line (`[NOTICE] %s starting for euid %u. |.../fileproviderd |501`); Files: one E line (`could not be converted to DOCDisplayMode`). Nothing from the FileProvider frameworks: dyld's __interpose tuples did not reach shared-cache callers here. No `LocalStorage` exec again.
+**Change (userland only, run 41203618358 green):** libsweet-fix overwrites the start of _os_log_impl/_os_log_error_impl/_os_log_fault_impl (VM_PROT_COPY page, `ldr x16,#8; br x16; .quad mirror_entry`) in those three programs; the real os_log is not called afterwards there. Default-level lines are now copied too.
+
 ### >>> xnu 0164 + libsweet-fix os_log mirror (2026-10-31; kernel 41202590414, userland 41202590436, both green): Files "On My iPhone" diagnosis; NOT YET BOOTED <<<
 
 **Found (ios-re 41202034391, 41202224104, the 20H392 OS image on the runner):** "On My iPhone" is `/System/Library/Frameworks/FileProvider.framework/PlugIns/LocalStorageFileProvider.appex` (extension point com.apple.fileprovider-nonui), listed in launchd.plist's `AppExtensions` with the other providers (PhotosFileProvider, CloudDocs, SMBClientProvider, userfs_provider). fileproviderd is `/System/Library/Frameworks/FileProvider.framework/Support/fileproviderd`. No boot ever showed `exec LocalStorageFileProvider`: fileproviderd never starts it.
