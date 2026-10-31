@@ -1,0 +1,212 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1353,6 +1353,127 @@
+ 	(void)gpu_smmu_faulted(kept.smmu, kept.pg, kept.npg, CORE_CONTEXT, "CORE");
+ }
+ 
++/* (xnu 0163) step 19's registers of the 3D core (Linux a6xx hw_init, a650); again after a reset (sweet_gpu_recover) */
++static void
++core_hw_regs(vm_offset_t gpu)
++{
++	static const uint16_t addr_modes[] = { 0x0842, 0x0c01, 0x8601, 0x8e05, 0x9e01, 0xbe05, 0xa601, 0x9601, 0x0e00, 0xae01,
++		                               0xb601, 0xf810 };
++	gpu_wr(gpu, GPU_GBIF_HALT, 0);
++	gpu_wr(gpu, GPU_RBBM_GBIF_HALT, 0);
++	gpu_wr(gpu, GPU_SECVID_TSB_CNTL, 0);
++	gpu_wr(gpu, GPU_SECVID_TSB_TRUSTED_BASE, 0);
++	gpu_wr(gpu, GPU_SECVID_TSB_TRUSTED_BASE + 4u, 0);
++	gpu_wr(gpu, GPU_SECVID_TSB_TRUSTED_SIZE, 0);
++	for (unsigned i = 0; i < sizeof(addr_modes) / sizeof(addr_modes[0]); ++i)
++		gpu_wr(gpu, GPU_WORD(addr_modes[i]), 1);           /* 64-bit addresses, every block */
++	for (unsigned i = 0; i < 4; ++i)
++		gpu_wr(gpu, GPU_GBIF_QSB_SIDE0 + 4u * i, 0x00071620u);
++	gpu_wr(gpu, GPU_RBBM_GBIF_CLIENT_QOS, 3);
++	gpu_wr(gpu, GPU_RBBM_PERFCTR_BUSY_MASKED, 0xffffffffu);
++	gpu_wr(gpu, GPU_UCHE_WRITE_RANGE_MAX, 0xffffffc0u);
++	gpu_wr(gpu, GPU_UCHE_WRITE_RANGE_MAX + 4u, 0x0001ffffu);
++	gpu_wr(gpu, GPU_UCHE_TRAP_BASE, 0xfffff000u);
++	gpu_wr(gpu, GPU_UCHE_TRAP_BASE + 4u, 0x0001ffffu);
++	gpu_wr(gpu, GPU_UCHE_WRITE_THRU_BASE, 0xfffff000u);
++	gpu_wr(gpu, GPU_UCHE_WRITE_THRU_BASE + 4u, 0x0001ffffu);
++	gpu_wr(gpu, GPU_UCHE_FILTER_CNTL, 0x804);
++	gpu_wr(gpu, GPU_UCHE_CACHE_WAYS, 0x4);
++	gpu_wr(gpu, GPU_CP_ROQ_THRESHOLDS_2, 0x02000140u);
++	gpu_wr(gpu, GPU_CP_ROQ_THRESHOLDS_1, 0x8040362cu);
++	gpu_wr(gpu, GPU_CP_MEM_POOL_SIZE, 128);
++	gpu_wr(gpu, GPU_PC_DBG_ECO_CNTL, 0x00300200u);
++	gpu_wr(gpu, GPU_CP_AHB_CNTL, 1);
++	gpu_wr(gpu, GPU_RBBM_PERFCTR_CNTL, 1);
++	/* UBWC (a6xx_set_ubwc_config, a650: highest bank bit 16 as the DT says) */
++	gpu_wr(gpu, GPU_RB_NC_MODE_CNTL, (1u << 11) | (1u << 4) | (3u << 1));
++	gpu_wr(gpu, GPU_TPL1_NC_MODE_CNTL, 3u << 1);
++	gpu_wr(gpu, GPU_SP_NC_MODE_CNTL, (2u << 4) | (3u << 1));
++	gpu_wr(gpu, GPU_UCHE_MODE_CNTL, 3u << 21);
++	gpu_wr(gpu, GPU_RBBM_HANG_INT_CNTL, (1u << 30) | 0x1fffffu);
++	gpu_wr(gpu, GPU_UCHE_CLIENT_PF, 1);
++	gpu_wr(gpu, GPU_CP_APRIV_CNTL, GPU_APRIV_VALUE);
++	gpu_wr(gpu, GPU_CP_SQE_INSTR_BASE, CORE_SQE_VA);
++	gpu_wr(gpu, GPU_CP_SQE_INSTR_BASE + 4u, 0);
++	gpu_wr(gpu, GPU_CP_RB_BASE, CORE_RING_VA);
++	gpu_wr(gpu, GPU_CP_RB_BASE + 4u, 0);
++	gpu_wr(gpu, GPU_CP_RB_CNTL, GPU_RB_CNTL_VALUE);
++}
++
++/*
++ * (xnu 0163) A hung 3D core, brought back. Boot 94: opening Settings, the core stopped reading its ring
++ * ("the ring stays full"); the service then refused every later submission for good, backboardd drew
++ * nothing right ("the display hanged then started going crazy") until it ran out of buffer handles and
++ * crashed. Now (as Linux a6xx_recover, without the power cycle): the command processor stopped, the core
++ * soft-reset (RBBM_SW_RESET_CMD), any SMMU fault record cleared, step 19's registers again, the processor
++ * started, CP_ME_INIT and CP_SET_SECURE_MODE 0 at the start of the ring, and every submission made
++ * before counted as done (its fence written): what it was drawing is lost, the next frames are drawn.
++ * At most SWEET_GPU_RECOVERIES times a boot; sweetgpurecover=0: stop for good as before.
++ */
++#define GPU_RBBM_SW_RESET_CMD   GPU_WORD(0x0043)
++#define SWEET_GPU_RECOVERIES    32u
++bool sweet_gpu_recover(void);
++
++bool
++sweet_gpu_recover(void)
++{
++	static uint32_t recoveries;
++	static const uint32_t me_init[8] = { 0x2f, 0x3, 0x20000000u, 0, 0, 0, 0, 0 };
++	uint32_t enabled = 1, at = 0, rptr = ~0u, status = ~0u, cb, fsr;
++	vm_offset_t gpu = kept.gpu;
++	volatile uint32_t *ring = (volatile uint32_t *)kept.ring_mem;
++	uint64_t began = mach_absolute_time(), took_ns;
++
++	(void)PE_parse_boot_argn("sweetgpurecover", &enabled, sizeof(enabled));
++	if (!kept.on || !enabled) {
++		return false;
++	}
++	if (recoveries >= SWEET_GPU_RECOVERIES) {
++		printf("SWEET GPU: kept: the core hung again; %u recoveries this boot are the limit: it stays stopped\n", recoveries);
++		return false;
++	}
++	recoveries++;
++	gpu_wr(gpu, GPU_CP_SQE_CNTL, 0);
++	gpu_wr(gpu, GPU_RBBM_SW_RESET_CMD, 1);
++	(void)gpu_rd(gpu, GPU_RBBM_SW_RESET_CMD);
++	delay(100);
++	gpu_wr(gpu, GPU_RBBM_SW_RESET_CMD, 0);
++	delay(100);
++	cb = (kept.npg + CORE_CONTEXT) * kept.pg;
++	fsr = gpu_rd(kept.smmu, cb + SMMU_CB_FSR);
++	if (fsr & SMMU_FSR_ALL) {
++		gpu_wr(kept.smmu, cb + SMMU_CB_FSR, fsr);            /* write-one-to-clear */
++	}
++	core_hw_regs(gpu);
++	gpu_wr(gpu, GPU_CP_SQE_CNTL, 1);
++	delay(2000);
++	ring[at++] = (7u << 28) | 8u | (gpu_parity(8) << 15) | (CP_ME_INIT << 16) | (gpu_parity(CP_ME_INIT) << 23);
++	for (unsigned i = 0; i < 8; ++i) {
++		ring[at++] = me_init[i];
++	}
++	ring[at++] = (7u << 28) | 1u | (gpu_parity(1) << 15) | (CP_SET_SECURE_MODE << 16) | (gpu_parity(CP_SET_SECURE_MODE) << 23);
++	ring[at++] = 0;
++	gpu_to_memory(kept.ring_mem, 4u * at);
++	gpu_wr(gpu, GPU_CP_RB_WPTR, at);
++	for (unsigned i = 0; i < 20000 && (rptr != at || (status & GPU_BUSY)); ++i) {
++		delay(100);
++		rptr = gpu_rd(gpu, GPU_CP_RB_RPTR);
++		status = gpu_rd(gpu, GPU_RBBM_STATUS);
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - began, &took_ns);
++	if (rptr != at || (status & GPU_BUSY) || gpu_rd(gpu, GPU_CP_HW_FAULT) != 0) {
++		printf("SWEET GPU: kept: recovery %u FAILED: rptr %u of %u, status %#x cp fault %#x smmu fsr was %#x: the core stays stopped\n",
++		    recoveries, rptr, at, status, gpu_rd(gpu, GPU_CP_HW_FAULT), fsr);
++		return false;
++	}
++	kept.at = kept.sent = at;
++	*(volatile uint32_t *)(kept.scratch + KEPT_FENCE_AT) = kept.fence;   /* everything before: done */
++	gpu_to_memory(kept.scratch + KEPT_FENCE_AT, 4);
++	printf("SWEET GPU: kept: RECOVERED the hung core (recovery %u, %llu ms; smmu fsr was %#x); submissions up to %u count as done\n",
++	    recoveries, took_ns / 1000000ull, fsr, kept.fence);
++	return true;
++}
++
+ static void
+ sweet_gpu_probe(unsigned steps)
+ {
+@@ -2020,48 +2141,8 @@
+ 		goto collapse;
+ 
+ 	/* ---- step 19: the core's registers, its command processor, CP_ME_INIT ---- */
+-	static const uint16_t addr_modes[] = { 0x0842, 0x0c01, 0x8601, 0x8e05, 0x9e01, 0xbe05, 0xa601, 0x9601, 0x0e00, 0xae01,
+-		                               0xb601, 0xf810 };
+ 	printf("SWEET GPU: step 19: the core's registers (Linux a6xx hw_init, a650)\n");
+-	gpu_wr(gpu, GPU_GBIF_HALT, 0);
+-	gpu_wr(gpu, GPU_RBBM_GBIF_HALT, 0);
+-	gpu_wr(gpu, GPU_SECVID_TSB_CNTL, 0);
+-	gpu_wr(gpu, GPU_SECVID_TSB_TRUSTED_BASE, 0);
+-	gpu_wr(gpu, GPU_SECVID_TSB_TRUSTED_BASE + 4u, 0);
+-	gpu_wr(gpu, GPU_SECVID_TSB_TRUSTED_SIZE, 0);
+-	for (unsigned i = 0; i < sizeof(addr_modes) / sizeof(addr_modes[0]); ++i)
+-		gpu_wr(gpu, GPU_WORD(addr_modes[i]), 1);           /* 64-bit addresses, every block */
+-	for (unsigned i = 0; i < 4; ++i)
+-		gpu_wr(gpu, GPU_GBIF_QSB_SIDE0 + 4u * i, 0x00071620u);
+-	gpu_wr(gpu, GPU_RBBM_GBIF_CLIENT_QOS, 3);
+-	gpu_wr(gpu, GPU_RBBM_PERFCTR_BUSY_MASKED, 0xffffffffu);
+-	gpu_wr(gpu, GPU_UCHE_WRITE_RANGE_MAX, 0xffffffc0u);
+-	gpu_wr(gpu, GPU_UCHE_WRITE_RANGE_MAX + 4u, 0x0001ffffu);
+-	gpu_wr(gpu, GPU_UCHE_TRAP_BASE, 0xfffff000u);
+-	gpu_wr(gpu, GPU_UCHE_TRAP_BASE + 4u, 0x0001ffffu);
+-	gpu_wr(gpu, GPU_UCHE_WRITE_THRU_BASE, 0xfffff000u);
+-	gpu_wr(gpu, GPU_UCHE_WRITE_THRU_BASE + 4u, 0x0001ffffu);
+-	gpu_wr(gpu, GPU_UCHE_FILTER_CNTL, 0x804);
+-	gpu_wr(gpu, GPU_UCHE_CACHE_WAYS, 0x4);
+-	gpu_wr(gpu, GPU_CP_ROQ_THRESHOLDS_2, 0x02000140u);
+-	gpu_wr(gpu, GPU_CP_ROQ_THRESHOLDS_1, 0x8040362cu);
+-	gpu_wr(gpu, GPU_CP_MEM_POOL_SIZE, 128);
+-	gpu_wr(gpu, GPU_PC_DBG_ECO_CNTL, 0x00300200u);
+-	gpu_wr(gpu, GPU_CP_AHB_CNTL, 1);
+-	gpu_wr(gpu, GPU_RBBM_PERFCTR_CNTL, 1);
+-	/* UBWC (a6xx_set_ubwc_config, a650: highest bank bit 16 as the DT says) */
+-	gpu_wr(gpu, GPU_RB_NC_MODE_CNTL, (1u << 11) | (1u << 4) | (3u << 1));
+-	gpu_wr(gpu, GPU_TPL1_NC_MODE_CNTL, 3u << 1);
+-	gpu_wr(gpu, GPU_SP_NC_MODE_CNTL, (2u << 4) | (3u << 1));
+-	gpu_wr(gpu, GPU_UCHE_MODE_CNTL, 3u << 21);
+-	gpu_wr(gpu, GPU_RBBM_HANG_INT_CNTL, (1u << 30) | 0x1fffffu);
+-	gpu_wr(gpu, GPU_UCHE_CLIENT_PF, 1);
+-	gpu_wr(gpu, GPU_CP_APRIV_CNTL, GPU_APRIV_VALUE);
+-	gpu_wr(gpu, GPU_CP_SQE_INSTR_BASE, CORE_SQE_VA);
+-	gpu_wr(gpu, GPU_CP_SQE_INSTR_BASE + 4u, 0);
+-	gpu_wr(gpu, GPU_CP_RB_BASE, CORE_RING_VA);
+-	gpu_wr(gpu, GPU_CP_RB_BASE + 4u, 0);
+-	gpu_wr(gpu, GPU_CP_RB_CNTL, GPU_RB_CNTL_VALUE);
++	core_hw_regs(gpu);
+ 	printf("SWEET GPU:   sqe_instr_base %#x rb_base %#x rb_cntl %#x apriv %#x rbbm_status %#x\n",
+ 	    gpu_rd(gpu, GPU_CP_SQE_INSTR_BASE), gpu_rd(gpu, GPU_CP_RB_BASE), gpu_rd(gpu, GPU_CP_RB_CNTL),
+ 	    gpu_rd(gpu, GPU_CP_APRIV_CNTL), gpu_rd(gpu, GPU_RBBM_STATUS));
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -62,6 +62,7 @@
+ bool sweet_gpu_done(uint32_t fence);
+ uint32_t sweet_gpu_last(void);
+ void sweet_gpu_report(const char *why);
++bool sweet_gpu_recover(void);                   /* (0163) */
+ 
+ void SweetGPUStart(void);
+ bool sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size);
+@@ -197,7 +198,7 @@
+ 	/* a wait of a second or more that came to nothing: the core has stopped; said once, and not waited for again */
+ 	if (milliseconds >= 1000 && !gGPUStopped) {
+ 		sweet_gpu_report("no answer");
+-		gGPUStopped = true;
++		gGPUStopped = !sweet_gpu_recover();     /* (0163) */
+ 	}
+ 	return false;
+ }
+@@ -616,7 +617,11 @@
+ 	request->fence = (count != 0 && !gGPUStopped) ? sweet_gpu_submit(addresses, words, count) : 0;
+ 	if (request->fence == 0 && count != 0 && !gGPUStopped) {
+ 		sweet_gpu_report("the ring stays full");
+-		gGPUStopped = true;
++		/* (0163) reset the core and submit once more */
++		if (sweet_gpu_recover()) {
++			request->fence = sweet_gpu_submit(addresses, words, count);
++		}
++		gGPUStopped = request->fence == 0;
+ 	}
+ 	if (request->flags & MSM_SUBMIT_FENCE_FD_OUT) {
+ 		request->fence_fd = -1;
