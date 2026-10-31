@@ -2,6 +2,12 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 102 (2026-10-31, kernel 41208843768, userland 41211919226): FILES' REAL BLOCKER = HFS+ ROOT -> userland 41213610351 reports it as apfs <<<
+
+**Observed (fileproviderd debug log, os_log_type_enabled hooked):** `[DEBUG] ┏ Loading home libraries`, `[INFO] Non-eligible device /dev/ufsroot0 [16777216]: non-apfs`, `[DEBUG] Volume /dev/ufsroot0 not eligible to store FP library, skipping` -> no FP library, no domains, Files empty. (PK discovery 8 providers, LS database mapped fine.)
+**Check (ios-re 4121xxxxxxx, FileProviderDaemon 0x1c4a4cab8 -[FPDVolume isEligibleForFPFS:]):** statfs f_flags bit0 (MNT_RDONLY) -> "R/O volume"; bit 12 (MNT_LOCAL) clear -> "non-local"; strcasecmp(f_fstypename (+0x48), "apfs") != 0 -> "non-apfs".
+**Fix (userland 41213610351):** libsweet-fix hooks statfs/fstatfs/getfsstat in fileproviderd/Files/LocalStorageFileProvider/usermanagerd: raw SYS_statfs64/fstatfs64/getfsstat64, "hfs" -> "apfs". Risk: FileProvider may then use APFS-only calls on HFS+ (clonefile, APFS fsctls); watch fixlog errors.
+
 ### >>> BOOT 101 (2026-10-31, kernel 41208843768, userland 41210454348): "Persona List failed" is a red herring -> userland 41211919226 mirrors ALL of fileproviderd's os_log <<<
 
 **Observed:** usermanagerd logs nothing about the request (never reached it). ios-re 41211xxxxxx (UserManagement disassembly): "Persona List failed with error %@" is logged by -[... personaAttributesForPersonaType:withError:] / personaAttributesForPersonaUniqueString: after `[UMXPCServer sharedServer] fetchPersonaSynchronous:{kUMUserPersonaTypeKey: type}` over com.apple.mobile.keybagd.UserManager.xpc: a lookup of one persona type (probably enterprise), whose ENOENT is normal on a phone without one. fileproviderd's remaining clues: `discovered extensions: attributes {NSExtensionPointName = (fileprovider-nonui, fileconversion-nonui)}, extensionSet <nil>` while PKHost found 8 matches; `registering: ( )`.
