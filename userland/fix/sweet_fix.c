@@ -15,10 +15,10 @@
  *
  * (xnu 0164) An os_log mirror for the Files app, fileproviderd and LocalStorageFileProvider (the
  * "On My iPhone" provider), which never started in any boot without saying why: they log only
- * through os_log, which the kernel log never sees. _os_log_impl and its error/fault/debug siblings
- * are interposed (dyld applies an inserted library's __interpose tuples to every image, the shared
- * cache's included); errors and faults are always copied, other lines when they name providers,
- * domains, extensions or failures; at most MIRROR_MAX lines a process, consecutive repeats dropped.
+ * through os_log, which the kernel log never sees. _os_log_impl and its error/fault siblings jump to
+ * our mirror (see hook_jump); errors, faults and default-level lines are copied, info/debug lines
+ * when they name providers, domains, extensions or failures; at most MIRROR_MAX lines a process,
+ * consecutive repeats dropped.
  * They go to stderr (/dev/null for these programs), which the kernel copies into its log for the
  * names 0164 adds to sweetnull: "|fileproviderd| fixlog: E ...".
  */
@@ -30,6 +30,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <dlfcn.h>
+#include <mach/mach.h>
+#include <libkern/OSCacheControl.h>
 
 typedef void (*setter_fn)(id, SEL, id);
 
@@ -69,16 +72,6 @@ FIX_SETTER(3)
 static const IMP fix_new[FIXES] = { (IMP)fix_setter_0, (IMP)fix_setter_1, (IMP)fix_setter_2, (IMP)fix_setter_3 };
 
 /* ---- the os_log mirror ---- */
-typedef void (*oslog_fn)(void *dso, void *log, uint8_t type, const char *format, uint8_t *buf, uint32_t size);
-extern void _os_log_impl(void *dso, void *log, uint8_t type, const char *format, uint8_t *buf, uint32_t size)
-    __attribute__((weak_import));
-extern void _os_log_error_impl(void *dso, void *log, uint8_t type, const char *format, uint8_t *buf, uint32_t size)
-    __attribute__((weak_import));
-extern void _os_log_fault_impl(void *dso, void *log, uint8_t type, const char *format, uint8_t *buf, uint32_t size)
-    __attribute__((weak_import));
-extern void _os_log_debug_impl(void *dso, void *log, uint8_t type, const char *format, uint8_t *buf, uint32_t size)
-    __attribute__((weak_import));
-
 #define MIRROR_MAX 800u
 static int mirror_on;
 static unsigned mirror_lines;
@@ -129,7 +122,7 @@ mirror_wanted(uint8_t type, const char *line)
 		"ail", "rror", "enied", "nvalid", "not ", "nable", "can't", "cannot", "missing", "ejected", NULL
 	};
 
-	if (type >= 0x10) {                     /* OS_LOG_TYPE_ERROR, OS_LOG_TYPE_FAULT */
+	if (type == 0 || type >= 0x10) {        /* OS_LOG_TYPE_DEFAULT, _ERROR, _FAULT */
 		return 1;
 	}
 	for (int i = 0; words[i] != NULL; i++) {
@@ -161,27 +154,49 @@ mirror(uint8_t type, const char *format, const uint8_t *buf, uint32_t size)
 	fprintf(stderr, "fixlog: %c %s\n", type == 0x11 ? 'F' : type == 0x10 ? 'E' : type == 2 ? 'D' : 'I', line);
 }
 
-#define MIRROR_FN(name, real) \
-	static void name(void *dso, void *log, uint8_t type, const char *format, uint8_t *buf, uint32_t size) \
-	{ \
-		mirror(type, format, buf, size); \
-		if (real != NULL) { \
-			real(dso, log, type, format, buf, size); \
-		} \
-	}
-MIRROR_FN(mirror_impl, _os_log_impl)
-MIRROR_FN(mirror_error_impl, _os_log_error_impl)
-MIRROR_FN(mirror_fault_impl, _os_log_fault_impl)
-MIRROR_FN(mirror_debug_impl, _os_log_debug_impl)
+/*
+ * Boot 96: interposing reached only the programs' own calls (one line from fileproviderd, one from
+ * Files): the shared cache's libraries call _os_log_impl directly. So the start of _os_log_impl,
+ * _os_log_error_impl and _os_log_fault_impl (libsystem_trace) is overwritten, in this process only
+ * (the page copied on write, as libsweet-gl does to QuartzCore), with a jump to mirror_entry. The
+ * real function is not called afterwards: these three programs' os_log goes to the kernel log
+ * instead of logd while the mirror is on.
+ */
+static void
+mirror_entry(void *dso, void *log, uint8_t type, const char *format, uint8_t *buf, uint32_t size)
+{
+	(void)dso;
+	(void)log;
+	mirror(type, format, buf, size);
+}
 
-__attribute__((used)) static const struct {
-	const void *replacement, *replacee;
-} mirror_interpose[] __attribute__((section("__DATA,__interpose"))) = {
-	{ (const void *)mirror_impl, (const void *)_os_log_impl },
-	{ (const void *)mirror_error_impl, (const void *)_os_log_error_impl },
-	{ (const void *)mirror_fault_impl, (const void *)_os_log_fault_impl },
-	{ (const void *)mirror_debug_impl, (const void *)_os_log_debug_impl },
-};
+static int
+hook_jump(const char *name, void *to)
+{
+	uint32_t *at = (uint32_t *)dlsym(RTLD_DEFAULT, name);
+	uint32_t words[4];
+	uintptr_t ps = (uintptr_t)getpagesize(), page;
+	uint64_t target = (uint64_t)(uintptr_t)to;
+
+	if (at == NULL) {
+		return 0;
+	}
+	words[0] = 0x58000050u;         /* ldr x16, #8 */
+	words[1] = 0xd61f0200u;         /* br x16 */
+	words[2] = (uint32_t)target;
+	words[3] = (uint32_t)(target >> 32);
+	page = (uintptr_t)at & ~(ps - 1);
+	if (vm_protect(mach_task_self(), (vm_address_t)page, (vm_size_t)(((uintptr_t)(at + 4) - page + ps - 1) & ~(ps - 1)), FALSE,
+	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
+		fprintf(stderr, "fixlog: %s: cannot make it writable\n", name);
+		return 0;
+	}
+	memcpy(at, words, sizeof(words));
+	(void)vm_protect(mach_task_self(), (vm_address_t)page, (vm_size_t)(((uintptr_t)(at + 4) - page + ps - 1) & ~(ps - 1)), FALSE,
+	    VM_PROT_READ | VM_PROT_EXECUTE);
+	sys_icache_invalidate(at, sizeof(words));
+	return 1;
+}
 
 __attribute__((constructor))
 static void
@@ -212,8 +227,12 @@ sweet_fix_init(void)
 			}
 		}
 		if (mirror_on) {
+			int n = hook_jump("_os_log_impl", (void *)mirror_entry);
+			int e = hook_jump("_os_log_error_impl", (void *)mirror_entry);
+			int f = hook_jump("_os_log_fault_impl", (void *)mirror_entry);
+
 			fprintf(stderr, "fixlog: %s[%d]: os_log mirrored (os_log_impl %s, error %s, fault %s)\n", me, getpid(),
-			    _os_log_impl ? "yes" : "no", _os_log_error_impl ? "yes" : "no", _os_log_fault_impl ? "yes" : "no");
+			    n ? "hooked" : "NO", e ? "hooked" : "no", f ? "hooked" : "no");
 		}
 	}
 }
