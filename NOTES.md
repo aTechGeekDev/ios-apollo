@@ -2,6 +2,11 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 100 (2026-10-31, kernel 41208843768 = first Xcode-16 kernel, userland 41208843715): boots; usermanagerd's personas load; the persona LIST request fails -> userland 41210454348 mirrors usermanagerd's server lines <<<
+
+**Observed:** usermanagerd (UMD_INIT, stdout): user session 501 loaded, `Loaded persona manifest` (version 1, generation 1), personas 99/199/200/1000/100 allocated in the kernel (1000 type 5 uid 501; 200 type 6 uid 501). So the manifest exists. But fileproviderd: `Persona List failed ... NSPOSIXErrorDomain Code=2` (x5), Files: `... Code=1 "Operation not permitted"`; still `registering: ( )`, `sourcesByID: { }`. fileproviderd runs in persona 200 (container lookups: origin/proximate personaid 200). The kernel's persona syscalls never return ENOENT (EPERM: info on another persona without com.apple.private.persona-mgmt). The ENOENT most likely comes from usermanagerd's fetchPersonaListforPid answer; its os_log server lines ("In RDServer: fetchPersonaListforPid ...") were filtered out of the mirror (info level, no keyword) -> keywords "ersona", "RDServer", "UMSyncServer" added.
+**Xcode-16 kernel:** booted and ran normally as far as this log shows.
+
 ### >>> BOOT 99 + CI MOVED TO macos-15 (2026-10-31; kernel 41208843768 = 0166+0167 built with Xcode 16.0, userland 41208843715): Files blocked on usermanagerd's persona list; NOT YET BOOTED <<<
 
 **Boot 99 (kernel 41206906921 = 0165, userland 41207174715) observed:** fileproviderd finds all 8 providers incl. com.apple.FileProvider.LocalStorage ("will be managed by runningboard"), then `Persona List failed with error Error Domain=NSPOSIXErrorDomain Code=2 "No such file or directory"` (UserManagement -> usermanagerd), `{unregistering: ( ), registering: ( )}`: no domain registered. Files: `could not find a valid source for com.apple.DocumentsApp (sourcesByID: { })`, `storageURLs is empty` for Local Storage / iCloud Drive / PhotosFileProvider. AegirPoster still loops: `SWEET FILES: /System/Library/ExtensionKit/Extensions: 0 matches listed`, move "not there" -> the poster lives elsewhere (to find).
