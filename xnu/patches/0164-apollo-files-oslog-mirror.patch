@@ -1,0 +1,43 @@
+--- a/bsd/dev/mem.c
++++ b/bsd/dev/mem.c
+@@ -162,16 +162,27 @@
+  * /dev/null goes to the console (and so to the persistent log) as
+  * "|name| text". sweetnull=- turns it off.
+  */
+-static char sweet_null_names[128];
++static char sweet_null_names[192];
+ static int sweet_null_parsed;
+ 
+ static bool
+ sweet_null_tee(char *name, size_t len)
+ {
+ 	if (!sweet_null_parsed) {
++		uint32_t fix = 1;
++
+ 		if (!PE_parse_boot_argn("sweetnull", sweet_null_names, sizeof(sweet_null_names))) {
+ 			strlcpy(sweet_null_names, "backboardd,SpringBoard", sizeof(sweet_null_names));
+ 		}
++		/*
++		 * (xnu 0164) and the programs libsweet-fix.dylib mirrors the os_log of (kern_exec.c's
++		 * built-in sweetinject group; names as proc_selfname gives them, 16 characters at most),
++		 * unless sweetfix=0: the boot line has no room for them
++		 */
++		(void)PE_parse_boot_argn("sweetfix", &fix, sizeof(fix));
++		if (fix != 0 && strcmp(sweet_null_names, "-") != 0) {
++			strlcat(sweet_null_names, ",fileproviderd,Files,LocalStorageFile", sizeof(sweet_null_names));
++		}
+ 		sweet_null_parsed = 1;
+ 	}
+ 	proc_selfname(name, (int)len);
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5589,7 +5589,8 @@
+  * (mkadt.py --file /usr/local/lib/libsweet-fix.dylib=...): dyld ends a
+  * program whose inserted library is missing.
+  */
+-#define SWEET_INJECT_BUILTIN    "/usr/local/lib/libsweet-fix.dylib:ScreenshotServicesService"
++/* (xnu 0164) + the Files app, its daemon and the "On My iPhone" provider: their os_log mirrored (libsweet-fix) */
++#define SWEET_INJECT_BUILTIN    "/usr/local/lib/libsweet-fix.dylib:ScreenshotServicesService,fileproviderd,Files,LocalStorageFileProvider"
+ 
+ static bool
+ sweet_exec_inject(struct image_params *imgp, char *env, size_t size)
