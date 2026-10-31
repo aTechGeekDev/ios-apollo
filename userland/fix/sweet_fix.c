@@ -137,7 +137,7 @@ static int
 mirror_wanted(uint8_t type, const char *line)
 {
 	static const char *const words[] = {
-		"rovider", "omain", "LocalStorage", "xtension", "lugIn", "plugin", "ontainer", "group.",
+		"ersona", "RDServer", "UMSyncServer", "rovider", "omain", "LocalStorage", "xtension", "lugIn", "plugin", "ontainer", "group.",
 		"ail", "rror", "enied", "nvalid", "not ", "nable", "can't", "cannot", "missing", "ejected", NULL
 	};
 
