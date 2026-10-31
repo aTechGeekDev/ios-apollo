@@ -1,0 +1,26 @@
+--- a/iokit/IOKit/IORPC.h
++++ b/iokit/IOKit/IORPC.h
+@@ -224,6 +224,13 @@
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++#ifdef KERNEL
++	/*
++	 * SWEET (xnu 0167): from xnu-11215. Xcode 16's iig generates kernel code that reads it (the
++	 * kernel builds on macOS 15 runners, which have no Xcode 15); NULL: the message is in .message.
++	 */
++	IORPCMessage     * kernelContent;
++#endif /* KERNEL */
+ };
+ typedef struct IORPC IORPC;
+ 
+--- a/iokit/Kernel/IOUserServer.cpp
++++ b/iokit/Kernel/IOUserServer.cpp
+@@ -3358,6 +3358,7 @@
+ 	rpc.sendSize  = mach->msgh.msgh_size;
+ 	rpc.reply     = (IORPCMessageMach *) (p + inSize);
+ 	rpc.replySize = ((uint32_t) (sizeof(buffer.buffer) - inSize));    // inSize was checked
++	rpc.kernelContent = NULL;                                          // SWEET (xnu 0167)
+ 
+ 	message->objects[0] = 0;
+ 	if ((action = OSDynamicCast(OSAction, object))) {
