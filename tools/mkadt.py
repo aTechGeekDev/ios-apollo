@@ -93,7 +93,9 @@ FILE_PREFIXES = ('/usr/local/', '/Library/Wallpaper/', '/private/var/', '/System
                  # the sound (tools/root-files/audio-on.txt): iOS's VirtualAudio.plugin and our HakiosAudio.driver
                  '/Library/Audio/Plug-Ins/', '/System/Library/Audio/Plug-Ins/HAL/',
                  # app extensions that cannot work without Metal (tools/root-files/aegir-off.txt)
-                 '/System/Library/ExtensionKit/')
+                 '/System/Library/ExtensionKit/',
+                 # Sileo moved among the system apps (tools/root-files/sileo-system.txt)
+                 '/Applications/')
 D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
 
 

@@ -1,0 +1,16 @@
+# Sileo onto the home screen (one boot, then leave out; boot 108: Procursus uicache gets "Unable to register" for
+# every app, Sileo's included, so lsd refuses registrations from it). lsd registers every bundle in /Applications by
+# itself when it seeds a new database: Sileo.app is moved there (one HFS+ volume: a plain rename) and the database is
+# removed (the ls-rebuild.txt lines below). The bootstrap archive is removed too, so libsweet-fix no longer starts the
+# installer (it would reinstall Sileo into /var/jb, since /var/jb/Applications/Sileo.app is gone).
+?/private/var/jb/Applications
+>/private/var/jb/Applications/Sileo.app=/Applications/Sileo.app
+-/private/var/sweet-jb/bootstrap.tar.xz
+?/private/var/mobile/Containers/Data/InternalDaemon/*/Library/Caches/com.apple.LaunchServices*
+?/private/var/containers/Data/System/*/Library/Caches/com.apple.LaunchServices*
+?/private/var/mobile/Library/Caches/com.apple.LaunchServices*
+-/private/var/mobile/Containers/Data/InternalDaemon/*/Library/Caches/com.apple.LaunchServices-*.csstore
+-/private/var/mobile/Containers/Data/InternalDaemon/*/Library/Caches/com.apple.LaunchServices.syncInterrupted
+-/private/var/mobile/Containers/Data/InternalDaemon/*/Library/Caches/com.apple.LaunchServices.error
+-/private/var/containers/Data/System/*/Library/Caches/com.apple.LaunchServices-*.csstore
+-/private/var/mobile/Library/Caches/com.apple.LaunchServices-*.csstore
