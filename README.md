@@ -58,9 +58,9 @@ The detailed engineering log, with every boot's results, is [`NOTES.md`](NOTES.m
 
 | Patch | What it does | State |
 | --- | --- | --- |
-| **0158** | Memory bus kept at its top again (suspect for a sudden reset in boot 88); one more busy daemon off (`quiet-on.txt`) | Built, not booted |
-| **0156–0157** | Page flipping (no tearing), fast scaling, named kernel threads, busy daemons off | Booted (boot 88): flips work, idle CPU nearly zero; one sudden reset |
-| Next | The GPU draws each frame scaled straight into the flip buffers: no CPU copy, smooth text, higher frame rate | In progress |
+| **0159** + bridge | The GPU scales each frame (smooth filtering) straight into the flip buffers; no CPU copy | Building, not booted |
+| **0158** | Memory bus kept at its top (suspect for a sudden reset in boot 88); one more busy daemon off | Built, being tested |
+| Next | Whatever boots 89–90 show: resets, frame rate, GPU clock scaling, the microphone | Planned |
 
 ---
 
@@ -184,6 +184,7 @@ Boot options (boot-args) go in `--cmdline`. The most useful ones are below. Each
 | `sweetfb_height=2502` | Full-panel mode (0152): build the device tree with `mkadt.py --display-height 2502` and add `--files-from tools/root-files/mgcache-reset.txt` on the first boot |
 | `sweetfb_native=1` | iOS draws at 1080×2400 1:1 (360×800 points; iOS shows a red status bar). Needs `mkadt.py --native-display` |
 | `sweetfb_stats=N` | Every N s, a `SWEET FB` line with frames a second and copy time (default 10) |
+| `sweetscan=0` | Don't let the GPU scale frames into the flip buffers (0159); the CPU copies them |
 | `sweetflip=0` | Copy each frame into the shown buffer instead of page flipping (0156; tears) |
 | `sweetfb_smooth=1` | Blended (bilinear) scaling instead of nearest pixel: smoother text, but far slower on the CPU (0155/0157) |
 | `apollo_backlight=P` | Backlight: `0` leave it alone, `1`–`100` set a level, absent = keep the bootloader's level |
@@ -251,7 +252,7 @@ None of these files are in git. Each tool runs with the phone in the temporary r
 
 | Path | What's inside |
 | --- | --- |
-| `xnu/patches/` | The kernel: patches 0001–0158 on Apple's xnu-8796, applied in order by CI |
+| `xnu/patches/` | The kernel: patches 0001–0159 on Apple's xnu-8796, applied in order by CI |
 | `shim/` | The boot shim, packed as an Android boot image |
 | `wifi/` | The Linux compatibility layer the Wi-Fi driver (ath11k) is built on |
 | `userland/` | Programs for the phone: Mesa, the CoreAnimation bridge, the audio plug-in, the Bluetooth library, GPU tests ([details](userland/README.md)) |
