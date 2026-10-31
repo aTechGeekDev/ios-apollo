@@ -300,7 +300,7 @@
 +	int           fFlipCount;               /* 3, or 0: no flips */
 +	uint64_t      fFlipPA[3];
 +	vm_offset_t   fFlipVA[3];
-+	int           fFront, fPending;         /* the frame the panel scans; the one flipped to and not yet taken (-1) */
++	int           fFlipFront, fFlipPending; /* the frame the panel scans; the one flipped to and not yet taken (-1) */
 +	uintptr_t     fDraw;                    /* where present() draws: a frame's mapping */
 +	uint32_t      fStatFlips, fStatFlipWaits;
  
@@ -320,8 +320,8 @@
 +	/* (xnu 0156) the page flips' frames; without them every frame goes into fPixels as before */
 +	fDraw = fPixels;
 +	fFlipVA[0] = fPixels;
-+	fFront = 0;
-+	fPending = -1;
++	fFlipFront = 0;
++	fFlipPending = -1;
 +	fFlipCount = fPixels != 0 ? sweet_flip_init(fPhys, fRowBytes, fHeight, fFlipPA, fFlipVA) : 0;
  	fWorkLoop = IOWorkLoop::workLoop();
  	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
@@ -368,7 +368,7 @@
 +		 */
 +		int target = -1;
 +		if (fFlipCount == 3 && coversDisplay(rec)) {
-+			if (fPending >= 0) {
++			if (fFlipPending >= 0) {
 +				uint64_t waited_us = 0;
 +				while (!sweet_flip_latched() && waited_us < 50000) {
 +					IODelay(200);
@@ -378,20 +378,20 @@
 +					fStatFlipWaits++;
 +				}
 +				if (sweet_flip_latched()) {
-+					fFront = fPending;
-+					fPending = -1;
++					fFlipFront = fFlipPending;
++					fFlipPending = -1;
 +				}
 +			}
 +			for (int f = 0; f < 3 && target < 0; f++) {
-+				if (f != fFront && f != fPending) {
++				if (f != fFlipFront && f != fFlipPending) {
 +					target = f;
 +				}
 +			}
 +		}
-+		fDraw = target >= 0 ? fFlipVA[target] : fFlipCount ? fFlipVA[fPending >= 0 ? fPending : fFront] : fPixels;
++		fDraw = target >= 0 ? fFlipVA[target] : fFlipCount ? fFlipVA[fFlipPending >= 0 ? fFlipPending : fFlipFront] : fPixels;
  		bool shown = present(rec);
-+		if (shown && target >= 0 && fPending < 0 && sweet_flip(fFlipPA[target])) {
-+			fPending = target;
++		if (shown && target >= 0 && fFlipPending < 0 && sweet_flip(fFlipPA[target])) {
++			fFlipPending = target;
 +			fStatFlips++;
 +		}
  		uint64_t spent = mach_absolute_time() - began;

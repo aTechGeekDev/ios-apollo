@@ -217,3 +217,10 @@ jobs:
           name: xnu-kernel
           path: out/
           if-no-files-found: warn
+
+      # Last, so that the end of the log (all an API reader may get) has them: the compile errors again, short.
+      - name: Compile errors (again, last)
+        if: failure()
+        run: |
+          echo "compile errors: $(grep -c -E ' error:' build.log || true)"
+          grep -E ' error:' build.log | sort -u | head -40 || true
