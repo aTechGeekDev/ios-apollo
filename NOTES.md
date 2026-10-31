@@ -2,6 +2,11 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 106 (2026-10-31, kernel 41216279299 = 0168, userland 41216279313 + jb-install.txt): no installer at all -> userland 41217755048 <<<
+
+**Observed:** the three files written (SWEET FILES), `exec configd`, but no `sweet-jb:` line and nothing from libsweet-fix in configd (its stderr reaches no log); usermanagerd's libsweet-fix loaded as before (no longer a trigger). Unknown: whether 0168 inserted the library into configd and what posix_spawn returned.
+**Change:** libsweet-fix's jailbreak start logs to /dev/console (`sweet-fix: <prog>[pid] uid N: jailbreak: done/archive/installer` and `... installer started/NOT started (error N)`); usermanagerd is a trigger again besides configd (the installer's flock keeps one at a time); the installer ignores SIGHUP/SIGTERM.
+
 ### >>> BOOT 105 (2026-10-31, kernel 41208843768, userland 41215357320 + jb-install.txt): installer started twice, killed mid-unpack -> kernel 41216279299 (0168) + userland 41216279313 <<<
 
 **Observed (user's grep):** `fixlog: jailbreak installer started (pid 13)` (usermanagerd's boot task) and again `(pid 94)` (the usermanagerd daemon); each logged "step 1: unpacking" and nothing after; no Sileo after 3 min. Cause (inferred): launchd ends usermanagerd's jobs (boot task; daemon `-t 15` idle exit) together with the processes they started.
