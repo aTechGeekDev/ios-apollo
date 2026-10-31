@@ -327,8 +327,10 @@ fix_setup_done(void)
 }
 
 /*
- * (jailbreak) In usermanagerd (root, early in every boot): start userland/jb's sweet-jbinstall, detached in its
- * own session and without our DYLD_ variables, while its archive is there and /var/jb/.sweet-jb-done is not.
+ * (jailbreak) In configd (root, alive for the whole boot; xnu 0168 inserts us): start userland/jb's sweet-jbinstall,
+ * detached in its own session and without our DYLD_ variables, while its archive is there and
+ * /var/jb/.sweet-jb-done is not. Boot 105 started it from usermanagerd instead: launchd ends that job after 15 s
+ * idle (and its boot task sooner) and the processes it started with it, mid-unpack.
  */
 static void
 fix_start_jb_installer(void)
@@ -374,14 +376,14 @@ sweet_fix_init(void)
 		static const char *const mirrored[] = { "fileproviderd", "Files", "LocalStorageFileProvider", "usermanagerd", NULL };
 		const char *me = getprogname();
 
+		if (me != NULL && strcmp(me, "configd") == 0) {
+			fix_start_jb_installer();
+		}
 		for (int i = 0; me != NULL && mirrored[i] != NULL; i++) {
 			if (strcmp(me, mirrored[i]) == 0) {
 				mirror_on = 1;
 				mirror_all = strcmp(me, "fileproviderd") == 0;
 			}
-		}
-		if (mirror_on && strcmp(me, "usermanagerd") == 0) {
-			fix_start_jb_installer();
 		}
 		if (mirror_on && strcmp(me, "usermanagerd") != 0) {
 			int a = hook_jump("statfs", (void *)fix_statfs);

@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -237,6 +238,9 @@ unpack(void)
 		if (hdr[0] == 0) {
 			break;                                  /* the end blocks */
 		}
+		if ((files + dirs + links) % 1000 == 999) {
+			say("... %u entries so far", files + dirs + links + 1);
+		}
 		uint64_t size = tar_number(hdr + 124, 12), padded = (size + 511) & ~511ull;
 		char type = hdr[156];
 
@@ -409,6 +413,12 @@ main(void)
 	(void)mkdir(DIR_IN, 0755);
 	logfile = fopen(LOG_FILE, "a");
 	if (stat(DONE, &st) == 0) {
+		return 0;
+	}
+	/* one installer at a time (boot 105: two ran at once) */
+	int lock = open(DIR_IN "/lock", O_RDWR | O_CREAT, 0600);
+	if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB) != 0) {
+		say("another installer is running; leaving it to that one");
 		return 0;
 	}
 	say("pid %d, uid %d: installing the jailbreak userland", getpid(), getuid());
