@@ -1,0 +1,505 @@
+--- a/bsd/dev/sweet_display.c
++++ b/bsd/dev/sweet_display.c
+@@ -15,6 +15,11 @@
+  * framebuffer and two more behind it, write-combined. Flips are refused when the display's SMMU stream would translate the
+  * address (the stream's match register says translate with the context's MMU on, or fault): then nothing changes.
+  * Boot-arg sweetflip=0: no flips (the copy into the scanned buffer, as before).
++ *
++ * (xnu 0159) The frames' rows are 64-byte multiples (4352 bytes for 1080 pixels; the boot framebuffer's are 4320), so that
++ * the GPU can draw into them (a render target's pitch is in 64-byte units: Mesa's freedreno refuses others; hakios-apollo's
++ * apollo_gpu_present does the same): three such frames still fit the reservation (3 x 10.45 MB of 35). All three, the boot
++ * framebuffer's place included, are mapped here at their full size; a flip writes the pipe's stride too when it changes.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -33,8 +38,9 @@
+ #define VM_WIMG_WCOMB           0x6u
+ #endif
+ 
+-int sweet_flip_init(uint64_t fb_phys, uint32_t stride, uint32_t height, uint64_t pa[3], vm_offset_t va[3]);
+-bool sweet_flip(uint64_t phys);
++int sweet_flip_init(uint64_t fb_phys, uint32_t stride, uint32_t height, uint32_t *frame_stride, uint64_t pa[3],
++    vm_offset_t va[3]);
++bool sweet_flip(uint64_t phys, uint32_t stride);
+ bool sweet_flip_latched(void);
+ uint32_t sweet_flip_frame_count(void);
+ 
+@@ -94,6 +100,7 @@
+ static vm_offset_t mdp, intf, ctl_base[CTL_COUNT];
+ static int ctl_driving = -1, sspp_found = -1;
+ static uint32_t flip_bit;
++static uint32_t pipe_stride;            /* (0159) the stride the pipe has now */
+ static bool ready;
+ 
+ static void
+@@ -164,9 +171,11 @@
+  * The number of frames (3), or 0: no flips (nothing was written to the display).
+  */
+ int
+-sweet_flip_init(uint64_t fb_phys, uint32_t stride, uint32_t height, uint64_t pa[3], vm_offset_t va[3])
++sweet_flip_init(uint64_t fb_phys, uint32_t stride, uint32_t height, uint32_t *frame_stride, uint64_t pa[3],
++    vm_offset_t va[3])
+ {
+ 	uint32_t enabled = 1;
++	uint32_t gpu_stride = (stride + 63) & ~63u;     /* (0159) */
+ 	uint64_t bytes;
+ 
+ 	(void)PE_parse_boot_argn("sweetflip", &enabled, sizeof(enabled));
+@@ -178,7 +187,7 @@
+ 		printf("SWEET FLIP: the framebuffer is at %#llx, not at the display's reservation: no flips\n", fb_phys);
+ 		return 0;
+ 	}
+-	bytes = ((uint64_t)stride * height + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
++	bytes = ((uint64_t)gpu_stride * height + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+ 	if (3 * bytes > DISPLAY_RESERVED_SIZE) {
+ 		printf("SWEET FLIP: three frames of %llu bytes do not fit the display's reservation: no flips\n", bytes);
+ 		return 0;
+@@ -206,30 +215,41 @@
+ 		return 0;
+ 	}
+ 	flip_bit = 1u << sspp_table[sspp_found].flush_bit;
+-	pa[0] = fb_phys;
+-	for (int i = 1; i < 3; i++) {
++	pipe_stride = stride;
++	*frame_stride = gpu_stride;
++	for (int i = 0; i < 3; i++) {
+ 		pa[i] = fb_phys + (uint64_t)i * bytes;
+ 		va[i] = ml_io_map_unmappable((vm_offset_t)pa[i], (vm_size_t)bytes, VM_WIMG_WCOMB);
+ 		if (va[i] == 0) {
+ 			printf("SWEET FLIP: frame %d at %#llx cannot be mapped: no flips\n", i, pa[i]);
+ 			return 0;
+ 		}
+-		/* (not filled: the framebuffer flips to a frame only after a whole picture was drawn into it) */
++		/* (not filled: the framebuffer flips to a frame only after a whole picture was drawn into it; frame 0, the boot
++		 * framebuffer, keeps what the panel shows until then) */
+ 	}
+ 	ready = true;
+-	printf("SWEET FLIP: %s on %#llx flipped by ctl_%d (flush bit %u); frames at %#llx, %#llx, %#llx (%llu bytes each)\n",
+-	    sspp_table[sspp_found].name, fb_phys, ctl_driving, sspp_table[sspp_found].flush_bit, pa[0], pa[1], pa[2], bytes);
++	printf("SWEET FLIP: %s on %#llx flipped by ctl_%d (flush bit %u); frames at %#llx, %#llx, %#llx (%llu bytes each, rows "
++	    "of %u)\n", sspp_table[sspp_found].name, fb_phys, ctl_driving, sspp_table[sspp_found].flush_bit, pa[0], pa[1], pa[2],
++	    bytes, gpu_stride);
+ 	return 3;
+ }
+ 
+ /* the pipe to `phys` at the next frame start (hakios's apollo_display_flip, stride unchanged); false: nothing written */
+ bool
+-sweet_flip(uint64_t phys)
++sweet_flip(uint64_t phys, uint32_t stride)
+ {
+-	if (!ready || phys >= (1ull << 32) || (phys & 0xff) != 0) {
++	vm_offset_t b;
++
++	if (!ready || phys >= (1ull << 32) || (phys & 0xff) != 0 || stride == 0 || stride > 0xffff) {
+ 		return false;
+ 	}
+-	wr(mdp + sspp_table[sspp_found].offset + SSPP_SRC0_ADDR, (uint32_t)phys);
++	b = mdp + sspp_table[sspp_found].offset;
++	if (stride != pipe_stride) {
++		/* (0159) taken with the address at the same frame start (dpu_hw_sspp_setup_sourceaddress / _setup_rects) */
++		wr(b + SSPP_SRC_YSTRIDE0, (rd(b + SSPP_SRC_YSTRIDE0) & 0xffff0000u) | stride);
++		pipe_stride = stride;
++	}
++	wr(b + SSPP_SRC0_ADDR, (uint32_t)phys);
+ 	__asm__ volatile ("dsb sy" : : : "memory");
+ 	wr(ctl_base[ctl_driving] + CTL_FLUSH, flip_bit);        /* last */
+ 	return true;
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -58,6 +58,20 @@
+  * 375 points, so iOS keeps the iPhone X's layouts across (status bar, Control
+  * Center); only the height is the panel's.
+  *
++ * (xnu 0159) The GPU scales the frame: the three flip frames (64-byte-multiple rows,
++ * sweet_display.c) are published as IOSurfaces, so the CoreAnimation bridge in
++ * backboardd (userland/ca-bridge/eagl.c, scan_frame()) can have the GPU draw
++ * iOS's finished picture into one, scaled with filtering, the moment
++ * CoreAnimation finishes it -- as hakios-apollo's apollo_gpu_present. It asks
++ * through selector kSweetFBScan (info / acquire / queue / release): a frame it
++ * acquires is its own until it queues it, marked with the picture's surface id;
++ * the present thread, given a swap whose only layer is that surface over the
++ * whole display, waits for the GPU (sweet_gpu_surface_ready) and flips to the
++ * frame: nothing is copied by a processor. Anything else is copied as before.
++ * A frame's owner: free, the bridge's, queued (ready) or the present thread's
++ * (being copied into); the shown and the pending frame are never handed out.
++ * Boot-arg sweetscan=0: the frames are not offered (the bridge keeps away).
++ *
+  * (xnu 0156) No tearing: each frame is drawn into a buffer the panel is not
+  * scanning and the panel is switched to it at its next refresh (a page flip of
+  * the display controller's source pipe, bsd/dev/sweet_display.c, as hakios-apollo
+@@ -109,8 +123,9 @@
+ extern "C" uint32_t apollo_backlight_value(void);                               /* (xnu 0154) */
+ extern "C" { int sweet_display_dark; }  /* (xnu 0155) off and blanked: sweet_touch.c polls slowly */
+ /* (xnu 0156) bsd/dev/sweet_display.c: page flips of the panel's scanout */
+-extern "C" int sweet_flip_init(uint64_t fb_phys, uint32_t stride, uint32_t height, uint64_t pa[3], vm_offset_t va[3]);
+-extern "C" bool sweet_flip(uint64_t phys);
++extern "C" int sweet_flip_init(uint64_t fb_phys, uint32_t stride, uint32_t height, uint32_t *frame_stride, uint64_t pa[3],
++    vm_offset_t va[3]);
++extern "C" bool sweet_flip(uint64_t phys, uint32_t stride);
+ extern "C" bool sweet_flip_latched(void);
+ 
+ #if defined(SWEET)
+@@ -138,6 +153,7 @@
+ 	kSweetFBIsMainDisplay           = 18,
+ 	kSweetFBGetDotPitch             = 28,
+ 	kSweetFBNotifications           = 72,
++	kSweetFBScan                    = 200,  /* (xnu 0159) ours: the bridge's GPU scaling into the flip frames */
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
+@@ -161,6 +177,30 @@
+ #define SWEET_FB_FIT_NUM                24
+ #define SWEET_FB_FIT_DEN                25
+ 
++/*
++ * (xnu 0159) kSweetFBScan: one structure in and out (userland/ca-bridge/eagl.c has the same). op: SWEET_SCAN_INFO (the
++ * frames: count, ids, size, rows; the display's size and where its picture goes: band = the panel line its first line lands
++ * on, scaled_height = the lines it takes), _ACQUIRE (a frame for the bridge: index; waits up to timeout_ms), _QUEUE (index
++ * holds the picture of surface `mark`), _RELEASE (index given back unused).
++ */
++#define SWEET_SCAN_INFO         0
++#define SWEET_SCAN_ACQUIRE      1
++#define SWEET_SCAN_QUEUE        2
++#define SWEET_SCAN_RELEASE      3
++#define SWEET_SCAN_FREE         0       /* a frame's owner */
++#define SWEET_SCAN_BRIDGE       1
++#define SWEET_SCAN_READY        2
++#define SWEET_SCAN_CPU          3
++struct sweet_scan_request {
++	uint32_t op, index, mark, timeout_ms;
++	uint32_t count, width, height, stride;
++	uint32_t display_width, display_height;
++	int32_t  band;
++	uint32_t scaled_height;
++	uint32_t ids[3], flags;
++};
++static uint32_t get32(const uint8_t *p, uint32_t off);    /* (below) */
++
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+ };
+@@ -218,6 +258,15 @@
+ 	vm_offset_t   fFlipVA[3];
+ 	int           fFlipFront, fFlipPending; /* the frame the panel scans; the one flipped to and not yet taken (-1) */
+ 	uintptr_t     fDraw;                    /* where present() draws: a frame's mapping */
++	/* (xnu 0159) the frames' rows, the shown frame's (the boot framebuffer's until the first flip), the one drawn into now */
++	uint32_t      fFlipStride, fFrontStride, fDrawRow;
++	SweetSurface *fFlipSurf[3];             /* the frames as IOSurfaces, for the GPU */
++	uint32_t      fFlipOwner[3];            /* SWEET_SCAN_FREE / _BRIDGE / _READY / _CPU */
++	uint32_t      fFlipMark[3], fFlipSeq[3], fScanSeq;
++	bool          fScanReady;
++	uint32_t      fStatGPU;
++	void settleFlip(void);
++	IOReturn scan(void *request);
+ 	uint32_t      fStatFlips, fStatFlipWaits;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -452,10 +501,23 @@
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	/* (xnu 0156) the page flips' frames; without them every frame goes into fPixels as before */
+ 	fDraw = fPixels;
+-	fFlipVA[0] = fPixels;
++	fDrawRow = fFrontStride = fRowBytes;
+ 	fFlipFront = 0;
+ 	fFlipPending = -1;
+-	fFlipCount = fPixels != 0 ? sweet_flip_init(fPhys, fRowBytes, fHeight, fFlipPA, fFlipVA) : 0;
++	fFlipCount = fPixels != 0 ? sweet_flip_init(fPhys, fRowBytes, fHeight, &fFlipStride, fFlipPA, fFlipVA) : 0;
++	/* (xnu 0159) the frames as surfaces the GPU can draw into */
++	int scanOn = 1;
++	PE_parse_boot_argn("sweetscan", &scanOn, sizeof(scanOn));
++	fScanReady = fFlipCount == 3 && scanOn != 0;
++	for (int f = 0; f < 3 && fScanReady; f++) {
++		fFlipSurf[f] = sweet_surface_create_physical(fFlipPA[f], fWidth, fHeight, fFlipStride, SWEET_FB_FORMAT_BGRA);
++		fScanReady = fFlipSurf[f] != NULL;
++	}
++	if (fFlipCount == 3) {
++		IOLog("SWEET FB: GPU scaling %s (frames %u, %u, %u; rows of %u)\n", fScanReady ? "offered" :
++		    scanOn ? "NOT offered: no surfaces" : "not offered (sweetscan=0)", fFlipSurf[0] ? fFlipSurf[0]->id : 0,
++		    fFlipSurf[1] ? fFlipSurf[1]->id : 0, fFlipSurf[2] ? fFlipSurf[2]->id : 0, fFlipStride);
++	}
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+@@ -582,9 +644,9 @@
+ 		    lateMost / NSEC_PER_MSEC, lateMost % NSEC_PER_MSEC / 100000);
+ 		if (fb->fFlipCount != 0) {
+ 			/* (xnu 0156) */
+-			IOLog("SWEET FB: %u page flips (%u frames waited for the last flip to be taken)\n", fb->fStatFlips,
+-			    fb->fStatFlipWaits);
+-			fb->fStatFlips = fb->fStatFlipWaits = 0;
++			IOLog("SWEET FB: %u page flips, %u of them frames the GPU scaled (%u frames waited for the last flip to be taken)\n",
++			    fb->fStatFlips, fb->fStatGPU, fb->fStatFlipWaits);
++			fb->fStatFlips = fb->fStatFlipWaits = fb->fStatGPU = 0;
+ 		}
+ 		fb->fStatSince = now;
+ 		fb->fStatSwaps = fb->fStatShown = fb->fStatBusy = fb->fStatTicks = fb->fStatSkipped = 0;
+@@ -635,8 +697,9 @@
+ 			/* (0156) every frame black: whichever the panel scans */
+ 			for (int f = 0; f < (fFlipCount ? fFlipCount : 1); f++) {
+ 				uintptr_t frame = fFlipCount ? fFlipVA[f] : fPixels;
++				uint32_t rowb = fFlipCount ? (f == fFlipFront ? fFrontStride : fFlipStride) : fRowBytes;  /* (0159) */
+ 				for (uint32_t y = 0; y < fHeight; y++) {
+-					volatile uint64_t *row = (volatile uint64_t *)(frame + (uint64_t)y * fRowBytes);
++					volatile uint64_t *row = (volatile uint64_t *)(frame + (uint64_t)y * rowb);
+ 					for (uint32_t x = 0; x < fWidth / 2; x++) {
+ 						row[x] = 0;
+ 					}
+@@ -667,33 +730,79 @@
+ 		 * (xnu 0156) where to draw: with flips and a swap covering the display, the frame neither scanned nor waiting
+ 		 * to be (the last flip settled first: at most a refresh); else the scanned one, as before.
+ 		 */
+-		int target = -1;
++		int target = -1, gpuFrame = -1;
+ 		if (fFlipCount == 3 && coversDisplay(rec)) {
+-			if (fFlipPending >= 0) {
+-				uint64_t waited_us = 0;
+-				while (!sweet_flip_latched() && waited_us < 50000) {
+-					IODelay(200);
+-					waited_us += 200;
+-				}
+-				if (waited_us != 0) {
+-					fStatFlipWaits++;
++			/* (xnu 0159) a frame the GPU has already scaled this swap's picture into: its only layer is that surface */
++			uint32_t mask = get32(rec, 0x104), layer0 = (mask & 1u) ? get32(rec, 0x54) : 0, newest = 0;
++			bool only0 = layer0 != 0;
++			for (uint32_t l = 1; l < SWEET_FB_LAYERS; l++) {
++				only0 = only0 && (!(mask & (1u << l)) || get32(rec, 0x54 + 4 * l) == 0);
++			}
++			IOLockLock(fLock);
++			for (int f = 0; f < 3 && only0 && fScanReady; f++) {
++				if (fFlipOwner[f] == SWEET_SCAN_READY && fFlipMark[f] == layer0 && fFlipSeq[f] >= newest) {
++					gpuFrame = f;
++					newest = fFlipSeq[f];
+ 				}
+-				if (sweet_flip_latched()) {
+-					fFlipFront = fFlipPending;
+-					fFlipPending = -1;
++			}
++			IOLockUnlock(fLock);
++			/* the last flip settled first (at most a refresh: 7 ms at 144 Hz) */
++			uint64_t waited_us = 0;
++			for (;;) {
++				IOLockLock(fLock);
++				settleFlip();
++				bool settled = fFlipPending < 0;
++				IOLockUnlock(fLock);
++				if (settled || waited_us >= 50000) {
++					break;
+ 				}
++				IODelay(200);
++				waited_us += 200;
+ 			}
+-			for (int f = 0; f < 3 && target < 0; f++) {
+-				if (f != fFlipFront && f != fFlipPending) {
+-					target = f;
++			if (waited_us != 0) {
++				fStatFlipWaits++;
++			}
++			if (gpuFrame < 0) {
++				/* the processor copies: into a frame nobody has (marked so while it does) */
++				IOLockLock(fLock);
++				for (int f = 0; f < 3 && target < 0 && fFlipPending < 0; f++) {
++					if (f != fFlipFront && fFlipOwner[f] == SWEET_SCAN_FREE) {
++						target = f;
++						fFlipOwner[f] = SWEET_SCAN_CPU;
++					}
+ 				}
++				IOLockUnlock(fLock);
+ 			}
+ 		}
+-		fDraw = target >= 0 ? fFlipVA[target] : fFlipCount ? fFlipVA[fFlipPending >= 0 ? fFlipPending : fFlipFront] : fPixels;
+-		bool shown = present(rec);
+-		if (shown && target >= 0 && fFlipPending < 0 && sweet_flip(fFlipPA[target])) {
+-			fFlipPending = target;
+-			fStatFlips++;
++		bool shown;
++		if (gpuFrame >= 0) {
++			/* (0159) nothing to copy: once the GPU has finished drawing the frame, it is flipped to */
++			shown = sweet_gpu_surface_ready(fFlipSurf[gpuFrame]->id, NULL, 0);
++		} else {
++			fDraw = target >= 0 ? fFlipVA[target] : fFlipCount ? fFlipVA[fFlipPending >= 0 ? fFlipPending : fFlipFront] : fPixels;
++			fDrawRow = target >= 0 || (fFlipCount && fFlipPending >= 0) ? fFlipStride : fFlipCount ? fFrontStride : fRowBytes;
++			shown = present(rec);
++		}
++		int flipTo = gpuFrame >= 0 ? gpuFrame : target;
++		if (flipTo >= 0) {
++			IOLockLock(fLock);
++			if (shown && fFlipPending < 0 && sweet_flip(fFlipPA[flipTo], fFlipStride)) {
++				fFlipPending = flipTo;
++				fStatFlips++;
++				if (gpuFrame >= 0) {
++					/* older queued frames (swaps that were never shown) given back */
++					for (int f = 0; f < 3; f++) {
++						if (f != flipTo && fFlipOwner[f] == SWEET_SCAN_READY && fFlipSeq[f] < fFlipSeq[flipTo]) {
++							fFlipOwner[f] = SWEET_SCAN_FREE;
++						}
++					}
++					fStatGPU++;
++				}
++				fFlipOwner[flipTo] = SWEET_SCAN_FREE;
++			} else if (gpuFrame < 0) {
++				fFlipOwner[flipTo] = SWEET_SCAN_FREE;  /* (a queued frame stays queued: tried again) */
++			}
++			IOLockUnlock(fLock);
+ 		}
+ 		uint64_t spent = mach_absolute_time() - began;
+ 		if (!shown) {
+@@ -725,7 +834,101 @@
+ 	}
+ }
+ 
+-static uint32_t get32(const uint8_t *p, uint32_t off);    /* (below) */
++/* (xnu 0159) with fLock held: the last flip taken by the hardware, the frame it went to is the shown one */
++void
++AppleCLCD::settleFlip(void)
++{
++	if (fFlipPending >= 0 && sweet_flip_latched()) {
++		fFlipFront = fFlipPending;
++		fFrontStride = fFlipStride;
++		fFlipPending = -1;
++	}
++}
++
++/* (xnu 0159) kSweetFBScan, for the bridge (see the top of this file and struct sweet_scan_request) */
++IOReturn
++AppleCLCD::scan(void *request)
++{
++	struct sweet_scan_request *r = (struct sweet_scan_request *)request;
++	IOReturn ret = kIOReturnSuccess;
++
++	if (!fScanReady) {
++		return kIOReturnUnsupported;
++	}
++	switch (r->op) {
++	case SWEET_SCAN_INFO:
++		r->count = 3;
++		r->width = fWidth;
++		r->height = fHeight;
++		r->stride = fFlipStride;
++		r->display_width = fLogicalW;
++		r->display_height = fLogicalH;
++		r->band = fFit ? fFitBand : -fOffY;
++		r->scaled_height = fFit ? fFitHeight : fLogicalH;
++		r->flags = fFit ? 1 : 0;
++		for (int f = 0; f < 3; f++) {
++			r->ids[f] = fFlipSurf[f]->id;
++		}
++		break;
++	case SWEET_SCAN_ACQUIRE: {
++		uint32_t waited_us = 0, limit_us = (r->timeout_ms > 100 ? 100 : r->timeout_ms) * 1000;
++		int got = -1;
++
++		for (;;) {
++			IOLockLock(fLock);
++			settleFlip();
++			for (int f = 0; f < 3 && got < 0; f++) {
++				if (f != fFlipFront && f != fFlipPending && fFlipOwner[f] == SWEET_SCAN_FREE) {
++					got = f;
++				}
++			}
++			if (got < 0 && waited_us >= limit_us) {
++				/* none free in time: the oldest queued frame is taken back (its swap is older than this picture) */
++				uint32_t oldest = 0xffffffffu;
++				for (int f = 0; f < 3; f++) {
++					if (f != fFlipFront && f != fFlipPending && fFlipOwner[f] == SWEET_SCAN_READY && fFlipSeq[f] < oldest) {
++						got = f;
++						oldest = fFlipSeq[f];
++					}
++				}
++			}
++			if (got >= 0) {
++				fFlipOwner[got] = SWEET_SCAN_BRIDGE;
++			}
++			IOLockUnlock(fLock);
++			if (got >= 0 || waited_us >= limit_us) {
++				break;
++			}
++			IODelay(500);
++			waited_us += 500;
++		}
++		if (got < 0) {
++			ret = kIOReturnBusy;
++		} else {
++			r->index = (uint32_t)got;
++		}
++		break;
++	}
++	case SWEET_SCAN_QUEUE:
++	case SWEET_SCAN_RELEASE:
++		IOLockLock(fLock);
++		if (r->index >= 3 || fFlipOwner[r->index] != SWEET_SCAN_BRIDGE) {
++			ret = kIOReturnBadArgument;
++		} else if (r->op == SWEET_SCAN_QUEUE) {
++			fFlipOwner[r->index] = SWEET_SCAN_READY;
++			fFlipMark[r->index] = r->mark;
++			fFlipSeq[r->index] = ++fScanSeq;
++		} else {
++			fFlipOwner[r->index] = SWEET_SCAN_FREE;
++		}
++		IOLockUnlock(fLock);
++		break;
++	default:
++		ret = kIOReturnBadArgument;
++		break;
++	}
++	return ret;
++}
+ 
+ /* (xnu 0156) one of the swap's layers fills the whole presented display: the frame can be drawn into an empty buffer */
+ bool
+@@ -813,7 +1016,7 @@
+ 			}
+ 			line = fLine;
+ 		}
+-		uint32_t *to = (uint32_t *)(fDraw + (uint64_t)py * fRowBytes) + px0;
++		uint32_t *to = (uint32_t *)(fDraw + (uint64_t)py * fDrawRow) + px0;
+ 		for (uint32_t i = 0; i < n; i++) {
+ 			uint32_t x = fXMap[i], wx = fXWeight[i];
+ 			to[i] = wx == 0 ? line[x] : sweet_mix(line[x], line[x + 1], wx);
+@@ -901,7 +1104,7 @@
+ 			uint32_t from = band == 0 ? 0 : fFitEnd, to = band == 0 ? fFitTop : fHeight;
+ 
+ 			for (uint32_t y = from; y < to; y++) {
+-				volatile uint64_t *line = (volatile uint64_t *)(fDraw + (uint64_t)y * fRowBytes);
++				volatile uint64_t *line = (volatile uint64_t *)(fDraw + (uint64_t)y * fDrawRow);
+ 				for (uint32_t x = 0; x < fWidth / 2; x++) {
+ 					line[x] = 0;
+ 				}
+@@ -1009,7 +1212,7 @@
+ 					int32_t ys = ((int32_t)py - fFitBand) * SWEET_FB_FIT_DEN / SWEET_FB_FIT_NUM - dy;
+ 					const uint32_t *from = (const uint32_t *)(src + start +
+ 					    (uint64_t)(sy + (ys < 0 ? 0 : ys >= h ? h - 1 : ys)) * row);
+-					uint32_t *to = (uint32_t *)(fDraw + (uint64_t)py * fRowBytes) + px0;
++					uint32_t *to = (uint32_t *)(fDraw + (uint64_t)py * fDrawRow) + px0;
+ 
+ 					for (uint32_t i = 0; i < px1 - px0; i++) {
+ 						to[i] = from[fXMap[i]];
+@@ -1051,7 +1254,7 @@
+ 		}
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fDraw + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++				memcpy((void *)(fDraw + (uint64_t)(dy + y) * fDrawRow + (uint64_t)dx * 4),
+ 				    (const void *)(src + start + (uint64_t)(sy + y) * row + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
+@@ -1151,6 +1354,19 @@
+ 		IOLockUnlock(fFB->fLock);
+ 		outCount = 1;
+ 		break;
++	case kSweetFBScan: {
++		/* (xnu 0159) a structure in and out; returned here (the end of this method clears structure outputs) */
++		struct sweet_scan_request r;
++		if (args->structureInputDescriptor != NULL || args->structureOutputDescriptor != NULL ||
++		    args->structureInputSize < sizeof(r) || args->structureOutput == NULL || args->structureOutputSize < sizeof(r)) {
++			return kIOReturnBadArgument;
++		}
++		memcpy(&r, args->structureInput, sizeof(r));
++		ret = fFB->scan(&r);
++		memcpy(args->structureOutput, &r, sizeof(r));
++		args->structureOutputSize = sizeof(r);
++		return ret;
++	}
+ 	case kSweetFBSwapEnd: {
+ 		uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
+ 		if (args->structureInputDescriptor != NULL ||
