@@ -198,6 +198,20 @@ hook_jump(const char *name, void *to)
 	return 1;
 }
 
+/*
+ * (boot 97) The fix itself: fileproviderd logged "[INFO] Not instantiating file providers until setup has
+ * been run." and "[ERROR] denying connection because the device is not set up", so no provider (not even
+ * "On My iPhone") was ever started. -[FPDServer _computeUnlockedStatusAndSetup] (FileProviderDaemon) asks
+ * BYSetupAssistantNeedsToRun() (SetupAssistant.framework), which looks past com.apple.purplebuddy's
+ * SetupDone (launch sentinel, MobileGestalt, dates) and answers YES on this port although Setup was
+ * skipped (tools/sweet-root-tweaks.py). In the programs this library is inserted into it answers NO.
+ */
+static int
+fix_setup_done(void)
+{
+	return 0;
+}
+
 __attribute__((constructor))
 static void
 sweet_fix_init(void)
@@ -225,6 +239,10 @@ sweet_fix_init(void)
 			if (strcmp(me, mirrored[i]) == 0) {
 				mirror_on = 1;
 			}
+		}
+		if (mirror_on) {
+			fprintf(stderr, "fixlog: %s: BYSetupAssistantNeedsToRun -> NO: %s\n", me,
+			    hook_jump("BYSetupAssistantNeedsToRun", (void *)fix_setup_done) ? "hooked" : "NOT FOUND");
 		}
 		if (mirror_on) {
 			int n = hook_jump("_os_log_impl", (void *)mirror_entry);
