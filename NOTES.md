@@ -2,6 +2,12 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 89 (2026-10-31, kernel 41182648508 = 0158, memory bus pinned): reset again ("while doing normal browsing") <<<
+
+**Observed (log `apollo-boot89.txt`, 12910 lines):** memory bus at its top 100% throughout (0158 works) -- **so the DDR vote was not the cause**. Settings opened (`exec Preferences`, line 11775), widgets/posters relaunching, MusicWidgets sig 11, assetsd sig 6; the last CPUFREQ window (line 12760): **all five cores 100% at their top clocks** (mobileassetd 66%, CalendarWidgetExtension 58%, WeatherWidget 37%, Preferences 21%, PosterBoard 20%), hottest 65 C; then `SWEET FB: 10.0 s: iOS gave 2 frames` with taps logged (UI frozen while the kernel ran: touches, Wi-Fi events, AKS calls), then the log stops: no panic, no launchd reboot line.
+**Compared:** boot 88 also reset shortly after `exec Preferences`, but at normal load (44 fps, cores 52-60%). Resets: boots 88 and 89 (both with page flips, 0156+); none in 86/87 (no flips). The "event diag" Wi-Fi lines run all through both logs (2375 / 2621, from line ~4440): not specific to the end. iOS's watchdogd cannot reset (SweetWatchdog never fires; only its sel 0 check-in). = a hardware/firmware reset (PS_HOLD by TZ/hypervisor, a watchdog bite, PMIC fault). Not determined.
+**Asked (next reset):** go straight to recovery (no other reboots in between: `fastboot boot` keeps the power-on reasons) and read the PMIC's power-on/power-off reasons from recovery Linux's dmesg (qpnp-power-on / pon); and an A/B session with `sweetflip=0` (flips off) to test the flip hypothesis.
+
 ### >>> xnu 0159 + bridge: the GPU scales each frame into a flip frame (2026-10-31; user: "go ahead with the display quality and smoothness") <<<
 
 **Why:** boot 88: our processor copy took 8-22% of a core (nearest pixel: ragged text and corners; bilinear on the CPU cost 18-30 ms a frame, boot 87). hakios-apollo's apollo_gpu_present has the GPU scale the picture into a flip frame. Ported, onto our flip code (0156) and our bridge (userland/ca-bridge/eagl.c, same lineage as theirs).
