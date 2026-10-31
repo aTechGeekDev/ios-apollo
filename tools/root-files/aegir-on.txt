@@ -1,0 +1,2 @@
+# Undoes aegir-off.txt: the astronomy wallpaper back where ExtensionKit finds it.
+>/System/Library/ExtensionKit/Extensions.disabled-AegirPoster.appex=/System/Library/ExtensionKit/Extensions/AegirPoster.appex

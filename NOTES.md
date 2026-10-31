@@ -2,6 +2,11 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 95 (2026-10-31, kernel 41194804367 = 0163, userland 41193711326; log `6b7ed251-apollo-boot95.txt`): no GPU hang this boot (0 failed submissions; recovery not exercised); AegirPoster crash loop -> tools/root-files/aegir-off.txt <<<
+
+**Observed:** 72 x `CRASH AegirPoster sig 6`, same stack each time: abort <- libc++abi "terminating due to uncaught exception" <- std::terminate <- _dispatch_client_callout <- __FBSSERIALQUEUE_IS_CALLING_OUT_TO_A_BLOCK__ (ios-re 41197432181; the throw site is not in the backtrace). AegirPoster (the astronomy wallpaper) draws with Metal; since 0161 extensions start, it starts and dies, PosterBoard restarts it. `exec Files` seen; still nothing from fileproviderd / a LocalStorage provider in the log. driverkitd and pkreporter sig 9 once each (as before).
+**Change:** mkadt.py FILE_PREFIXES += /System/Library/ExtensionKit/; new tools/root-files/aegir-off.txt moves /System/Library/ExtensionKit/Extensions/AegirPoster.appex aside (and lists the folder into the log: the path is a guess to confirm); aegir-on.txt undoes it.
+
 ### >>> xnu 0163 (2026-10-31, kernel run 41194804367): GPU hang recovery; NOT YET BOOTED <<<
 
 **Boot 94's log (`4582592e-apollo-boot94.txt`, 53297 lines, ring wrapped):** 1149 `MESA: error: flush_submit_list:135: submit failed: -60` each followed by a full msm_dump_submit (the flood pushed the start of the hang out of the 4 MB ring, so the `SWEET GPU: kept: ...` report line is lost), then `SweetGPU: no handles left for a buffer of 32768 bytes` and `CRASH backboardd[57] sig 11 ... far 0x1c` (pc 0x1058a8568, in a non-cache image: Mesa or libsweet-gl); backboardd restarted. -60 = ETIMEDOUT = kIOReturnTimeout from SweetGPU::submit: "the ring stays full" -> gGPUStopped = true for good. So: the 3D core hung once (cause unknown: report lost), and nothing recovered it. `sweet-fix` printed nothing to the kernel log (stderr), but screenshots save, so it worked.

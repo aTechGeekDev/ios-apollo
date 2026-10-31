@@ -1,0 +1,7 @@
+# The astronomy wallpaper (AegirPoster) draws with Metal, which this port does not have: since
+# xnu 0161 lets app extensions start, it threw an uncaught exception setting up its scene and
+# PosterBoard started it again and again (boot 95: 72 crashes, each a process launch and a crash
+# report: CPU time and heat for nothing). Moved out of ExtensionKit's folder so it is not started.
+# Undo: aegir-on.txt. The listing shows what is in the folder (the kernel log, "SWEET FILES").
+>/System/Library/ExtensionKit/Extensions/AegirPoster.appex=/System/Library/ExtensionKit/Extensions.disabled-AegirPoster.appex
+?/System/Library/ExtensionKit/Extensions

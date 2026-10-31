@@ -91,7 +91,9 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 # the paths the kernel writes (xnu 0120/0121 bsd/dev/sweet_files.c sweet_files_prefixes)
 FILE_PREFIXES = ('/usr/local/', '/Library/Wallpaper/', '/private/var/', '/System/Library/xpc/',
                  # the sound (tools/root-files/audio-on.txt): iOS's VirtualAudio.plugin and our HakiosAudio.driver
-                 '/Library/Audio/Plug-Ins/', '/System/Library/Audio/Plug-Ins/HAL/')
+                 '/Library/Audio/Plug-Ins/', '/System/Library/Audio/Plug-Ins/HAL/',
+                 # app extensions that cannot work without Metal (tools/root-files/aegir-off.txt)
+                 '/System/Library/ExtensionKit/')
 D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
 
 
