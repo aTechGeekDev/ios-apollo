@@ -236,6 +236,13 @@ hook_jump(const char *name, void *to)
  * SetupDone (launch sentinel, MobileGestalt, dates) and answers YES on this port although Setup was
  * skipped (tools/sweet-root-tweaks.py). In the programs this library is inserted into it answers NO.
  */
+/* fileproviderd: every os_log level counts as enabled, so its debug lines are formatted and reach the mirror */
+static int
+fix_log_enabled(void)
+{
+	return 1;
+}
+
 static int
 fix_setup_done(void)
 {
@@ -276,6 +283,11 @@ sweet_fix_init(void)
 			    hook_jump("BYSetupAssistantNeedsToRun", (void *)fix_setup_done) ? "hooked" : "NOT FOUND");
 		}
 		if (mirror_on) {
+			if (mirror_all) {
+				fprintf(stderr, "fixlog: %s: os_log_type_enabled -> always: %s\n", me,
+				    hook_jump("os_log_type_enabled", (void *)fix_log_enabled) ? "hooked" : "NOT FOUND");
+				(void)hook_jump("_os_log_debug_impl", (void *)mirror_entry);
+			}
 			int n = hook_jump("_os_log_impl", (void *)mirror_entry);
 			int e = hook_jump("_os_log_error_impl", (void *)mirror_entry);
 			int f = hook_jump("_os_log_fault_impl", (void *)mirror_entry);
