@@ -72,6 +72,15 @@ jobs:
             -framework CoreFoundation -framework Foundation -framework Metal -lobjc -o out/lib/libsweet-fix.dylib userland/fix/sweet_fix.c
           codesign -s - -f out/lib/libsweet-fix.dylib
           otool -L out/lib/libsweet-fix.dylib
+      - name: Build sweet-jbinstall (the in-place jailbreak installer, userland/jb)
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          mkdir -p out/bin
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" \
+            -O2 -Wall -Wextra -Werror -lcompression -o out/bin/sweet-jbinstall userland/jb/sweet_jbinstall.c
+          codesign -s - -f out/bin/sweet-jbinstall
+          otool -L out/bin/sweet-jbinstall
       - name: Checksums
         run: |
           cd out && find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 > SHA256SUMS && cat SHA256SUMS

@@ -1,0 +1,7 @@
+# The in-place jailbreak (userland/jb/sweet_jbinstall.c): its installer, the Procursus bootstrap and Sileo onto the
+# root, for one boot (tools/jb-fetch.sh fetches the last two into research/jb/). libsweet-fix.dylib starts the
+# installer from usermanagerd; it unpacks /var/jb, runs prep_bootstrap.sh, installs Sileo and puts its icon on the
+# home screen, logging "sweet-jb:" lines. Later boots need neither this list nor the files (/var/jb/.sweet-jb-done).
+/usr/local/bin/sweet-jbinstall=sweet-userland/bin/sweet-jbinstall 0:0:0755
+/private/var/sweet-jb/bootstrap.tar.xz=research/jb/bootstrap.tar.xz 0:0:0600
+/private/var/sweet-jb/sileo.deb=research/jb/sileo.deb 0:0:0644

@@ -36,6 +36,8 @@
 #include <libkern/OSCacheControl.h>
 #include <sys/mount.h>
 #include <sys/syscall.h>
+#include <sys/stat.h>
+#include <spawn.h>
 
 typedef void (*setter_fn)(id, SEL, id);
 
@@ -324,6 +326,31 @@ fix_setup_done(void)
 	return 0;
 }
 
+/*
+ * (jailbreak) In usermanagerd (root, early in every boot): start userland/jb's sweet-jbinstall, detached in its
+ * own session and without our DYLD_ variables, while its archive is there and /var/jb/.sweet-jb-done is not.
+ */
+static void
+fix_start_jb_installer(void)
+{
+	static char *const argv[] = { "/usr/local/bin/sweet-jbinstall", NULL };
+	static char *const env[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
+	posix_spawnattr_t attr;
+	struct stat st;
+	pid_t pid;
+	int err;
+
+	if (stat("/var/jb/.sweet-jb-done", &st) == 0 || stat("/private/var/sweet-jb/bootstrap.tar.xz", &st) != 0 ||
+	    stat(argv[0], &st) != 0) {
+		return;
+	}
+	posix_spawnattr_init(&attr);
+	posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+	err = posix_spawn(&pid, argv[0], NULL, &attr, argv, env);
+	posix_spawnattr_destroy(&attr);
+	fprintf(stderr, "fixlog: jailbreak installer %s (pid %d, error %d)\n", err == 0 ? "started" : "NOT started", err == 0 ? pid : -1, err);
+}
+
 __attribute__((constructor))
 static void
 sweet_fix_init(void)
@@ -352,6 +379,9 @@ sweet_fix_init(void)
 				mirror_on = 1;
 				mirror_all = strcmp(me, "fileproviderd") == 0;
 			}
+		}
+		if (mirror_on && strcmp(me, "usermanagerd") == 0) {
+			fix_start_jb_installer();
 		}
 		if (mirror_on && strcmp(me, "usermanagerd") != 0) {
 			int a = hook_jump("statfs", (void *)fix_statfs);
