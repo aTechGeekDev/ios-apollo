@@ -1,0 +1,34 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -24,7 +24,10 @@
+  * to the top while anything runs and lowers it to sweetddrlow (default 0x800 of 0x3fff, MC0 and SH0; ACV kept)
+  * after a second of quiet. Not 0: the boot chain's own votes for the panel's scanout were on this same DRV and
+  * were replaced by 0148's, so a low vote must still carry the display (1080x2400x60 = 0.6 GB/s). A memory bus held at its top all the time is part of what made the phone warm.
+- * Boot-arg sweetddr: 0 never voted, 1 following the load (default), 2 always at the top (as 0148).
++ * Boot-arg sweetddr: 0 never voted, 1 following the load, 2 always at the top (as 0148).
++ * (xnu 0158) Default 2 again: boot 88, the first where the cores went quiet enough for the vote to drop (98-99% at the
++ * top in two windows), ended in a reset with no panic written; the vote's change is the prime suspect (not proven).
++ * With the busy daemons off (tools/root-files/quiet-on.txt) the bus at its top costs little. sweetddr=1: following the load.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -624,14 +627,17 @@
+ int
+ sweet_rpmh_ddr_set(bool top)
+ {
+-	uint32_t mode = 1, low = 0x800;
++	uint32_t mode = 2, low = 0x800;        /* (0158) default 2: see the top of this file */
+ 	uint32_t level;
+ 	int error;
+ 
+ 	(void)PE_parse_boot_argn("sweetddr", &mode, sizeof(mode));
+ 	(void)PE_parse_boot_argn("sweetddrlow", &low, sizeof(low));
+ 	level = top ? 0x3fff : (low < 0x100 ? 0x100 : low > 0x3fff ? 0x3fff : low);
+-	if (mode != 1 || rh_ddr_voted < 0 || rh_ddr_voted == (int)top) {
++	if (mode != 1 || rh_ddr_voted < 0) {
++		return ENOTSUP;         /* (0158) the governor keeps counting the bus as at its top */
++	}
++	if (rh_ddr_voted == (int)top) {
+ 		return 0;
+ 	}
+ 	error = sweet_rpmh_bcm_vote("MC0", level, level);

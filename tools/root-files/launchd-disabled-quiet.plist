@@ -4,6 +4,8 @@
 <dict>
 	<key>com.apple.ReportCrash</key>
 	<true/>
+	<key>com.apple.accessoryupdater</key>
+	<true/>
 	<key>com.apple.coreduetd</key>
 	<true/>
 	<key>com.apple.fairplayd.H2</key>

@@ -58,9 +58,9 @@ The detailed engineering log, with every boot's results, is [`NOTES.md`](NOTES.m
 
 | Patch | What it does | State |
 | --- | --- | --- |
-| **0157** + `quiet-on.txt` | The fast screen scaling is the default again (the blended one cost 18–30 ms a frame); kernel threads named in `SWEET TOP`; four background daemons that spun all the time (coreduetd, voicemail, ReportCrash, fairplayd) switched off | Built, not booted |
-| **0156** | No tearing: frames are drawn off-screen and the display controller flips to them between refreshes | Built, not booted |
-| Next | Find what crash-loops (ReportCrash every few seconds) and why iOS's userland collapsed late in boot 87; let the GPU do the screen scaling; GPU clock scaling; the microphone | Planned |
+| **0158** | Memory bus kept at its top again (suspect for a sudden reset in boot 88); one more busy daemon off (`quiet-on.txt`) | Built, not booted |
+| **0156–0157** | Page flipping (no tearing), fast scaling, named kernel threads, busy daemons off | Booted (boot 88): flips work, idle CPU nearly zero; one sudden reset |
+| Next | The GPU draws each frame scaled straight into the flip buffers: no CPU copy, smooth text, higher frame rate | In progress |
 
 ---
 
@@ -199,7 +199,7 @@ Boot options (boot-args) go in `--cmdline`. The most useful ones are below. Each
 | `sweetthermal=T` | Slow the big cores while the hottest core is over T °C (default 75; 0 = no limit) |
 | `sweetcpustats=N` | Every N s, a `SWEET CPUFREQ` line: clocks, load, temperatures (default 10) |
 | `sweettop=0` | No `SWEET TOP` line (the 8 threads that used the most CPU, with the stats line; 0155) |
-| `sweetddr=N` | Memory bus: `0` leave it alone, `1` follow the load (default), `2` always at top |
+| `sweetddr=N` | Memory bus: `0` leave it alone, `1` follow the load, `2` always at top (default since 0158) |
 | `sweetddrlow=V` | The memory bus's idle level (default `0x800`); raise it if the screen flickers when idle |
 
 ### GPU
@@ -251,7 +251,7 @@ None of these files are in git. Each tool runs with the phone in the temporary r
 
 | Path | What's inside |
 | --- | --- |
-| `xnu/patches/` | The kernel: patches 0001–0157 on Apple's xnu-8796, applied in order by CI |
+| `xnu/patches/` | The kernel: patches 0001–0158 on Apple's xnu-8796, applied in order by CI |
 | `shim/` | The boot shim, packed as an Android boot image |
 | `wifi/` | The Linux compatibility layer the Wi-Fi driver (ath11k) is built on |
 | `userland/` | Programs for the phone: Mesa, the CoreAnimation bridge, the audio plug-in, the Bluetooth library, GPU tests ([details](userland/README.md)) |
