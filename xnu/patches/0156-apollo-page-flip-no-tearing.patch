@@ -1,0 +1,462 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -133,6 +133,7 @@
+ bsd/dev/sweet_mic.c			standard
+ bsd/dev/sweet_haptic.c			standard
+ bsd/dev/sweet_backlight.c		standard
++bsd/dev/sweet_display.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/sweet_display.c
+@@ -0,0 +1,251 @@
++/*
++ * apollo (xnu 0156): page flips of the panel's scanout, so that SweetFramebuffer.cpp draws each frame where the panel is
++ * not reading and switches the panel to it between two of its refreshes: no tearing (boot 87: "the screen is tearing").
++ * Taken from the Mi 10T port github.com/enesuzun2002/hakios-apollo (devices/mi-10t/xnu/files/bsd/dev/
++ * hakios.apollo_display.c, APSL 2.0: find_ctl(), dpu_setup(), smmu_look(), apollo_display_flip(),
++ * apollo_display_flip_latched(), flip_reserve()), whose apollo_flip=1 flips this phone's display the same way; only that
++ * part, without their timing changes, dumps, test and triple-buffer thread (the framebuffer's present thread does it here).
++ *
++ * The UEFI left the display controller (the SM8250's DPU) running: a source pipe fetches the boot framebuffer
++ * (0x9c000000, 1080x2400, stride 4320; boot 48's probe: VIG0) through a layer mixer and INTF_1 to the DSC video-mode panel
++ * (144 Hz). A flip writes the pipe's SRC0_ADDR (MDP 0x0ae00000 + the pipe's offset + 0x14) and then the pipe's bit in the
++ * CTL_FLUSH of the CTL that drives INTF_1; the hardware takes the address at the next frame's start and clears the bit
++ * (sweet_flip_latched()). The frames are in the display's own reservation (the device tree's cont_splash_region
++ * 0x9c000000, 0x2300000 bytes; with mkadt.py --highmem the kernel's memory starts at 4 GB and never has it): the boot
++ * framebuffer and two more behind it, write-combined. Flips are refused when the display's SMMU stream would translate the
++ * address (the stream's match register says translate with the context's MMU on, or fault): then nothing changes.
++ * Boot-arg sweetflip=0: no flips (the copy into the scanned buffer, as before).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t, vm_size_t, uint32_t);
++/* osfmk/arm/memory_types.h, not visible to BSD code (as in sweet_gpu.c) */
++#ifndef VM_WIMG_IO
++#define VM_WIMG_IO              0x7u
++#endif
++#ifndef VM_WIMG_WCOMB
++#define VM_WIMG_WCOMB           0x6u
++#endif
++
++int sweet_flip_init(uint64_t fb_phys, uint32_t stride, uint32_t height, uint64_t pa[3], vm_offset_t va[3]);
++bool sweet_flip(uint64_t phys);
++bool sweet_flip_latched(void);
++uint32_t sweet_flip_frame_count(void);
++
++static inline uint32_t
++rd(vm_offset_t address)
++{
++	return *(volatile uint32_t *)address;
++}
++
++static inline void
++wr(vm_offset_t address, uint32_t value)
++{
++	*(volatile uint32_t *)address = value;
++}
++
++#define INTF_PHYS               0x0ae6b800UL
++#define INTF_SIZE               0x2c0UL
++#define INTF_FRAME_COUNT        0x0ac
++
++#define CTL_PHYS                0x0ae02000UL
++#define CTL_STRIDE              0x200UL
++#define CTL_SIZE                0x1e0UL
++#define CTL_COUNT               6
++#define CTL_TOP                 0x014
++#define CTL_FLUSH               0x018
++#define CTL_INTF_ACTIVE         0x0f4
++#define CTL_INTF_ACTIVE_INTF1   (1u << 1)
++
++#define MDP_PHYS                0x0ae00000UL
++#define MDP_SIZE                0x84208UL
++#define SSPP_COUNT              8
++static const struct {
++	const char *name;
++	uint32_t offset;
++	uint32_t flush_bit;
++} sspp_table[SSPP_COUNT] = {
++	{ "VIG0", 0x05000, 0 }, { "VIG1", 0x07000, 1 }, { "VIG2", 0x09000, 2 }, { "VIG3", 0x0b000, 18 },
++	{ "DMA0", 0x25000, 11 }, { "DMA1", 0x27000, 12 }, { "DMA2", 0x29000, 24 }, { "DMA3", 0x2b000, 25 },
++};
++#define SSPP_SRC0_ADDR          0x14
++#define SSPP_SRC_YSTRIDE0       0x24
++
++#define SMMU_PHYS               0x15000000UL
++#define SMMU_SIZE               0x100000UL
++#define SMMU_SCR0               0x000
++#define SMMU_IDR0               0x020
++#define SMMU_IDR1               0x024
++#define SMMU_SMR(n)             (0x800 + 4 * (n))
++#define SMMU_S2CR(n)            (0xc00 + 4 * (n))
++#define SMMU_CB_SCTLR           0x00
++#define MDSS_STREAM             0x820   /* the device tree's smmu_sde_unsec_cb iommus <&apps_smmu 0x820 0x402> */
++#define MDSS_STREAM_MASK        0x402
++
++#define DISPLAY_RESERVED_PHYS   0x9c000000ull
++#define DISPLAY_RESERVED_SIZE   0x2300000ull    /* cont_splash_region (hakios: the UEFI's 0x2400000) */
++
++static vm_offset_t mdp, intf, ctl_base[CTL_COUNT];
++static int ctl_driving = -1, sspp_found = -1;
++static uint32_t flip_bit;
++static bool ready;
++
++static void
++find_ctl(void)
++{
++	int first_top = -1, active = -1;
++
++	for (int n = 0; n < CTL_COUNT; n++) {
++		ctl_base[n] = ml_io_map(CTL_PHYS + CTL_STRIDE * (uint32_t)n, CTL_SIZE);
++		uint32_t top = rd(ctl_base[n] + CTL_TOP), intf_active = rd(ctl_base[n] + CTL_INTF_ACTIVE);
++		if (active < 0 && (intf_active & CTL_INTF_ACTIVE_INTF1)) {
++			active = n;
++		}
++		if (first_top < 0 && top != 0) {
++			first_top = n;
++		}
++	}
++	ctl_driving = active >= 0 ? active : first_top;
++}
++
++/* hakios's smmu_look(): true if an address of ours would be translated (or fault) for the display's stream */
++static bool
++smmu_blocks(void)
++{
++	vm_offset_t base = ml_io_map_unmappable(SMMU_PHYS, SMMU_SIZE, VM_WIMG_IO);
++	uint32_t scr0, matches, contexts, page, pages, found = 0;
++	bool blocks = false;
++
++	if (base == 0) {
++		return true;
++	}
++	scr0 = rd(base + SMMU_SCR0);
++	matches = rd(base + SMMU_IDR0) & 0xff;
++	contexts = rd(base + SMMU_IDR1) & 0xff;
++	page = (rd(base + SMMU_IDR1) >> 31) ? 0x10000 : 0x1000;
++	pages = 2u << (rd(base + SMMU_IDR1) >> 28 & 7);
++	if (scr0 & 1u << 3) {
++		printf("SWEET FLIP: the SMMU has 16-bit stream ids: not looked at, no flips\n");
++		return true;
++	}
++	for (uint32_t n = 0; n < matches && SMMU_SMR(n) < 0xc00; n++) {
++		uint32_t smr = rd(base + SMMU_SMR(n)), s2cr = rd(base + SMMU_S2CR(n));
++		uint32_t stream = smr & 0x7fff, mask = smr >> 16 & 0x7fff, type = s2cr >> 16 & 3;
++
++		if (!(smr >> 31) || ((stream ^ MDSS_STREAM) & ~mask & ~MDSS_STREAM_MASK) != 0) {
++			continue;
++		}
++		found++;
++		if (type == 0 && (s2cr & 0xff) < contexts) {
++			uint32_t sctlr = rd(base + (pages + (s2cr & 0xff)) * page + SMMU_CB_SCTLR);
++			printf("SWEET FLIP: the display's stream: match %u, translate in context %u (MMU %s)\n", n, s2cr & 0xff,
++			    (sctlr & 1) ? "on" : "off");
++			blocks = blocks || (sctlr & 1);
++		} else {
++			printf("SWEET FLIP: the display's stream: match %u, %s\n", n, type == 1 ? "bypass" : "fault");
++			blocks = blocks || type == 2;
++		}
++	}
++	if (found == 0 && !(scr0 & 1) && (scr0 >> 10 & 1)) {
++		blocks = true;          /* unmatched streams fault */
++	}
++	return blocks;
++}
++
++/*
++ * Ready the flips: the pipe that scans `fb_phys`, the CTL that drives INTF_1, the SMMU; the boot framebuffer (frame 0) and
++ * two frames behind it in the display's reservation, mapped write-combined into va[1], va[2] (va[0] is the caller's).
++ * The number of frames (3), or 0: no flips (nothing was written to the display).
++ */
++int
++sweet_flip_init(uint64_t fb_phys, uint32_t stride, uint32_t height, uint64_t pa[3], vm_offset_t va[3])
++{
++	uint32_t enabled = 1;
++	uint64_t bytes;
++
++	(void)PE_parse_boot_argn("sweetflip", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET FLIP: sweetflip=0: frames are copied into the scanned buffer\n");
++		return 0;
++	}
++	if (fb_phys != DISPLAY_RESERVED_PHYS || stride == 0 || stride > 0xffff || height == 0) {
++		printf("SWEET FLIP: the framebuffer is at %#llx, not at the display's reservation: no flips\n", fb_phys);
++		return 0;
++	}
++	bytes = ((uint64_t)stride * height + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
++	if (3 * bytes > DISPLAY_RESERVED_SIZE) {
++		printf("SWEET FLIP: three frames of %llu bytes do not fit the display's reservation: no flips\n", bytes);
++		return 0;
++	}
++	find_ctl();
++	mdp = ml_io_map_unmappable(MDP_PHYS, MDP_SIZE, VM_WIMG_IO);
++	intf = ml_io_map(INTF_PHYS, INTF_SIZE);
++	for (int i = 0; mdp != 0 && i < SSPP_COUNT; i++) {
++		if (rd(mdp + sspp_table[i].offset + SSPP_SRC0_ADDR) == (uint32_t)fb_phys) {
++			sspp_found = i;
++			break;
++		}
++	}
++	if (ctl_driving < 0 || sspp_found < 0) {
++		printf("SWEET FLIP: no %s: no flips\n", ctl_driving < 0 ? "CTL driving INTF_1" : "source pipe on the framebuffer");
++		return 0;
++	}
++	if ((rd(mdp + sspp_table[sspp_found].offset + SSPP_SRC_YSTRIDE0) & 0xffff) != stride) {
++		printf("SWEET FLIP: %s's stride is %u, not %u: no flips\n", sspp_table[sspp_found].name,
++		    rd(mdp + sspp_table[sspp_found].offset + SSPP_SRC_YSTRIDE0) & 0xffff, stride);
++		return 0;
++	}
++	if (smmu_blocks()) {
++		printf("SWEET FLIP: the display's SMMU stream translates: no flips\n");
++		return 0;
++	}
++	flip_bit = 1u << sspp_table[sspp_found].flush_bit;
++	pa[0] = fb_phys;
++	for (int i = 1; i < 3; i++) {
++		pa[i] = fb_phys + (uint64_t)i * bytes;
++		va[i] = ml_io_map_unmappable((vm_offset_t)pa[i], (vm_size_t)bytes, VM_WIMG_WCOMB);
++		if (va[i] == 0) {
++			printf("SWEET FLIP: frame %d at %#llx cannot be mapped: no flips\n", i, pa[i]);
++			return 0;
++		}
++		/* (not filled: the framebuffer flips to a frame only after a whole picture was drawn into it) */
++	}
++	ready = true;
++	printf("SWEET FLIP: %s on %#llx flipped by ctl_%d (flush bit %u); frames at %#llx, %#llx, %#llx (%llu bytes each)\n",
++	    sspp_table[sspp_found].name, fb_phys, ctl_driving, sspp_table[sspp_found].flush_bit, pa[0], pa[1], pa[2], bytes);
++	return 3;
++}
++
++/* the pipe to `phys` at the next frame start (hakios's apollo_display_flip, stride unchanged); false: nothing written */
++bool
++sweet_flip(uint64_t phys)
++{
++	if (!ready || phys >= (1ull << 32) || (phys & 0xff) != 0) {
++		return false;
++	}
++	wr(mdp + sspp_table[sspp_found].offset + SSPP_SRC0_ADDR, (uint32_t)phys);
++	__asm__ volatile ("dsb sy" : : : "memory");
++	wr(ctl_base[ctl_driving] + CTL_FLUSH, flip_bit);        /* last */
++	return true;
++}
++
++/* the hardware has cleared the pipe's flush bit: the last flip is what the panel scans now */
++bool
++sweet_flip_latched(void)
++{
++	return ready && (rd(ctl_base[ctl_driving] + CTL_FLUSH) & flip_bit) == 0;
++}
++
++/* the frames the panel has started (INTF_1's counter), for the stats */
++uint32_t
++sweet_flip_frame_count(void)
++{
++	return intf != 0 ? rd(intf + INTF_FRAME_COUNT) : 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -58,6 +58,16 @@
+  * 375 points, so iOS keeps the iPhone X's layouts across (status bar, Control
+  * Center); only the height is the panel's.
+  *
++ * (xnu 0156) No tearing: each frame is drawn into a buffer the panel is not
++ * scanning and the panel is switched to it at its next refresh (a page flip of
++ * the display controller's source pipe, bsd/dev/sweet_display.c, as hakios-apollo
++ * flips this phone's display). Three buffers in the display's reservation: the
++ * one shown, the one flipped to (until the hardware takes it, at most a refresh:
++ * 7 ms at 144 Hz), the one drawn into. A swap none of whose layers covers the
++ * whole display is drawn into the shown buffer as before (each buffer only
++ * holds what was drawn into it). sweetflip=0, or a display that cannot be
++ * flipped (logged): the copy into the scanned buffer as before.
++ *
+  * (xnu 0155) The scaling blends instead of picking the nearest pixel (boot 86:
+  * text and rounded corners looked ragged: nearest-pixel 24/25 drops one column
+  * and one line in 25): each panel pixel is the 2x2 blend of the four presented
+@@ -95,6 +105,10 @@
+ extern "C" void apollo_backlight_brightness(uint32_t value, uint32_t ms);       /* (xnu 0154) */
+ extern "C" uint32_t apollo_backlight_value(void);                               /* (xnu 0154) */
+ extern "C" { int sweet_display_dark; }  /* (xnu 0155) off and blanked: sweet_touch.c polls slowly */
++/* (xnu 0156) bsd/dev/sweet_display.c: page flips of the panel's scanout */
++extern "C" int sweet_flip_init(uint64_t fb_phys, uint32_t stride, uint32_t height, uint64_t pa[3], vm_offset_t va[3]);
++extern "C" bool sweet_flip(uint64_t phys);
++extern "C" bool sweet_flip_latched(void);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -195,12 +209,20 @@
+ 	uint8_t      *fXWeight;                 /* (0155) and how much of the next column, of 256 (smooth) */
+ 	uint32_t     *fLine;                    /* (0155) a source line blended between two, for one layer (smooth) */
+ 	bool          fSmooth;                  /* (0155) sweetfb_smooth, default 1 */
++	/* (xnu 0156) page flips: frame 0 is the boot framebuffer (fPixels) */
++	int           fFlipCount;               /* 3, or 0: no flips */
++	uint64_t      fFlipPA[3];
++	vm_offset_t   fFlipVA[3];
++	int           fFront, fPending;         /* the frame the panel scans; the one flipped to and not yet taken (-1) */
++	uintptr_t     fDraw;                    /* where present() draws: a frame's mapping */
++	uint32_t      fStatFlips, fStatFlipWaits;
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	bool present(const uint8_t *rec);
++	bool coversDisplay(const uint8_t *rec);         /* (0156) */
+ 	void presentSmooth(uint64_t base, uint64_t row, int32_t sx, int32_t w, int32_t dy, int32_t h,
+ 	    uint32_t px0, uint32_t px1, uint32_t py0, uint32_t py1);     /* (0155) */
+ };
+@@ -425,6 +447,12 @@
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++	/* (xnu 0156) the page flips' frames; without them every frame goes into fPixels as before */
++	fDraw = fPixels;
++	fFlipVA[0] = fPixels;
++	fFront = 0;
++	fPending = -1;
++	fFlipCount = fPixels != 0 ? sweet_flip_init(fPhys, fRowBytes, fHeight, fFlipPA, fFlipVA) : 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+@@ -548,6 +576,12 @@
+ 		    (uint64_t)shown * 10000 / span % 10, fb->fStatBusy, copy / NSEC_PER_MSEC, copy % NSEC_PER_MSEC / 100000,
+ 		    most / NSEC_PER_MSEC, most % NSEC_PER_MSEC / 100000, fb->fStatTicks, fb->fStatSkipped,
+ 		    lateMost / NSEC_PER_MSEC, lateMost % NSEC_PER_MSEC / 100000);
++		if (fb->fFlipCount != 0) {
++			/* (xnu 0156) */
++			IOLog("SWEET FB: %u page flips (%u frames waited for the last flip to be taken)\n", fb->fStatFlips,
++			    fb->fStatFlipWaits);
++			fb->fStatFlips = fb->fStatFlipWaits = 0;
++		}
+ 		fb->fStatSince = now;
+ 		fb->fStatSwaps = fb->fStatShown = fb->fStatBusy = fb->fStatTicks = fb->fStatSkipped = 0;
+ 		fb->fStatCopy = fb->fStatCopyMost = fb->fStatLateMost = 0;
+@@ -594,10 +628,14 @@
+ 					continue;
+ 				}
+ 			}
+-			for (uint32_t y = 0; y < fHeight; y++) {
+-				volatile uint64_t *row = (volatile uint64_t *)(fPixels + (uint64_t)y * fRowBytes);
+-				for (uint32_t x = 0; x < fWidth / 2; x++) {
+-					row[x] = 0;
++			/* (0156) every frame black: whichever the panel scans */
++			for (int f = 0; f < (fFlipCount ? fFlipCount : 1); f++) {
++				uintptr_t frame = fFlipCount ? fFlipVA[f] : fPixels;
++				for (uint32_t y = 0; y < fHeight; y++) {
++					volatile uint64_t *row = (volatile uint64_t *)(frame + (uint64_t)y * fRowBytes);
++					for (uint32_t x = 0; x < fWidth / 2; x++) {
++						row[x] = 0;
++					}
+ 				}
+ 			}
+ 			IOLockLock(fLock);
+@@ -621,7 +659,38 @@
+ 		fDirty = false;
+ 		IOLockUnlock(fLock);
+ 		uint64_t began = mach_absolute_time();
++		/*
++		 * (xnu 0156) where to draw: with flips and a swap covering the display, the frame neither scanned nor waiting
++		 * to be (the last flip settled first: at most a refresh); else the scanned one, as before.
++		 */
++		int target = -1;
++		if (fFlipCount == 3 && coversDisplay(rec)) {
++			if (fPending >= 0) {
++				uint64_t waited_us = 0;
++				while (!sweet_flip_latched() && waited_us < 50000) {
++					IODelay(200);
++					waited_us += 200;
++				}
++				if (waited_us != 0) {
++					fStatFlipWaits++;
++				}
++				if (sweet_flip_latched()) {
++					fFront = fPending;
++					fPending = -1;
++				}
++			}
++			for (int f = 0; f < 3 && target < 0; f++) {
++				if (f != fFront && f != fPending) {
++					target = f;
++				}
++			}
++		}
++		fDraw = target >= 0 ? fFlipVA[target] : fFlipCount ? fFlipVA[fPending >= 0 ? fPending : fFront] : fPixels;
+ 		bool shown = present(rec);
++		if (shown && target >= 0 && fPending < 0 && sweet_flip(fFlipPA[target])) {
++			fPending = target;
++			fStatFlips++;
++		}
+ 		uint64_t spent = mach_absolute_time() - began;
+ 		if (!shown) {
+ 			IODelay(500);   /* (xnu 0153; XNU blocks the thread, not spins, for this long) the GPU's frame looked at again after 0.5 ms (was 2: a late frame missed its vsync) */
+@@ -652,6 +721,26 @@
+ 	}
+ }
+ 
++/* (xnu 0156) one of the swap's layers fills the whole presented display: the frame can be drawn into an empty buffer */
++bool
++AppleCLCD::coversDisplay(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104);
++
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		const uint8_t *b = rec + 0xc4 + 16 * layer;
++		int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4), w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
++
++		if (!(mask & (1u << layer)) || get32(rec, 0x54 + 4 * layer) == 0) {
++			continue;
++		}
++		if (dx <= 0 && dy <= 0 && dx + w >= (int32_t)fLogicalW && dy + h >= (int32_t)fLogicalH) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ /* (xnu 0155) p..q by w of 256, each channel; two channels at a time in 16-bit lanes (0xff * 256 fits) */
+ static inline uint32_t
+ sweet_mix(uint32_t p, uint32_t q, uint32_t w)
+@@ -718,7 +807,7 @@
+ 			}
+ 			line = fLine;
+ 		}
+-		uint32_t *to = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes) + px0;
++		uint32_t *to = (uint32_t *)(fDraw + (uint64_t)py * fRowBytes) + px0;
+ 		for (uint32_t i = 0; i < n; i++) {
+ 			uint32_t x = fXMap[i], wx = fXWeight[i];
+ 			to[i] = wx == 0 ? line[x] : sweet_mix(line[x], line[x + 1], wx);
+@@ -806,7 +895,7 @@
+ 			uint32_t from = band == 0 ? 0 : fFitEnd, to = band == 0 ? fFitTop : fHeight;
+ 
+ 			for (uint32_t y = from; y < to; y++) {
+-				volatile uint64_t *line = (volatile uint64_t *)(fPixels + (uint64_t)y * fRowBytes);
++				volatile uint64_t *line = (volatile uint64_t *)(fDraw + (uint64_t)y * fRowBytes);
+ 				for (uint32_t x = 0; x < fWidth / 2; x++) {
+ 					line[x] = 0;
+ 				}
+@@ -914,7 +1003,7 @@
+ 					int32_t ys = ((int32_t)py - fFitBand) * SWEET_FB_FIT_DEN / SWEET_FB_FIT_NUM - dy;
+ 					const uint32_t *from = (const uint32_t *)(src + start +
+ 					    (uint64_t)(sy + (ys < 0 ? 0 : ys >= h ? h - 1 : ys)) * row);
+-					uint32_t *to = (uint32_t *)(fPixels + (uint64_t)py * fRowBytes) + px0;
++					uint32_t *to = (uint32_t *)(fDraw + (uint64_t)py * fRowBytes) + px0;
+ 
+ 					for (uint32_t i = 0; i < px1 - px0; i++) {
+ 						to[i] = from[fXMap[i]];
+@@ -956,7 +1045,7 @@
+ 		}
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++				memcpy((void *)(fDraw + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + start + (uint64_t)(sy + y) * row + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
