@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <dlfcn.h>
+#include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach.h>
 #include <libkern/OSCacheControl.h>
 
@@ -107,8 +108,26 @@ mirror_decode(char *out, size_t outsz, const char *fmt, const uint8_t *buf, uint
 				v |= (unsigned long long)buf[p + b] << (8 * b);
 			}
 			n += snprintf(out + n, outsz - (size_t)n, " |%llu", v);
+		} else if ((desc & 0xf0) == 0x40 && sz == 8) {   /* an object (%@): its description */
+			const void *obj;
+			char text[320];
+			CFStringRef d;
+
+			memcpy(&obj, buf + p, sizeof(obj));
+			text[0] = 0;
+			if (obj != NULL && (uintptr_t)obj > 0x100000 && ((uintptr_t)obj >> 47) == 0 &&
+			    (d = CFCopyDescription((CFTypeRef)obj)) != NULL) {
+				(void)CFStringGetCString(d, text, sizeof(text), kCFStringEncodingUTF8);
+				CFRelease(d);
+			}
+			for (char *c = text; *c != 0; c++) {
+				if (*c == '\n') {
+					*c = ' ';
+				}
+			}
+			n += snprintf(out + n, outsz - (size_t)n, " |%.300s", text[0] ? text : "<nil>");
 		} else {
-			n += snprintf(out + n, outsz - (size_t)n, " |<%#x>", desc);   /* objects, private data */
+			n += snprintf(out + n, outsz - (size_t)n, " |<%#x>", desc);   /* private data and others */
 		}
 		p += sz;
 	}
@@ -136,8 +155,8 @@ mirror_wanted(uint8_t type, const char *line)
 static void
 mirror(uint8_t type, const char *format, const uint8_t *buf, uint32_t size)
 {
-	static char last[600];
-	char line[600];
+	static char last[1400];
+	char line[1400];
 
 	if (!mirror_on || format == NULL || mirror_lines >= MIRROR_MAX) {
 		return;

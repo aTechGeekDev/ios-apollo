@@ -69,7 +69,7 @@ jobs:
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" \
             -O2 -Wall -Wextra -Werror -dynamiclib -install_name /usr/local/lib/libsweet-fix.dylib \
-            -framework Foundation -framework Metal -lobjc -o out/lib/libsweet-fix.dylib userland/fix/sweet_fix.c
+            -framework CoreFoundation -framework Foundation -framework Metal -lobjc -o out/lib/libsweet-fix.dylib userland/fix/sweet_fix.c
           codesign -s - -f out/lib/libsweet-fix.dylib
           otool -L out/lib/libsweet-fix.dylib
       - name: Checksums
