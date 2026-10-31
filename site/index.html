@@ -1,0 +1,588 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>project-BadApple</title>
+<meta name="description" content="Apple's iOS 16 running natively on the Xiaomi Mi 10T (apollo, Snapdragon 865): an open-source XNU port. Status, how it boots, and documentation.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0b0c0f;
+  --bg-2: #12141a;
+  --card: #161921;
+  --line: #262a35;
+  --text: #e8eaf0;
+  --muted: #9aa0ae;
+  --accent: #ff3b5c;
+  --accent-2: #ff8a3d;
+  --ok: #34d399;
+  --wip: #fbbf24;
+  --no: #6b7280;
+  --code-bg: #0f1116;
+  --shadow: 0 10px 30px rgba(0,0,0,.35);
+  color-scheme: dark;
+}
+:root[data-theme="light"] {
+  --bg: #f7f7f9;
+  --bg-2: #ffffff;
+  --card: #ffffff;
+  --line: #e3e5ea;
+  --text: #15171c;
+  --muted: #5b6170;
+  --accent: #e11d48;
+  --accent-2: #ea580c;
+  --ok: #059669;
+  --wip: #b45309;
+  --no: #9ca3af;
+  --code-bg: #f1f2f5;
+  --shadow: 0 10px 30px rgba(20,20,40,.08);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #f7f7f9; --bg-2: #ffffff; --card: #ffffff; --line: #e3e5ea; --text: #15171c; --muted: #5b6170;
+    --accent: #e11d48; --accent-2: #ea580c; --ok: #059669; --wip: #b45309; --no: #9ca3af; --code-bg: #f1f2f5;
+    --shadow: 0 10px 30px rgba(20,20,40,.08); color-scheme: light;
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 76px; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.6 Inter, system-ui, -apple-system, sans-serif; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, pre, .mono { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace; }
+code { background: var(--code-bg); border: 1px solid var(--line); padding: .08em .35em; border-radius: 6px; font-size: .88em; }
+
+/* top bar */
+.top { position: sticky; top: 0; z-index: 20; backdrop-filter: blur(12px); background: color-mix(in srgb, var(--bg) 82%, transparent); border-bottom: 1px solid var(--line); }
+.top .wrap { display: flex; align-items: center; gap: 16px; height: 60px; }
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 800; color: var(--text); letter-spacing: -.02em; }
+.brand:hover { text-decoration: none; }
+.logo { width: 28px; height: 28px; }
+.top nav { display: flex; gap: 18px; margin-left: auto; font-size: 14px; }
+.top nav a { color: var(--muted); }
+.top nav a:hover { color: var(--text); text-decoration: none; }
+.icon-btn { border: 1px solid var(--line); background: var(--card); color: var(--text); border-radius: 10px; height: 36px; padding: 0 12px; cursor: pointer; font: inherit; font-size: 14px; }
+.wrap { max-width: 1160px; margin: 0 auto; padding: 0 20px; }
+
+/* hero */
+.hero { position: relative; overflow: hidden; padding: 84px 0 64px; border-bottom: 1px solid var(--line); }
+.hero::before { content: ""; position: absolute; inset: -40% -10% auto; height: 520px; background: radial-gradient(closest-side, color-mix(in srgb, var(--accent) 30%, transparent), transparent 70%), radial-gradient(closest-side at 70% 40%, color-mix(in srgb, var(--accent-2) 22%, transparent), transparent 70%); filter: blur(10px); pointer-events: none; }
+.hero .wrap { position: relative; display: grid; grid-template-columns: 1.25fr .75fr; gap: 48px; align-items: center; }
+.eyebrow { display: inline-flex; gap: 8px; align-items: center; font-size: 13px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 4px 12px; background: var(--card); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); box-shadow: 0 0 0 4px color-mix(in srgb, var(--ok) 25%, transparent); }
+h1 { font-size: clamp(40px, 6vw, 68px); line-height: 1.02; letter-spacing: -.045em; margin: 18px 0 16px; }
+h1 .grad { background: linear-gradient(90deg, var(--accent), var(--accent-2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.lead { font-size: 19px; color: var(--muted); max-width: 640px; }
+.cta { display: flex; gap: 12px; margin-top: 28px; flex-wrap: wrap; }
+.btn { display: inline-flex; align-items: center; gap: 8px; border-radius: 12px; padding: 11px 18px; font-weight: 600; font-size: 15px; border: 1px solid var(--line); background: var(--card); color: var(--text); }
+.btn.primary { background: linear-gradient(90deg, var(--accent), var(--accent-2)); color: #fff; border: 0; }
+.btn:hover { text-decoration: none; transform: translateY(-1px); }
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 36px; max-width: 560px; }
+.stat { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px; }
+.stat b { display: block; font-size: 24px; letter-spacing: -.02em; }
+.stat span { font-size: 13px; color: var(--muted); }
+
+/* phone */
+.phone { justify-self: center; width: 230px; aspect-ratio: 1080/2400; border-radius: 34px; padding: 10px; background: linear-gradient(160deg, #2b2f3a, #0d0f14); box-shadow: var(--shadow), inset 0 0 0 2px #3a3f4c; position: relative; }
+.screen { width: 100%; height: 100%; border-radius: 26px; overflow: hidden; background: linear-gradient(170deg, #1b2a6b 0%, #6b2a8f 45%, #ff5f6d 100%); position: relative; }
+.screen .hole { position: absolute; top: 10px; left: 14px; width: 10px; height: 10px; border-radius: 50%; background: #000; }
+.screen .time { text-align: center; color: #fff; margin-top: 44px; font-weight: 700; font-size: 44px; letter-spacing: -.03em; }
+.screen .date { text-align: center; color: rgba(255,255,255,.85); font-size: 12px; font-weight: 600; }
+.screen .grid { position: absolute; left: 16px; right: 16px; bottom: 20px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+.screen .app { aspect-ratio: 1; border-radius: 11px; background: rgba(255,255,255,.22); backdrop-filter: blur(6px); }
+.screen .app:nth-child(4n+1) { background: rgba(52,211,153,.75); }
+.screen .app:nth-child(4n+2) { background: rgba(96,165,250,.75); }
+.screen .app:nth-child(4n+3) { background: rgba(251,191,36,.8); }
+.phone-caption { text-align: center; font-size: 12px; color: var(--muted); margin-top: 12px; }
+
+/* docs layout */
+.docs { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 40px; padding: 48px 0 80px; }
+.docs > div, .hero .wrap > div { min-width: 0; }
+.side { position: sticky; top: 84px; align-self: start; font-size: 14px; }
+.side .label { text-transform: uppercase; letter-spacing: .08em; font-size: 11px; color: var(--muted); margin: 0 0 8px; font-weight: 700; }
+.side a { display: block; padding: 6px 10px; border-radius: 8px; color: var(--muted); border-left: 2px solid transparent; }
+.side a:hover { color: var(--text); text-decoration: none; background: var(--card); }
+.side a.active { color: var(--text); border-left-color: var(--accent); background: var(--card); }
+section.doc { padding-bottom: 28px; margin-bottom: 36px; border-bottom: 1px solid var(--line); }
+section.doc:last-child { border-bottom: 0; }
+h2 { font-size: 30px; letter-spacing: -.03em; margin: 0 0 8px; }
+h3 { font-size: 18px; margin: 26px 0 10px; }
+.sub { color: var(--muted); margin: 0 0 22px; }
+
+/* progress */
+.overall { display: flex; align-items: center; gap: 18px; background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 18px; margin-bottom: 18px; }
+.ring { --p: 0; width: 84px; height: 84px; border-radius: 50%; background: conic-gradient(var(--accent) calc(var(--p) * 1%), var(--line) 0); display: grid; place-items: center; flex: none; }
+.ring::after { content: attr(data-label); width: 66px; height: 66px; border-radius: 50%; background: var(--card); display: grid; place-items: center; font-weight: 800; font-size: 20px; }
+.filters { display: flex; gap: 8px; flex-wrap: wrap; margin: 0 0 14px; }
+.chip { border: 1px solid var(--line); background: var(--card); color: var(--muted); border-radius: 999px; padding: 5px 12px; font-size: 13px; cursor: pointer; font: inherit; font-size: 13px; }
+.chip.on { color: var(--text); border-color: var(--accent); }
+.items { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+.item { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; }
+.item .row { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+.item b { font-size: 15px; }
+.pill { font-size: 11px; font-weight: 700; border-radius: 999px; padding: 2px 8px; white-space: nowrap; }
+.pill.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
+.pill.wip { color: var(--wip); background: color-mix(in srgb, var(--wip) 16%, transparent); }
+.pill.no { color: var(--muted); background: color-mix(in srgb, var(--no) 18%, transparent); }
+.bar { height: 6px; border-radius: 99px; background: var(--line); margin: 10px 0 8px; overflow: hidden; }
+.bar i { display: block; height: 100%; width: 0; border-radius: 99px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 1s cubic-bezier(.2,.8,.2,1); }
+.item p { margin: 0; font-size: 13.5px; color: var(--muted); }
+
+/* boot chain */
+.chain { display: grid; gap: 10px; counter-reset: s; }
+.stage { display: grid; grid-template-columns: 44px 1fr; gap: 14px; align-items: start; background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; position: relative; }
+.stage::before { counter-increment: s; content: counter(s); width: 32px; height: 32px; border-radius: 10px; display: grid; place-items: center; font-weight: 800; color: #fff; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
+.stage b { display: block; }
+.stage span { color: var(--muted); font-size: 14px; }
+.notes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 16px; }
+.note { background: var(--bg-2); border: 1px solid var(--line); border-radius: 14px; padding: 14px; font-size: 14px; color: var(--muted); }
+.note b { color: var(--text); display: block; margin-bottom: 4px; }
+
+/* steps & code */
+.callout { border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--line)); background: color-mix(in srgb, var(--accent) 8%, var(--card)); border-radius: 14px; padding: 12px 16px; font-size: 14.5px; margin: 0 0 18px; }
+.steps { counter-reset: st; display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+.step { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 18px; }
+.step h3 { margin: 0 0 6px; display: flex; align-items: center; gap: 10px; }
+.step h3::before { counter-increment: st; content: counter(st); width: 26px; height: 26px; border-radius: 8px; background: var(--bg-2); border: 1px solid var(--line); display: grid; place-items: center; font-size: 13px; }
+.step p { margin: 0 0 10px; color: var(--muted); font-size: 14.5px; }
+.code { position: relative; }
+.code pre { margin: 0; background: var(--code-bg); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; overflow-x: auto; font-size: 13px; line-height: 1.55; }
+.code .copy { position: absolute; top: 8px; right: 8px; font-size: 12px; height: 28px; padding: 0 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); color: var(--muted); cursor: pointer; }
+.code .copy:hover { color: var(--text); }
+.c { color: var(--muted); }
+
+/* tables */
+.search { width: 100%; max-width: 420px; height: 42px; border-radius: 12px; border: 1px solid var(--line); background: var(--card); color: var(--text); padding: 0 14px; font: inherit; margin: 0 0 14px; }
+.table { border: 1px solid var(--line); border-radius: 14px; overflow: hidden; background: var(--card); }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); background: var(--bg-2); }
+tr:last-child td { border-bottom: 0; }
+td.group { background: var(--bg-2); font-weight: 700; font-size: 13px; color: var(--accent); }
+td code { white-space: nowrap; }
+.empty { padding: 18px; color: var(--muted); display: none; }
+
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; }
+.card b { display: block; margin-bottom: 4px; }
+.card span { font-size: 14px; color: var(--muted); }
+
+footer { border-top: 1px solid var(--line); padding: 28px 0 40px; color: var(--muted); font-size: 14px; }
+footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+
+@media (max-width: 900px) {
+  .hero .wrap { grid-template-columns: 1fr; }
+  .phone { width: 190px; }
+  .docs { grid-template-columns: 1fr; }
+  .side { display: none; }
+  .notes { grid-template-columns: 1fr; }
+  .top nav { display: none; }
+  .top .icon-btn { margin-left: auto; }
+}
+@media (max-width: 520px) {
+  .stats { grid-template-columns: 1fr 1fr; }
+  td code { white-space: normal; word-break: break-all; }
+  th, td { padding: 8px 10px; }
+}
+@media (prefers-reduced-motion: reduce) { .bar i { transition: none; } html { scroll-behavior: auto; } }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="#">
+      <svg class="logo" viewBox="0 0 32 32" aria-hidden="true">
+        <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ff3b5c"/><stop offset="1" stop-color="#ff8a3d"/></linearGradient></defs>
+        <path fill="url(#g)" d="M21.6 4.2c.1 1.5-.5 3-1.4 4-.9 1.1-2.4 1.9-3.8 1.8-.2-1.5.5-3 1.4-4 .9-1 2.5-1.8 3.8-1.8zM26.4 22.3c-.7 1.5-1 2.2-1.9 3.5-1.3 1.9-3.1 4.2-5.3 4.2-2 0-2.5-1.3-5.2-1.3s-3.3 1.3-5.3 1.3c-2.2 0-3.9-2.1-5.2-4C-.1 20.7-.5 14.6 1.6 11.4c1.5-2.3 3.8-3.6 6-3.6 2.2 0 3.6 1.3 5.4 1.3 1.8 0 2.9-1.3 5.4-1.3 2 0 4 1.1 5.5 2.9-4.8 2.6-4 9.5.5 11.6z"/>
+        <path d="M7 15l18 9" stroke="var(--bg)" stroke-width="2.4" stroke-linecap="round"/>
+      </svg>
+      project-BadApple
+    </a>
+    <nav>
+      <a href="#progress">Progress</a>
+      <a href="#boot">How it boots</a>
+      <a href="#start">Getting started</a>
+      <a href="#options">Boot options</a>
+      <a href="https://github.com/aTechGeekDev/ios-apollo">GitHub</a>
+    </nav>
+    <button class="icon-btn" id="theme" type="button" aria-label="Switch light or dark theme">◐ Theme</button>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="wrap">
+    <div>
+      <span class="eyebrow"><span class="dot"></span> Boots to the home screen · iOS 16.7.16 (20H392)</span>
+      <h1>iOS 16 on the <span class="grad">Xiaomi Mi 10T</span>.</h1>
+      <p class="lead">Apple's open-source XNU kernel, patched for the Snapdragon 865, boots the unmodified iOS system of the iPhone X on <code>apollo</code>: launchd, the daemons, SpringBoard and the stock apps. No emulator, and no Android underneath.</p>
+      <div class="cta">
+        <a class="btn primary" href="#start">Get started →</a>
+        <a class="btn" href="https://github.com/aTechGeekDev/ios-apollo">View on GitHub</a>
+        <a class="btn" href="https://github.com/aTechGeekDev/ios-apollo/blob/main/NOTES.md">Engineering log</a>
+      </div>
+      <div class="stats">
+        <div class="stat"><b id="overall-num">72%</b><span>overall progress</span></div>
+        <div class="stat"><b>163</b><span>kernel patches</span></div>
+        <div class="stat"><b>8 cores</b><span>Snapdragon 865</span></div>
+      </div>
+    </div>
+    <div>
+      <div class="phone" aria-hidden="true">
+        <div class="screen">
+          <div class="hole"></div>
+          <div class="time" id="clock">9:41</div>
+          <div class="date" id="date">Saturday, October 31</div>
+          <div class="grid"><i class="app"></i><i class="app"></i><i class="app"></i><i class="app"></i><i class="app"></i><i class="app"></i><i class="app"></i><i class="app"></i></div>
+        </div>
+      </div>
+      <div class="phone-caption">An illustration, not a screenshot</div>
+    </div>
+  </div>
+</section>
+
+<main class="wrap docs">
+  <aside class="side">
+    <p class="label">Documentation</p>
+    <a href="#progress">Progress</a>
+    <a href="#boot">How it boots</a>
+    <a href="#start">Getting started</a>
+    <a href="#options">Boot options</a>
+    <a href="#firmware">Firmware</a>
+    <a href="#layout">Repository layout</a>
+    <a href="#faq">FAQ</a>
+    <a href="#credits">Credits</a>
+  </aside>
+
+  <div>
+    <section class="doc" id="progress">
+      <h2>Progress</h2>
+      <p class="sub">Rough estimates of how much of each part works on the phone today. Every boot's details are in <a href="https://github.com/aTechGeekDev/ios-apollo/blob/main/NOTES.md">NOTES.md</a>.</p>
+      <div class="overall">
+        <div class="ring" id="ring" data-label="72%"></div>
+        <div><b>Close to a daily-usable phone</b><br><span class="c">The UI, Wi-Fi, Bluetooth, sound, microphone and vibration work. Battery status, sleep, cameras and cellular are still to do.</span></div>
+      </div>
+      <div class="filters" role="group" aria-label="Filter by status">
+        <button class="chip on" data-f="all" type="button">All</button>
+        <button class="chip" data-f="ok" type="button">Works</button>
+        <button class="chip" data-f="wip" type="button">In progress</button>
+        <button class="chip" data-f="no" type="button">Not started</button>
+      </div>
+      <div class="items" id="items"></div>
+    </section>
+
+    <section class="doc" id="boot">
+      <h2>How it boots</h2>
+      <p class="sub">Every boot is temporary: nothing is flashed except the iOS root in <code>userdata</code>.</p>
+      <div class="chain">
+        <div class="stage"><div><b>Xiaomi bootloader (unlocked)</b><span>Stock, untouched. Rebooting without the next step starts Android's boot chain as usual.</span></div></div>
+        <div class="stage"><div><b><code>fastboot boot shim-boot.img</code></b><span>A temporary boot image; nothing is written to the boot partition.</span></div></div>
+        <div class="stage"><div><b>The shim</b><span>Loads XNU, an Apple Device Tree built for the phone, and the boot options.</span></div></div>
+        <div class="stage"><div><b>XNU kernel and drivers</b><span>UFS storage, display, touch, GPU, Wi-Fi, Bluetooth, audio, vibration, CPU clocks and temperature.</span></div></div>
+        <div class="stage"><div><b>iOS root (HFS+) in <code>userdata</code></b><span>The iPhone X's iOS 16.7.16 system, unmodified, plus small helper libraries.</span></div></div>
+        <div class="stage"><div><b>launchd → daemons → backboardd + SpringBoard → apps</b><span>CoreAnimation draws on the Adreno 650 through Mesa; the kernel page-flips the frames onto the panel.</span></div></div>
+      </div>
+      <div class="notes">
+        <div class="note"><b>No serial port</b>The kernel keeps a 4 MiB log at the end of <code>userdata</code>, read from recovery with <code>tools/sweet-log-pull.sh</code>.</div>
+        <div class="note"><b>First boot is slow</b>A new root runs iOS's data migration once (an hour or more). Later boots take about a minute.</div>
+        <div class="note"><b>Built in the cloud</b>The kernel and the iOS programs build on GitHub Actions' macOS runners.</div>
+      </div>
+    </section>
+
+    <section class="doc" id="start">
+      <h2>Getting started</h2>
+      <p class="sub">What you need: a Mi 10T / 10T Pro with an <b>unlocked bootloader</b>; Linux with <code>adb</code>, <code>fastboot</code>, <code>python3</code>, <code>aarch64-linux-gnu-gcc</code>, <code>mkbootimg</code> and the GitHub CLI; a recovery with <code>adb</code> (OrangeFox) at <code>recovery/recovery.img</code>.</p>
+      <div class="callout">⚠️ This is an experiment. Most of Apple's security model is switched off, and installing the iOS root <b>erases Android's <code>userdata</code></b>. Bootloaders, recovery, modem and <code>persist</code> are never touched.</div>
+      <div class="steps">
+        <div class="step">
+          <h3>Back up the phone</h3>
+          <p>From the temporary recovery, pull at least <code>persist</code>, <code>modemst1</code>, <code>modemst2</code>, <code>fsg</code>, <code>fsc</code>, <code>boot</code>, <code>dtbo</code> and <code>vbmeta</code>, and keep them out of git. Then extract the stock device tree:</p>
+          <div class="code"><pre>python3 tools/unpack_bootv2.py backup/boot.img dtb/boot_unpacked</pre></div>
+        </div>
+        <div class="step">
+          <h3>Build the kernel and the iOS programs</h3>
+          <p>Each workflow uploads an artifact; download them by run ID.</p>
+          <div class="code"><pre>python3 tools/validate-repo.py      <span class="c"># checks the patch series in seconds</span>
+gh workflow run xnu.yml             <span class="c"># the kernel</span>
+gh workflow run userland.yml        <span class="c"># Mesa, the CoreAnimation bridge, libsweet-fix</span>
+gh workflow run audio.yml           <span class="c"># the audio plug-in</span>
+gh workflow run bt.yml              <span class="c"># the Bluetooth library</span>
+gh run watch RUN_ID --exit-status
+gh run download RUN_ID -n xnu-kernel -D xnu/out
+gh run download USERLAND_RUN_ID -n sweet-userland -D sweet-userland
+gh run download BT_RUN_ID -n sweet-bt -D sweet-bt</pre></div>
+        </div>
+        <div class="step">
+          <h3>Build and install the iOS root</h3>
+          <p><code>tools/build-ios-root.sh</code> downloads the iPhone X IPSW's disk images, builds the root, adds the programs and, after asking, writes it to <code>userdata</code>. Details: <a href="https://github.com/aTechGeekDev/ios-apollo/blob/main/userland/README.md">userland/README.md</a>.</p>
+        </div>
+        <div class="step">
+          <h3>Get the firmware</h3>
+          <p>Firmware comes from Xiaomi and Qualcomm and is never stored in git. See <a href="#firmware">Firmware</a> for each file and the tool that fetches it.</p>
+        </div>
+        <div class="step">
+          <h3>Build the boot image and boot</h3>
+          <p>The full-featured setup: GPU-drawn UI at 60 Hz in full-panel mode, Wi-Fi, Bluetooth, sound, microphone, vibration and every iOS service.</p>
+          <div class="code"><pre>python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 \
+    --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
+    --gmu-fw research/apollo-gpu/a650_gmu.bin --sqe-fw research/apollo-gpu/a650_sqe.fw \
+    --zap-mdt research/apollo-gpu/a650_zap.mdt --zap-seg research/apollo-gpu/a650_zap.b02 \
+    --wifi-fw research/apollo-wifi --bt-fw research/apollo-bt \
+    --file /usr/local/lib/libsweet-gl.dylib=sweet-userland/lib/libsweet-gl.dylib \
+    --file /usr/local/lib/libsweet-fix.dylib=sweet-userland/lib/libsweet-fix.dylib \
+    --file /usr/local/lib/libsweet-bt.dylib=sweet-bt/lib/libsweet-bt.dylib \
+    --files-from tools/root-files/files.txt --files-from tools/root-files/bt-on.txt \
+    --files-from tools/root-files/aegir-off.txt
+python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/apollo.adt shim/out/payload.bin \
+    --cmdline 'debug=0xc serial=3 cpumask=0xf1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 sweetfb_noconsole=1 sweetfb_height=2502 sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetgpulevel=6 sweetwifi=12 apollo_audio=5 apollo_sound_gain=0 apollo_sound_below=80 apollo_mic=4 apollo_haptic=5 sweetbt=6 sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd;/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool sweetnull=backboardd,SpringBoard,bluetoothd,BlueTool,mediaserverd'
+shim/build.sh ../shim/out/payload.bin   <span class="c"># → shim/out/shim-boot.img</span>
+fastboot boot shim/out/shim-boot.img</pre></div>
+          <p style="margin-top:10px">For a minimal first boot, drop everything after <code>sweetfb_noconsole=1</code> and use <code>cpus=1</code> instead of <code>cpumask=0xf1</code>. The boot line holds at most 607 characters.</p>
+        </div>
+        <div class="step">
+          <h3>Read the kernel log</h3>
+          <p>Boot into recovery straight from the boot you want to look at; a new iOS boot overwrites the log.</p>
+          <div class="code"><pre>fastboot boot recovery/recovery.img &amp;&amp; adb wait-for-recovery
+tools/sweet-log-pull.sh logs/boot.txt
+adb reboot bootloader</pre></div>
+          <p style="margin-top:10px"><code>tools/sweet-crash.py</code> turns crash reports in the log into function names.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="doc" id="options">
+      <h2>Boot options</h2>
+      <p class="sub">Boot-args go in <code>--cmdline</code>. Each driver's source in <code>xnu/patches/</code> documents the rest.</p>
+      <input class="search" id="q" type="search" placeholder="Search options, e.g. gpu, fade, thermal…" aria-label="Search boot options">
+      <div class="table"><table><thead><tr><th style="width:38%">Option</th><th>Effect</th></tr></thead><tbody id="opts"></tbody></table><div class="empty" id="none">No option matches.</div></div>
+    </section>
+
+    <section class="doc" id="firmware">
+      <h2>Firmware</h2>
+      <p class="sub">None of these files are in git. Each tool runs with the phone in the temporary recovery.</p>
+      <div class="table"><table>
+        <thead><tr><th>Part</th><th>Files</th><th>How to get them</th></tr></thead>
+        <tbody>
+          <tr><td>Touch</td><td><code>novatek_nt36675_j3s_fw01.bin</code></td><td>The <code>.ihex</code> from Xiaomi's kernel source (<code>MiCode/Xiaomi_Kernel_OpenSource</code>, branch <code>apollo-q-oss</code>), then <code>objcopy -I ihex -O binary</code></td></tr>
+          <tr><td>GPU</td><td><code>a650_gmu.bin</code>, <code>a650_sqe.fw</code>, <code>a650_zap.*</code></td><td><code>tools/pull-gpu-fw.sh</code></td></tr>
+          <tr><td>Wi-Fi</td><td><code>amss20.bin</code>, <code>m3.bin</code>, <code>regdb.bin</code>, <code>bd_j3sgl.elf</code></td><td><code>tools/pull-wifi-fw.sh</code></td></tr>
+          <tr><td>Bluetooth</td><td><code>htbtfw20.tlv</code>, <code>htnv20.bin</code></td><td><code>tools/pull-bt-fw.sh</code></td></tr>
+          <tr><td>Audio DSP</td><td><code>adsp.mdt</code>, <code>adsp.b00</code> …</td><td><code>tools/pull-audio-fw.sh</code> (writes a one-boot file list)</td></tr>
+          <tr><td>Vibration, microphone</td><td><code>aw8697_haptic.bin</code>, <code>mic_*.bin</code></td><td><code>tools/pull-mic-haptic-fw.sh</code></td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section class="doc" id="layout">
+      <h2>Repository layout</h2>
+      <p class="sub"><code>sweet</code> / <code>SWEET</code> is the kernel's internal machine name; you'll see it in file, tool and option names.</p>
+      <div class="cards">
+        <div class="card"><b><code>xnu/patches/</code></b><span>The kernel: patches 0001–0163 on Apple's xnu-8796, applied in order by CI.</span></div>
+        <div class="card"><b><code>shim/</code></b><span>The boot shim, packed as an Android boot image.</span></div>
+        <div class="card"><b><code>wifi/</code></b><span>The Linux compatibility layer the ath11k Wi-Fi driver is built on.</span></div>
+        <div class="card"><b><code>userland/</code></b><span>Programs for the phone: Mesa, the CoreAnimation bridge, libsweet-fix, the audio plug-in, the Bluetooth library.</span></div>
+        <div class="card"><b><code>tools/</code></b><span>Device-tree builder, boot packer, iOS root builder, firmware pullers, log and crash tools.</span></div>
+        <div class="card"><b><code>tools/root-files/</code></b><span>One-boot lists that add, move or remove files on the iOS root.</span></div>
+        <div class="card"><b><code>.github/workflows/</code></b><span>CI for the kernel and the programs, and an analysis job for iOS's libraries (nothing from Apple is stored).</span></div>
+        <div class="card"><b><code>NOTES.md</code></b><span>The engineering log: every boot's result, the current state and the next steps.</span></div>
+      </div>
+    </section>
+
+    <section class="doc" id="faq">
+      <h2>FAQ</h2>
+      <h3>Can it run iOS 17, 18 or 26?</h3>
+      <p class="c">Not without a different approach. iOS 16 is the last release built for the iPhone X, the newest whose code runs on a processor without pointer authentication (ARMv8.3 PAC), and the Snapdragon 865 has none. Newer releases also draw only through Metal, while this port drives the GPU through Mesa's OpenGL ES.</p>
+      <h3>Is Android gone?</h3>
+      <p class="c">Its <code>userdata</code> is replaced by the iOS root; the bootloader, recovery, modem and <code>persist</code> stay. Every iOS boot is a temporary <code>fastboot boot</code>.</p>
+      <h3>Does Metal work?</h3>
+      <p class="c">No. There is no Metal device; <code>libsweet-fix.dylib</code> keeps the few programs that assume one (the screenshot markup) from crashing.</p>
+      <h3>Is anything from Apple in the repository?</h3>
+      <p class="c">No. iOS, its firmware and its libraries are downloaded by you and never committed or uploaded by CI.</p>
+    </section>
+
+    <section class="doc" id="credits">
+      <h2>Credits</h2>
+      <div class="cards">
+        <div class="card"><b>Apple's open source</b><span>xnu, IOHIDFamily, libpthread, hfs.</span></div>
+        <div class="card"><b><a href="https://github.com/enesuzun2002/hakios-apollo">hakios-apollo</a></b><span>The Mi 10T's sound, microphone, vibration and backlight drivers, and the audio plug-in.</span></div>
+        <div class="card"><b><a href="https://github.com/oosexgang/hackios-xnu-kernel">HackiOS</a></b><span>The Mesa and CoreAnimation approach and the Wi-Fi layer; its <a href="https://github.com/JopangJovan/hackios-xnu-kernel-umi">Mi 10 port</a> for the QCA6390.</span></div>
+        <div class="card"><b>ios-spes, ios-sailfish</b><span>The brightness service design.</span></div>
+        <div class="card"><b>Tools</b><span><a href="https://github.com/blacktop/darwin-xnu-build">darwin-xnu-build</a>, <a href="https://github.com/blacktop/ipsw">ipsw</a>, <a href="https://mesa3d.org">Mesa</a>, <a href="https://bearssl.org">BearSSL</a>, Linux's ath11k and FreeBSD's LinuxKPI.</span></div>
+        <div class="card"><b>Phone software</b><span>Xiaomi's published kernel source; <a href="https://orangefox.download">OrangeFox Recovery</a>.</span></div>
+      </div>
+      <p class="c" style="margin-top:16px">iOS belongs to Apple and is not distributed here. The project's own code is under the MIT License.</p>
+    </section>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>project-BadApple · iOS 16 on the Xiaomi Mi 10T (<code>apollo</code>)</span>
+    <span><a href="https://github.com/aTechGeekDev/ios-apollo">GitHub</a> · <a href="https://github.com/aTechGeekDev/ios-apollo/blob/main/NOTES.md">NOTES.md</a> · <a href="https://github.com/aTechGeekDev/ios-apollo/blob/main/LICENSE">MIT License</a></span>
+  </div>
+</footer>
+
+<script>
+(function () {
+  /* theme: remembered per viewer when storage works */
+  var root = document.documentElement;
+  try { var saved = localStorage.getItem('theme'); if (saved) root.setAttribute('data-theme', saved); } catch (e) {}
+  document.getElementById('theme').addEventListener('click', function () {
+    var dark = root.getAttribute('data-theme') ? root.getAttribute('data-theme') === 'dark'
+      : !window.matchMedia('(prefers-color-scheme: light)').matches;
+    var next = dark ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+    try { localStorage.setItem('theme', next); } catch (e) {}
+  });
+
+  /* the phone's clock */
+  function tick() {
+    var d = new Date();
+    document.getElementById('clock').textContent = d.getHours() + ':' + String(d.getMinutes()).padStart(2, '0');
+    document.getElementById('date').textContent = d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
+  }
+  tick(); setInterval(tick, 30000);
+
+  /* progress */
+  var items = [
+    ['Boot to the home screen', 100, 'ok', 'Lock screen, home screen, Control Center, Settings, app switcher, home gesture, wallpapers, widgets.'],
+    ['Touch', 95, 'ok', 'Novatek NT36675 over SPI; its firmware is loaded at every boot.'],
+    ['Buttons', 100, 'ok', 'Power, volume up, volume down.'],
+    ['Wi-Fi', 95, 'ok', "QCA6390 with Linux's ath11k in the kernel: scan, WPA2, saved networks, internet in apps and Safari."],
+    ['Bluetooth', 90, 'ok', 'On/off, scan, pairing kept across reboots, music to headphones (A2DP), HFP, AVRCP.'],
+    ['Speakers', 85, 'ok', 'Audio DSP and two CS35L41 amplifiers; an occasional crackle remains.'],
+    ['Microphone', 100, 'ok', 'WCD938x codec; recording works (Voice Memos).'],
+    ['Vibration', 75, 'ok', 'AW8697 motor: taps and ringtone patterns, with limits that protect the motor.'],
+    ['GPU drawing', 75, 'ok', 'Adreno 650 runs Mesa (OpenGL ES 3.2); CoreAnimation draws the whole UI on it, blur included. A hung GPU is reset.'],
+    ['Screen fit', 90, 'ok', 'Full-panel 375×834 points, GPU-scaled into page-flipped buffers: no tearing, no CPU copy.'],
+    ['Brightness', 95, 'ok', 'Brightness slider and Control Center drive the backlight; smooth fade on lock and unlock.'],
+    ['CPU', 85, 'ok', 'All 8 cores; clocks follow the load, a touch boosts them, 75 °C limit on the big cores.'],
+    ['Heat / power use', 80, 'ok', 'Acceptable with every service on: runaway background processes are held to 10% of a core.'],
+    ['Screenshots', 90, 'ok', 'Taken and saved to Photos (libsweet-fix keeps the markup editor from crashing without Metal).'],
+    ['Smoothness (goal: 60 fps)', 70, 'wip', '25–55 fps; limited by background work and the thermal limit.'],
+    ['Files app', 40, 'wip', 'Opens; the "On My iPhone" location does not appear yet.'],
+    ['Battery / charging status', 0, 'no', 'Not started.'],
+    ['Sleep / standby', 0, 'no', 'The panel goes dark when locked, but the phone never suspends.'],
+    ['USB, cameras, cellular, sensors, GPS, fingerprint', 0, 'no', 'Not started.']
+  ];
+  var label = { ok: 'Works', wip: 'In progress', no: 'Not started' };
+  var box = document.getElementById('items');
+  box.innerHTML = items.map(function (it) {
+    return '<div class="item" data-s="' + it[2] + '"><div class="row"><b>' + it[0] + '</b><span class="pill ' + it[2] + '">' +
+      label[it[2]] + ' · ' + it[1] + '%</span></div><div class="bar"><i data-w="' + it[1] + '"></i></div><p>' + it[3] + '</p></div>';
+  }).join('');
+  var overall = Math.round(items.reduce(function (s, it) { return s + it[1]; }, 0) / items.length);
+  document.getElementById('overall-num').textContent = overall + '%';
+  var ring = document.getElementById('ring');
+  ring.setAttribute('data-label', overall + '%');
+  ring.style.setProperty('--p', overall);
+  function fill() { box.querySelectorAll('.bar i').forEach(function (b) { b.style.width = b.getAttribute('data-w') + '%'; }); }
+  if ('IntersectionObserver' in window) {
+    new IntersectionObserver(function (es, o) { if (es[0].isIntersecting) { fill(); o.disconnect(); } }).observe(box);
+  } else { fill(); }
+  document.querySelectorAll('.chip').forEach(function (c) {
+    c.addEventListener('click', function () {
+      document.querySelectorAll('.chip').forEach(function (x) { x.classList.toggle('on', x === c); });
+      var f = c.getAttribute('data-f');
+      box.querySelectorAll('.item').forEach(function (it) { it.style.display = f === 'all' || it.getAttribute('data-s') === f ? '' : 'none'; });
+    });
+  });
+
+  /* boot options */
+  var opts = [
+    ['Core'],
+    ['cpus=N', 'Start N cores (cpus=1 is the safe fallback).'],
+    ['cpumask=M', 'Start the cores in mask M (bit n = core n: 0–3 small, 4–6 big, 7 prime). 0xf1 = core 0 + the four big cores. Not together with cpus=.'],
+    ['ufslogsecs=1', 'Write the log to storage every second (for hangs).'],
+    ['sweetnull=A,B,…', 'Copy what these programs print into the kernel log.'],
+    ['sweetinject=LIB:PROG,…;…', 'Start these programs with a library inserted (the CoreAnimation bridge, libsweet-bt).'],
+    ['sweetfix=0', 'Do not insert libsweet-fix.dylib into the programs that need it (0162).'],
+    ['sweettouch=0, sweetkeys=0', 'Turn off touch or the buttons.'],
+    ['Display and backlight'],
+    ['sweetfb_hz=N', 'Screen refreshes a second (default 10; use 60).'],
+    ['sweetfb_noconsole=1', "Don't draw kernel text over the UI."],
+    ['sweetfb_height=2502', 'Full-panel mode: build the device tree with mkadt.py --display-height 2502.'],
+    ['sweetfb_native=1', 'iOS draws at 1080×2400 1:1 (360×800 points). Needs mkadt.py --native-display.'],
+    ['sweetfb_fit=0', 'Crop the iPhone X picture instead of scaling it to fit.'],
+    ['sweetfb_stats=N', 'Every N s, a SWEET FB line with frames a second (default 10).'],
+    ['sweetscan=0', "Don't let the GPU scale frames into the flip buffers; the CPU copies them."],
+    ['sweetflip=0', 'Copy each frame into the shown buffer instead of page flipping (tears).'],
+    ['sweetfb_smooth=1', 'Bilinear CPU scaling: smoother text, far slower.'],
+    ['apollo_backlight=P', 'Backlight: 0 leave it alone, 1–100 set a level, absent = keep the bootloader’s level.'],
+    ['apollo_backlight_fade_ms=N', 'Lock/unlock fade length (default 300).'],
+    ['sweetbacklight=0', "Don't offer the backlight to iOS (the slider does nothing)."],
+    ['CPU, memory and heat'],
+    ['sweetcpugov=0', 'Pin every core at top speed instead of following the load.'],
+    ['sweetcpufreq=N', 'Cap the CPU clock at N MHz.'],
+    ['sweetthermal=T', 'Slow the big cores while the hottest core is over T °C (default 75; 0 = no limit).'],
+    ['sweetcpustats=N', 'Every N s, a SWEET CPUFREQ line: clocks, load, temperatures (default 10).'],
+    ['sweettop=0', 'No SWEET TOP line (the threads that used the most CPU).'],
+    ['sweettame=0', 'No CPU budget for runaway background processes. Tune with sweettame_enter=35, sweettame_strikes=4, sweettame_held=10.'],
+    ['sweetboost=N', 'After a touch, every CPU at full speed (within the thermal limit) for N ms (default 250; 0 = off).'],
+    ['sweetddr=N', 'Memory bus: 0 leave it alone, 1 follow the load, 2 always at top (default).'],
+    ['sweetddrlow=V', 'The memory bus’s idle level (default 0x800).'],
+    ['GPU'],
+    ['sweetgpu=22 sweetgpukeep=1', 'Bring the GPU up and keep it on for iOS.'],
+    ['sweetgpulevel=N', 'GPU speed: 1 = 305 MHz (default) … 6 = 587 MHz (best frame rate).'],
+    ['sweetgpurecover=0', 'On a GPU hang, stop the GPU for good instead of resetting it (0163).'],
+    ['sweetgl=0', "Keep iOS's software renderer."],
+    ['Wi-Fi and Bluetooth'],
+    ['sweetwifi=12', 'Wi-Fi for iOS (1–11 are bring-up test steps).'],
+    ['sweetwifimac=aa:bb:cc:dd:ee:ff', 'Fixed Wi-Fi address (default: random each boot).'],
+    ['sweetbt=6', 'Bluetooth for iOS; needs the bt-on.txt list and the libsweet-bt injection.'],
+    ['Sound, vibration and microphone'],
+    ['apollo_audio=5', 'Speakers for iOS; needs the audio plug-in on the root once (audio-on.txt).'],
+    ['apollo_sound_below=N', 'Volume ceiling below Android’s level, in eighths of a dB (default 160 = 20 dB).'],
+    ['apollo_sound_gain=N', 'Pre-gain of the limiter, in eighths of a dB (default 96; 0 avoids crackle).'],
+    ['apollo_haptic=5', 'Vibration motor for iOS.'],
+    ['apollo_haptic_max_ms=N', 'Longest single vibration (default 2000).'],
+    ['apollo_mic=4', 'Microphone for iOS; apollo_mic_path=0 uses the plain path without Xiaomi’s tuning.']
+  ];
+  var tb = document.getElementById('opts');
+  tb.innerHTML = opts.map(function (o) {
+    return o.length === 1 ? '<tr class="g"><td class="group" colspan="2">' + o[0] + '</td></tr>'
+      : '<tr class="o"><td><code>' + o[0] + '</code></td><td>' + o[1] + '</td></tr>';
+  }).join('');
+  document.getElementById('q').addEventListener('input', function (e) {
+    var q = e.target.value.trim().toLowerCase(), shown = 0, group = null, groupHas = false;
+    function closeGroup() { if (group) group.style.display = groupHas || !q ? '' : 'none'; }
+    tb.querySelectorAll('tr').forEach(function (tr) {
+      if (tr.classList.contains('g')) { closeGroup(); group = tr; groupHas = false; return; }
+      var hit = !q || tr.textContent.toLowerCase().indexOf(q) >= 0;
+      tr.style.display = hit ? '' : 'none';
+      if (hit) { shown++; groupHas = true; }
+    });
+    closeGroup();
+    document.getElementById('none').style.display = shown ? 'none' : 'block';
+  });
+
+  /* copy buttons */
+  document.querySelectorAll('.code').forEach(function (c) {
+    var b = document.createElement('button');
+    b.className = 'copy'; b.type = 'button'; b.textContent = 'Copy';
+    b.addEventListener('click', function () {
+      var text = c.querySelector('pre').innerText.replace(/\s+# .*$/gm, '');
+      var done = function () { b.textContent = 'Copied'; setTimeout(function () { b.textContent = 'Copy'; }, 1400); };
+      if (navigator.clipboard) navigator.clipboard.writeText(text).then(done, function () {}); else done();
+    });
+    c.appendChild(b);
+  });
+
+  /* the side menu follows the reading position */
+  var links = document.querySelectorAll('.side a');
+  if ('IntersectionObserver' in window) {
+    var io = new IntersectionObserver(function (es) {
+      es.forEach(function (e) {
+        if (e.isIntersecting) links.forEach(function (a) { a.classList.toggle('active', a.getAttribute('href') === '#' + e.target.id); });
+      });
+    }, { rootMargin: '-30% 0px -60% 0px' });
+    document.querySelectorAll('section.doc').forEach(function (s) { io.observe(s); });
+  }
+})();
+</script>
+</body>
+</html>

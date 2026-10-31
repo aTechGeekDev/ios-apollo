@@ -4,6 +4,8 @@
 
 Apple's open-source XNU kernel (xnu-8796), patched for this phone, boots the **unmodified iOS 16.7.16 (20H392) system of the iPhone X**: launchd, the system daemons, the window server, SpringBoard and the stock apps. No emulator, and no Android underneath.
 
+**Website and documentation:** [atechgeekdev.github.io/ios-apollo](https://atechgeekdev.github.io/ios-apollo/) (source: [`site/`](site/index.html)).
+
 > [!WARNING]
 > This is an experiment, not a daily-use phone OS. Most of Apple's security model is switched off, and installing the iOS root **erases Android's `userdata` partition**.
 
@@ -262,6 +264,7 @@ None of these files are in git. Each tool runs with the phone in the temporary r
 | `userland/` | Programs for the phone: Mesa, the CoreAnimation bridge, the audio plug-in, the Bluetooth library, GPU tests ([details](userland/README.md)) |
 | `tools/` | Device tree builder, boot packer, iOS root builder, firmware pullers, log and crash tools |
 | `tools/root-files/` | One-boot file lists that add, move or remove files on the iOS root (e.g. `quiet-on.txt` / `quiet-max.txt`: switch off daemons that waste CPU) |
+| `site/` | The project website (status and documentation), published to GitHub Pages by `pages.yml` |
 | `.github/workflows/` | CI: the kernel, the iOS programs, and an analysis job for iOS's system libraries (nothing from Apple is stored) |
 | `NOTES.md` | The engineering log: every boot's result, current state, next steps |
 
