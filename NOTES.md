@@ -2,6 +2,11 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 105 (2026-10-31, kernel 41208843768, userland 41215357320 + jb-install.txt): installer started twice, killed mid-unpack -> kernel 41216279299 (0168) + userland 41216279313 <<<
+
+**Observed (user's grep):** `fixlog: jailbreak installer started (pid 13)` (usermanagerd's boot task) and again `(pid 94)` (the usermanagerd daemon); each logged "step 1: unpacking" and nothing after; no Sileo after 3 min. Cause (inferred): launchd ends usermanagerd's jobs (boot task; daemon `-t 15` idle exit) together with the processes they started.
+**Change:** xnu 0168 adds configd (root, whole boot) to the built-in libsweet-fix group; libsweet-fix starts the installer from configd only; the installer flocks /private/var/sweet-jb/lock and logs every 1000 entries. Partly unpacked /var/jb is simply overwritten.
+
 ### >>> In-place jailbreak (2026-10-31; userland 41215357320 has bin/sweet-jbinstall + libsweet-fix trigger): NOT YET BOOTED <<<
 
 **Design:** tools/jb-fetch.sh (host: curl, zstd, xz) -> research/jb/bootstrap.tar.xz (Procursus 1900 rootless bootstrap-iphoneos-arm64, zstd -> xz -6 single-threaded) + sileo.deb (2.5.1 iphoneos-arm64). tools/root-files/jb-install.txt carries /usr/local/bin/sweet-jbinstall, /private/var/sweet-jb/{bootstrap.tar.xz,sileo.deb} (~21 MiB) for one boot. libsweet-fix in usermanagerd (root) posix_spawns the installer (POSIX_SPAWN_SETSID, clean env) unless /var/jb/.sweet-jb-done. Installer (userland/jb/sweet_jbinstall.c): xz via libcompression COMPRESSION_LZMA, tar (ustar/pax/GNU L/K), only ./var/jb entries, owners + modes after chown; markers .sweet-jb-unpacked / -prepped / -done; sleeps 90 s then `NO_PASSWORD_PROMPT=1 /var/jb/bin/sh /var/jb/prep_bootstrap.sh`, `dpkg -i sileo.deb`, `uicache -p /var/jb/Applications/Sileo.app`. Logs `sweet-jb:` to /dev/console + /private/var/sweet-jb/install.log.
