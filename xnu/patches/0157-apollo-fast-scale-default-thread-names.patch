@@ -1,0 +1,83 @@
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -53,6 +53,7 @@
+ extern int sweet_rpmh_ddr_set(bool top);                                                /* sweet_rpmh.c */
+ extern void sweet_cpu_top(char *out, size_t size, uint64_t window_abs);                 /* machine_routines.c (0155) */
+ void sweet_cpufreq_init(void);
++extern void thread_set_thread_name(thread_t thread, const char *name);          /* (0157) */
+ 
+ #define CPUFREQ_DOMAIN_PA(d)  (0x18591000u + 0x1000u * (d))
+ #define CPUFREQ_DOMAINS       3u
+@@ -397,6 +398,7 @@
+ 
+ 		tsens0 = ml_io_map(TSENS0_TM_PA, 0x1000);
+ 		if (kernel_thread_start(cpufreq_governor, NULL, &thread) == KERN_SUCCESS) {
++			thread_set_thread_name(thread, "sweet cpufreq governor");
+ 			thread_deallocate(thread);
+ 		} else {
+ 			printf("SWEET CPUFREQ: no thread for the governor: every domain stays at its top\n");
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -52,6 +52,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
++extern void thread_set_thread_name(thread_t thread, const char *name);          /* (0157) */
+ extern int sweet_display_dark;  /* (xnu 0155) SweetFramebuffer.cpp: the display is off and dark */
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
+@@ -990,6 +991,7 @@
+ 
+ 	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet touch");
+ 		thread_deallocate(thread);
+ 	} else {
+ 		printf("SWEET TOUCH: kernel_thread_start failed %d\n", kr);
+--- a/bsd/dev/sweet_backlight.c
++++ b/bsd/dev/sweet_backlight.c
+@@ -32,6 +32,7 @@
+ #include <sys/systm.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void thread_set_thread_name(thread_t thread, const char *name);          /* (0157) */
+ 
+ /* into the loader's log as well (as the other apollo drivers) */
+ extern void loader_log_putc(char c);
+@@ -588,6 +589,7 @@
+ 		say("apollo backlight: no thread for the fade: left alone\n");
+ 		return;
+ 	}
++	thread_set_thread_name(thread, "sweet backlight fade");
+ 	thread_deallocate(thread);
+ 	ready = true;
+ 	if (percent != 0) {
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -75,6 +75,9 @@
+  * at a time (no NEON in the kernel): a line blended between its two source
+  * lines first, then across. More work per frame on the present thread (the
+  * SWEET FB line's copy time says how much); sweetfb_smooth=0: nearest pixel.
++ * (xnu 0157) Off by default: boot 87 measured the blended copy at 18-30 ms a
++ * frame (64 at most) against 3.5-4.3 nearest, and only 20-28 of iOS's 35-52
++ * frames a second reached the panel. sweetfb_smooth=1 turns it on.
+  *
+  * (xnu 0154) The brightness slider: an AppleARMBacklight service under AppleCLCD,
+  * as ios-sailfish 0168 / ios-spes 0145 (same iOS 16.7 and iPhone X identity;
+@@ -438,7 +441,7 @@
+ 		fFit = false;
+ 	}
+ 	/* (0155) blended, not nearest */
+-	int smooth = 1;
++	int smooth = 0;         /* (0157) off by default: see the top of this file */
+ 	PE_parse_boot_argn("sweetfb_smooth", &smooth, sizeof(smooth));
+ 	fXWeight = fFit && smooth ? (uint8_t *)IOMallocData(fWidth) : NULL;
+ 	fLine = fFit && smooth ? (uint32_t *)IOMallocData((fLogicalW + 4) * sizeof(uint32_t)) : NULL;
+@@ -478,6 +481,7 @@
+ 		IOLog("SWEET FB: no present thread\n");
+ 		return false;
+ 	}
++	thread_set_thread_name(presenter, "sweet fb present");    /* (0157) its name in SWEET TOP */
+ 	thread_deallocate(presenter);
+ 	fStatSince = mach_absolute_time();
+ 	fNextVsync = fStatSince + fPeriodAbs;

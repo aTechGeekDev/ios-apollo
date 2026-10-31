@@ -58,9 +58,9 @@ The detailed engineering log, with every boot's results, is [`NOTES.md`](NOTES.m
 
 | Patch | What it does | State |
 | --- | --- | --- |
-| **0156** | No tearing: frames are drawn off-screen and the display controller flips to them between refreshes (three buffers) | Built, not booted |
-| **0155** | A per-thread CPU report every 10 s (`SWEET TOP`) to find what keeps the cores busy; blended screen scaling; touch polled slowly while the screen is off | Booted (boot 87): tearing and slow; its log is needed |
-| Next | Fix whatever `SWEET TOP` shows burning idle CPU; let the GPU do the screen scaling (no CPU copy: cooler and faster); GPU clock scaling; the microphone | Planned |
+| **0157** + `quiet-on.txt` | The fast screen scaling is the default again (the blended one cost 18–30 ms a frame); kernel threads named in `SWEET TOP`; four background daemons that spun all the time (coreduetd, voicemail, ReportCrash, fairplayd) switched off | Built, not booted |
+| **0156** | No tearing: frames are drawn off-screen and the display controller flips to them between refreshes | Built, not booted |
+| Next | Find what crash-loops (ReportCrash every few seconds) and why iOS's userland collapsed late in boot 87; let the GPU do the screen scaling; GPU clock scaling; the microphone | Planned |
 
 ---
 
@@ -185,7 +185,7 @@ Boot options (boot-args) go in `--cmdline`. The most useful ones are below. Each
 | `sweetfb_native=1` | iOS draws at 1080×2400 1:1 (360×800 points; iOS shows a red status bar). Needs `mkadt.py --native-display` |
 | `sweetfb_stats=N` | Every N s, a `SWEET FB` line with frames a second and copy time (default 10) |
 | `sweetflip=0` | Copy each frame into the shown buffer instead of page flipping (0156; tears) |
-| `sweetfb_smooth=0` | Nearest-pixel scaling instead of the blended (bilinear) default (0155): less CPU, rougher text |
+| `sweetfb_smooth=1` | Blended (bilinear) scaling instead of nearest pixel: smoother text, but far slower on the CPU (0155/0157) |
 | `apollo_backlight=P` | Backlight: `0` leave it alone, `1`–`100` set a level, absent = keep the bootloader's level |
 | `apollo_backlight_fade_ms=N` | Lock/unlock fade length (default 300) |
 | `sweetbacklight=0` | Don't offer the backlight to iOS (the brightness slider does nothing) |
@@ -251,12 +251,12 @@ None of these files are in git. Each tool runs with the phone in the temporary r
 
 | Path | What's inside |
 | --- | --- |
-| `xnu/patches/` | The kernel: patches 0001–0156 on Apple's xnu-8796, applied in order by CI |
+| `xnu/patches/` | The kernel: patches 0001–0157 on Apple's xnu-8796, applied in order by CI |
 | `shim/` | The boot shim, packed as an Android boot image |
 | `wifi/` | The Linux compatibility layer the Wi-Fi driver (ath11k) is built on |
 | `userland/` | Programs for the phone: Mesa, the CoreAnimation bridge, the audio plug-in, the Bluetooth library, GPU tests ([details](userland/README.md)) |
 | `tools/` | Device tree builder, boot packer, iOS root builder, firmware pullers, log and crash tools |
-| `tools/root-files/` | One-boot file lists that add, move or remove files on the iOS root |
+| `tools/root-files/` | One-boot file lists that add, move or remove files on the iOS root (e.g. `quiet-on.txt`: switches off daemons that waste CPU) |
 | `.github/workflows/` | CI: the kernel, the iOS programs, and an analysis job for iOS's system libraries (nothing from Apple is stored) |
 | `NOTES.md` | The engineering log: every boot's result, current state, next steps |
 

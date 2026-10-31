@@ -2,6 +2,18 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 87's log (2026-10-31): SWEET TOP names the CPU burners -> xnu 0157 + tools/root-files/quiet-on.txt <<<
+
+**Observed (`SWEET TOP`, every 10 s, % of one core):**
+- **coreduetd** one thread 34-78% all the time (display on and off), more coreduetd threads 12-46%; **biomed** 9-18%, **dasd** 2-7% (Core Duet's companions).
+- **vmd** = `com.apple.voicemail.vmd` (voicemail, no cellular): 24-67% (two threads).
+- **ReportCrash** appearing every few windows (something crashes repeatedly; which: not in this grep), **launchd** threads 5-13%.
+- **The present thread** (unnamed: `kernel_task/#157` / `kernel_task/ev 0`, running) 49-68% with the display on: **0155's bilinear copy took 18-30 ms a frame (max 64)** vs 3.5-4.3 nearest (boot 86); iOS gave 35-52 frames/s, only 20-28 reached the panel. That is the "poor performance" (and makes the tearing wider).
+- Then **userland collapsed**: 85 threads (from ~950), 0 frames, one `launchd/#5784` at 100% on the prime core. Cause not in this grep (guess: a userspace reboot or launchd stuck after a crash loop).
+**xnu 0157 (`0157-apollo-fast-scale-default-thread-names.patch`):** `sweetfb_smooth` default 0 (nearest again; `=1` turns the blend on); thread names: "sweet fb present", "sweet cpufreq governor", "sweet touch", "sweet backlight fade" (thread_set_thread_name) so SWEET TOP names them.
+**tools/root-files/quiet-on.txt** (replaces bt-on.txt in the ADT command; same file, Bluetooth stays enabled): launchd's disabled.plist = coreduetd, voicemail.vmd, ReportCrash, fairplayd.H2 (`launchd-disabled-quiet.plist`). Labels: vmd's from tools/launchd-edit.py (ios-sailfish's list); coreduetd's as the job's plist name (com.apple.coreduetd; not checked against this root). Undo: bt-on.txt.
+**Asked:** the CRASH / exit lines of boot 87 (what crash-loops; why userland went to 85 threads).
+
 ### >>> BOOT 87 (2026-10-31, kernel 41080308008 = 0155): user: "the screen is tearing and the performance is poor" -> xnu 0156 page flips <<<
 
 **Observed (user, no log yet):** tearing, poor performance. **Cause of the tearing (from the code):** every frame is copied into the very buffer the panel scans (0x9c000000) while it scans it; 0155's bilinear copy takes longer, so the copy and the scan cross more visibly. Performance: not measured yet (asked for the boot 87 `SWEET TOP` / `SWEET FB` / `SWEET CPUFREQ` lines; guesses: the idle CPU burn of boot 86 + the 75 C cap + the slower blended copy).
