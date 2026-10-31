@@ -397,10 +397,12 @@
  		uint64_t spent = mach_absolute_time() - began;
  		if (!shown) {
  			IODelay(500);   /* (xnu 0153; XNU blocks the thread, not spins, for this long) the GPU's frame looked at again after 0.5 ms (was 2: a late frame missed its vsync) */
-@@ -652,6 +721,26 @@
+@@ -652,6 +721,28 @@
  	}
  }
  
++static uint32_t get32(const uint8_t *p, uint32_t off);    /* (below) */
++
 +/* (xnu 0156) one of the swap's layers fills the whole presented display: the frame can be drawn into an empty buffer */
 +bool
 +AppleCLCD::coversDisplay(const uint8_t *rec)
@@ -424,7 +426,7 @@
  /* (xnu 0155) p..q by w of 256, each channel; two channels at a time in 16-bit lanes (0xff * 256 fits) */
  static inline uint32_t
  sweet_mix(uint32_t p, uint32_t q, uint32_t w)
-@@ -718,7 +807,7 @@
+@@ -718,7 +809,7 @@
  			}
  			line = fLine;
  		}
@@ -433,7 +435,7 @@
  		for (uint32_t i = 0; i < n; i++) {
  			uint32_t x = fXMap[i], wx = fXWeight[i];
  			to[i] = wx == 0 ? line[x] : sweet_mix(line[x], line[x + 1], wx);
-@@ -806,7 +895,7 @@
+@@ -806,7 +897,7 @@
  			uint32_t from = band == 0 ? 0 : fFitEnd, to = band == 0 ? fFitTop : fHeight;
  
  			for (uint32_t y = from; y < to; y++) {
@@ -442,7 +444,7 @@
  				for (uint32_t x = 0; x < fWidth / 2; x++) {
  					line[x] = 0;
  				}
-@@ -914,7 +1003,7 @@
+@@ -914,7 +1005,7 @@
  					int32_t ys = ((int32_t)py - fFitBand) * SWEET_FB_FIT_DEN / SWEET_FB_FIT_NUM - dy;
  					const uint32_t *from = (const uint32_t *)(src + start +
  					    (uint64_t)(sy + (ys < 0 ? 0 : ys >= h ? h - 1 : ys)) * row);
@@ -451,7 +453,7 @@
  
  					for (uint32_t i = 0; i < px1 - px0; i++) {
  						to[i] = from[fXMap[i]];
-@@ -956,7 +1045,7 @@
+@@ -956,7 +1047,7 @@
  		}
  		if (src != 0 && bpe == 4) {
  			for (int32_t y = 0; y < h; y++) {

@@ -18,7 +18,7 @@
 - Then **userland collapsed**: 85 threads (from ~950), 0 frames, one `launchd/#5784` at 100% on the prime core. Cause not in this grep (guess: a userspace reboot or launchd stuck after a crash loop).
 **xnu 0157 (`0157-apollo-fast-scale-default-thread-names.patch`):** `sweetfb_smooth` default 0 (nearest again; `=1` turns the blend on); thread names: "sweet fb present", "sweet cpufreq governor", "sweet touch", "sweet backlight fade" (thread_set_thread_name) so SWEET TOP names them.
 **tools/root-files/quiet-on.txt** (replaces bt-on.txt in the ADT command; same file, Bluetooth stays enabled): launchd's disabled.plist = coreduetd, voicemail.vmd, ReportCrash, fairplayd.H2 (`launchd-disabled-quiet.plist`). Labels: vmd's from tools/launchd-edit.py (ios-sailfish's list); coreduetd's as the job's plist name (com.apple.coreduetd; not checked against this root). Undo: bt-on.txt.
-**Build:** commit a52931a, xnu run **41180374271** (0156's own run 41180007938 cancelled: 0157 contains it). **Asked:** the CRASH / exit lines of boot 87 (what crash-loops; why userland went to 85 threads).
+**Build:** commit a52931a, xnu run **41180374271** (0156's own run 41180007938 cancelled: 0157 contains it). **Run 41180374271 FAILED to compile**: 0156's coversDisplay() used get32() above its definition in SweetFramebuffer.cpp (C++: undeclared); fixed in 0156 itself by a forward declaration (neither 0156 nor 0157 had been booted). **Asked:** the CRASH / exit lines of boot 87 (what crash-loops; why userland went to 85 threads).
 
 ### >>> BOOT 87 (2026-10-31, kernel 41080308008 = 0155): user: "the screen is tearing and the performance is poor" -> xnu 0156 page flips <<<
 
