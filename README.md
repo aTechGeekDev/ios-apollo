@@ -42,7 +42,7 @@ The percentages are rough estimates of how much of each part works on the phone 
 | Smoothness (goal: 60 fps) | `███████░░░` 70% | 🚧 In progress | 25–55 fps (boot 90); limited by background iOS daemons and widgets saturating the CPU and the 75 °C limit |
 | Screen fit | `█████████░` 90% | ✅ Works | Full-panel mode: iOS draws 375×834 points; the GPU scales each frame (filtered) into page-flipped screen buffers, no tearing and no CPU copy (boot 90) |
 | Backlight / brightness | `█████████░` 95% | ✅ Works | Brightness slider and Control Center drive the backlight (boot 86); smooth fade on lock/unlock |
-| Heat / power use | `█████░░░░░` 55% | 🚧 In progress | With every service on, vmd/coreduetd/biomed spin the CPU (boot 91); 0160 holds such processes to a small CPU budget instead of switching them off |
+| Heat / power use | `████████░░` 80% | ✅ Works | Acceptable with every service on (boot 92): 0160 holds runaway background processes to 10% of a core; the CPU clocks follow the load with a 75 °C limit |
 | Microphone | `███░░░░░░░` 30% | ⏸️ Parked | The WCD938x codec comes up and iOS opens it, but the recording is silent |
 | Battery / charging status | `░░░░░░░░░░` 0% | ❌ Not started |  |
 | Sleep / standby | `░░░░░░░░░░` 0% | ❌ Not started | The panel goes dark when locked, but the phone never suspends |
