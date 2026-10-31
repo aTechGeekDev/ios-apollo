@@ -93,6 +93,12 @@ extern io_service_t IOServiceGetMatchingService(mach_port_t mainPort, CFDictiona
 extern CFTypeRef IORegistryEntryCreateCFProperty(io_registry_entry_t entry, CFStringRef key, CFAllocatorRef allocator,
     uint32_t options);
 extern kern_return_t IOObjectRelease(io_object_t object);
+/* (xnu 0159) the display's GPU scaling (scan_*) */
+typedef io_object_t io_connect_t;
+extern kern_return_t IOServiceOpen(io_service_t service, task_port_t owningTask, uint32_t type, io_connect_t *connect);
+extern kern_return_t IOServiceClose(io_connect_t connect);
+extern kern_return_t IOConnectCallStructMethod(io_connect_t connection, uint32_t selector, const void *input, size_t inputSize,
+    void *output, size_t *outputSize);
 
 /* ---- OpenGL ES: the types, the few names used here, the library's functions --------------------- */
 
@@ -142,6 +148,7 @@ typedef GLDEBUGPROC GLDEBUGPROCKHR;
 #define GL_DRAW_FRAMEBUFFER_BINDING     0x8ca6
 #define GL_COLOR_BUFFER_BIT             0x4000
 #define GL_NEAREST                      0x2600
+#define GL_LINEAR                       0x2601
 #define GL_LINES                        0x0001
 #define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE 0x8cd0
 #define GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME 0x8cd1
@@ -1084,6 +1091,255 @@ frame_begin(struct eagl *e)
  * glFlush, glFinish: what was drawn must be where the display takes it from. `finished`: the
  * library has been waited for already.
  */
+/* ---- the final scale on the GPU (xnu 0159) ------------------------------------------------------- */
+
+/*
+ * CoreAnimation's frame is the presented display's size (1125 x 2502 or 2436); the panel is 1080 x 2400. The kernel scaled one
+ * into the other with a processor (SweetFramebuffer.cpp present()); here the GPU does it, as hakios-apollo's apollo_gpu_present
+ * (userland/src/eagl.c scan_frame(), MIT): when a frame of CoreAnimation's has been drawn into the display's picture
+ * (frame_end()), this
+ *   1. asks the display (AppleCLCD, selector 200, xnu 0159) for a free one of the panel's three flip frames, which are
+ *      IOSurfaces whose rows suit the GPU,
+ *   2. draws the picture into it with glBlitFramebuffer(GL_LINEAR), scaled (filtered, unlike the processor's nearest pixel),
+ *      in a context of its own (CoreAnimation's keeps every binding it believes it has),
+ *   3. sends the work to the GPU without waiting for it (a fence asked to flush, as frame_end() does), and
+ *   4. tells the display that this frame holds the picture of that surface: the swap whose only layer is the surface is then
+ *      flipped to it once the GPU is done, and no processor copies anything.
+ * Anything else -- not the display's size, not BGRA, no free frame in 16 ms, a call that fails -- leaves it to the processor's
+ * copy, as before. No kernel of 0159 or later (or sweetscan=0): nothing of this is tried again.
+ */
+#define SCAN_SELECTOR           200             /* SweetFramebuffer.cpp kSweetFBScan */
+#define SCAN_INFO               0
+#define SCAN_ACQUIRE            1
+#define SCAN_QUEUE              2
+#define SCAN_RELEASE            3
+#define SCAN_SOURCES            6               /* surfaces kept as textures */
+#define SCAN_WAIT_MS            16
+
+struct scan_request {                           /* SweetFramebuffer.cpp struct sweet_scan_request */
+	uint32_t op, index, mark, timeout_ms;
+	uint32_t count, width, height, stride;
+	uint32_t display_width, display_height;
+	int32_t band;
+	uint32_t scaled_height;
+	uint32_t ids[3], flags;
+};
+
+static struct {
+	int state;                      /* 0: not tried, 1: ready, -1: not available (and it stays so) */
+	io_connect_t connection;
+	struct sweet_gl *gl;            /* the context these calls are made in */
+	struct scan_request info;
+	GLuint frame_texture[3], frame_buffer[3], reader;
+	struct scan_source {
+		uint32_t id;
+		IOSurfaceRef surface;   /* held while it is here: its ID is not given to another */
+		GLuint texture;         /* 0: it cannot be one (not BGRA, not one plane, not shareable) */
+		GLsizei width, height;
+		uint64_t used;
+	} sources[SCAN_SOURCES];
+	uint64_t frames, refused, seen;
+} scan;
+
+static int
+scan_call(struct scan_request *request)
+{
+	size_t size = sizeof(*request);
+
+	return IOConnectCallStructMethod(scan.connection, SCAN_SELECTOR, request, sizeof(*request), request, &size);
+}
+
+static bool
+scan_setup(void)
+{
+	io_service_t service;
+	struct sweet_gl *previous = current ? current->gl : NULL;
+	bool ok = false;
+
+	scan.state = -1;
+	if ((service = IOServiceGetMatchingService(0, IOServiceMatching("AppleCLCD"))) == 0) {
+		return false;
+	}
+	if (IOServiceOpen(service, mach_task_self(), 0, &scan.connection) != 0) {
+		IOObjectRelease(service);
+		return false;
+	}
+	IOObjectRelease(service);
+	scan.info.op = SCAN_INFO;
+	if (scan_call(&scan.info) != 0 || scan.info.count != 3 || scan.info.width == 0 || scan.info.height == 0) {
+		say("sweet-gl: GPU scaling: the display offers no flip frames (a kernel before 0159, sweetscan=0, or no flips): "
+		    "the processor copies\n");
+		goto fail;
+	}
+	if ((scan.gl = sweet_gl_create(3)) == NULL || !sweet_gl_make_current(scan.gl)) {
+		say("sweet-gl: GPU scaling: no context of our own\n");
+		sweet_gl_make_current(previous);        /* (a failed switch may have left none current) */
+		goto fail;
+	}
+	glGenFramebuffers(1, &scan.reader);
+	ok = true;
+	for (unsigned i = 0; i < 3 && ok; i++) {
+		glGenTextures(1, &scan.frame_texture[i]);
+		glBindTexture(GL_TEXTURE_2D, scan.frame_texture[i]);
+		ok = sweet_gl_surface_texture(scan.gl, scan.info.ids[i]) != 0;
+		glGenFramebuffers(1, &scan.frame_buffer[i]);
+		glBindFramebuffer(GL_FRAMEBUFFER, scan.frame_buffer[i]);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, scan.frame_texture[i], 0);
+		ok = ok && glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+		if (!ok) {
+			say("sweet-gl: GPU scaling: flip frame %u (surface %u) is not a render target for %s (GL error %#x)\n", i,
+			    scan.info.ids[i], sweet_gl_library(), glGetError());
+		}
+	}
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	sweet_gl_make_current(previous);
+	if (ok) {
+		scan.state = 1;
+		say("sweet-gl: GPU scaling: the panel's flip frames (surfaces %u %u %u, %ux%u, rows of %u bytes) are render targets; "
+		    "the display's %ux%u goes to lines %d..%d\n", scan.info.ids[0], scan.info.ids[1], scan.info.ids[2], scan.info.width,
+		    scan.info.height, scan.info.stride, scan.info.display_width, scan.info.display_height, scan.info.band,
+		    scan.info.band + (int32_t)scan.info.scaled_height);
+		return true;
+	}
+fail:
+	/* not available, and it stays so (state -1): nothing of it is kept */
+	if (scan.gl != NULL) {
+		sweet_gl_destroy(scan.gl);      /* (its textures and framebuffers with it) */
+		scan.gl = NULL;
+	}
+	IOServiceClose(scan.connection);
+	scan.connection = 0;
+	return false;
+}
+
+/* The texture of a surface to scale from (with scan.gl current); its texture is 0 if it cannot be one; NULL: no such surface. */
+static struct scan_source *
+scan_source(uint32_t id)
+{
+	struct scan_source *use = NULL;
+	GLint bound = 0;
+
+	for (unsigned i = 0; i < SCAN_SOURCES; i++) {
+		if (scan.sources[i].id == id && scan.sources[i].surface != NULL) {
+			scan.sources[i].used = scan.frames;
+			return &scan.sources[i];
+		}
+		if (use == NULL || scan.sources[i].surface == NULL || (use->surface != NULL && scan.sources[i].used < use->used)) {
+			use = &scan.sources[i];
+		}
+	}
+	if (use->surface != NULL) {
+		if (use->texture != 0) {
+			glDeleteTextures(1, &use->texture);
+		}
+		CFRelease(use->surface);
+	}
+	memset(use, 0, sizeof(*use));
+	if ((use->surface = IOSurfaceLookup(id)) == NULL) {
+		return NULL;
+	}
+	use->id = id;
+	use->used = scan.frames;
+	use->width = (GLsizei)IOSurfaceGetWidth(use->surface);
+	use->height = (GLsizei)IOSurfaceGetHeight(use->surface);
+	if (IOSurfaceGetPixelFormat(use->surface) != 0x42475241 /* 'BGRA' */ || IOSurfaceGetPlaneCount(use->surface) != 0 ||
+	    IOSurfaceGetBytesPerElement(use->surface) != 4) {
+		return use;
+	}
+	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
+	glGenTextures(1, &use->texture);
+	glBindTexture(GL_TEXTURE_2D, use->texture);
+	if (!sweet_gl_surface_texture(scan.gl, id)) {
+		glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+		glDeleteTextures(1, &use->texture);
+		use->texture = 0;
+		return use;
+	}
+	glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+	return use;
+}
+
+/* Scale surface `id` into a free flip frame and tell the display. true: done; false: nothing was done (the processor copies). */
+static bool
+scan_present(uint32_t id)
+{
+	struct scan_request ask;
+	struct scan_source *from;
+	struct sweet_gl *previous = current ? current->gl : NULL;
+	int32_t top = scan.info.band, bottom = scan.info.band + (int32_t)scan.info.scaled_height;
+	GLsync sync;
+
+	if (previous != NULL) {
+		glFlush();                      /* (what CoreAnimation has not sent yet goes to the GPU before ours) */
+	}
+	if (!sweet_gl_make_current(scan.gl)) {
+		sweet_gl_make_current(previous);
+		return false;
+	}
+	if ((from = scan_source(id)) == NULL || from->texture == 0 || (uint32_t)from->width != scan.info.display_width ||
+	    (uint32_t)from->height != scan.info.display_height) {
+		scan.refused++;
+		sweet_gl_make_current(previous);
+		return false;
+	}
+	memset(&ask, 0, sizeof(ask));
+	ask.op = SCAN_ACQUIRE;
+	ask.timeout_ms = SCAN_WAIT_MS;
+	if (scan_call(&ask) != 0 || ask.index > 2) {
+		scan.refused++;
+		sweet_gl_make_current(previous);
+		return false;
+	}
+	glBindFramebuffer(GL_DRAW_FRAMEBUFFER, scan.frame_buffer[ask.index]);
+	if (top > 0 || bottom < (int32_t)scan.info.height) {
+		/* (black lines above and below the picture: the frame is cleared first) */
+		glClearColor(0, 0, 0, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+	}
+	glBindFramebuffer(GL_READ_FRAMEBUFFER, scan.reader);
+	glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, from->texture, 0);
+	glBlitFramebuffer(0, 0, from->width, from->height, 0, top, (GLint)scan.info.width, bottom, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	/* the GPU is not waited for; Mesa may hold the work back after a glFlush, so a fence is asked to send it */
+	sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+	if (sync != NULL) {
+		(void)glClientWaitSync(sync, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+		glDeleteSync(sync);
+	}
+	sweet_gl_make_current(previous);
+	ask.op = SCAN_QUEUE;
+	ask.mark = id;
+	if (scan_call(&ask) != 0) {
+		ask.op = SCAN_RELEASE;
+		scan_call(&ask);
+		scan.refused++;
+		return false;
+	}
+	scan.frames++;
+	return true;
+}
+
+/* From frame_end(): a frame of CoreAnimation's has been drawn into `surface`, a picture the size of the display (or near it). */
+static void
+scan_frame(IOSurfaceRef surface, int width, int height)
+{
+	uint64_t began = now_us();
+
+	if (scan.state < 0 || (scan.state == 0 && !scan_setup())) {
+		return;
+	}
+	if ((uint32_t)width != scan.info.display_width || (uint32_t)height != scan.info.display_height) {
+		return;
+	}
+	bool done = scan_present(IOSurfaceGetID(surface));
+	if (++scan.seen <= 3 || scan.seen % 600 == 0) {
+		say("sweet-gl: GPU scaling: frame %llu (surface %u, %dx%d) %s in %llu us; %llu scaled, %llu left to the processor\n",
+		    scan.seen, IOSurfaceGetID(surface), width, height, done ? "scaled into a flip frame" : "NOT scaled",
+		    now_us() - began, scan.frames, scan.refused);
+	}
+}
+
 static void frame_functions(struct eagl *e);
 static void
 frame_end(struct eagl *e, bool finished)
@@ -1091,10 +1347,21 @@ frame_end(struct eagl *e, bool finished)
 	static unsigned unfollowed;
 	uint64_t before, waited, after;
 	unsigned copied = 0, in_place = 0;
+	/*
+	 * (xnu 0159) the display's picture, if this frame drew into it: noted in the first loop, because target_to_surface()
+	 * clears `drawn` (as hakios-apollo found: every display frame is of the mirror kind, copied into the surface by the GPU)
+	 */
+	IOSurfaceRef scan_surface = NULL;
+	int scan_width = 0, scan_height = 0;
 
 	clear_now(e);
 	before = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
+		if (e->images[i].target && e->images[i].drawn && e->images[i].width >= 1000 && e->images[i].height >= 2000) {
+			scan_surface = e->images[i].surface;
+			scan_width = e->images[i].width;
+			scan_height = e->images[i].height;
+		}
 		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
 			target_to_surface(e, &e->images[i]);    /* (the GPU's copy: before what follows sends it out) */
 			in_place++;
@@ -1125,12 +1392,20 @@ frame_end(struct eagl *e, bool finished)
 	waited = now_us();
 	for (unsigned i = 0; i < e->image_count; i++) {
 		if (e->images[i].target && e->images[i].drawn) {
+			if (e->images[i].width >= 1000 && e->images[i].height >= 2000 && scan_surface == NULL) {
+				scan_surface = e->images[i].surface;
+				scan_width = e->images[i].width;
+				scan_height = e->images[i].height;
+			}
 			copied += !e->images[i].shared;
 			target_to_surface(e, &e->images[i]);
 			if (shown_texture != 0) {
 				show_texture(e, &e->images[i]);
 			}
 		}
+	}
+	if (scan_surface != NULL) {
+		scan_frame(scan_surface, scan_width, scan_height);      /* (xnu 0159) */
 	}
 	if (!e->in_frame) {
 		return;
