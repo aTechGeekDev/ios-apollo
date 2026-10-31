@@ -2,6 +2,12 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 103 (2026-10-31, kernel 41208843768, userland 41213610351): NO HOME SCREEN -- usermanagerd SIGBUS loop from my statfs hook -> userland 41214268895 <<<
+
+**Observed:** `Data/Stack execution not permitted: usermanagerd[pid 12] at virtual address 0x1fdf7c000, protections were read-write`, `CRASH usermanagerd sig 10 ... pc 0x1fdf7c53c` at every relaunch; no frames. Cause: hook_jump made the libsystem_kernel page holding statfs RW (not X) and then called vm_protect, a stub on that same page.
+**Fix:** hook_jump uses a raw `_kernelrpc_mach_vm_protect_trap` (Mach trap -14, inline svc) and makes no library calls while a page is writable; the statfs/fstatfs/getfsstat "apfs" answer is no longer applied in usermanagerd (only fileproviderd, Files, LocalStorageFileProvider).
+**Also (2026-10-31):** `mkadt.py --artwork-subtype N` (commit c9e6c42): /product artwork-device-subtype (MobileGestalt ArtworkDeviceSubType; 2556 = iPhone 14 Pro Dynamic Island) + mgcache-reset.txt for one boot. Untested. Jailbreak (Procursus rootless /var/jb + Sileo): user to choose rebuild-root vs in-place installer.
+
 ### >>> BOOT 102 (2026-10-31, kernel 41208843768, userland 41211919226): FILES' REAL BLOCKER = HFS+ ROOT -> userland 41213610351 reports it as apfs <<<
 
 **Observed (fileproviderd debug log, os_log_type_enabled hooked):** `[DEBUG] ┏ Loading home libraries`, `[INFO] Non-eligible device /dev/ufsroot0 [16777216]: non-apfs`, `[DEBUG] Volume /dev/ufsroot0 not eligible to store FP library, skipping` -> no FP library, no domains, Files empty. (PK discovery 8 providers, LS database mapped fine.)
