@@ -4,11 +4,13 @@
 <dict>
 	<key>com.apple.ReportCrash</key>
 	<true/>
-	<key>com.apple.accessoryupdater</key>
+	<key>com.apple.accessoryupdaterd</key>
 	<true/>
 	<key>com.apple.coreduetd</key>
 	<true/>
 	<key>com.apple.fairplayd.H2</key>
+	<true/>
+	<key>com.apple.geod</key>
 	<true/>
 	<key>com.apple.voicemail.vmd</key>
 	<true/>

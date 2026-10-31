@@ -24,7 +24,7 @@ Apple's open-source XNU kernel (xnu-8796), patched for this phone, boots the **u
 
 ## Progress
 
-**Overall: `██████░░░░` 65%** (updated 2026-10-30)
+**Overall: `██████░░░░` 67%** (updated 2026-10-30)
 
 The percentages are rough estimates of how much of each part works on the phone today.
 
@@ -39,10 +39,10 @@ The percentages are rough estimates of how much of each part works on the phone 
 | Vibration | `███████░░░` 75% | ✅ Works | AW8697 motor: taps and ringtone patterns; duty-cycle limits protect the motor |
 | GPU drawing | `███████░░░` 75% | ✅ Works | Adreno 650 runs Mesa (OpenGL ES 3.2, freedreno); iOS's CoreAnimation draws the whole UI on it through a bridge, blur and materials included |
 | CPU | `████████░░` 85% | ✅ Works | All 8 cores (or a chosen set with `cpumask`); clocks follow the load with a 75 °C limit on the big cores (xnu 0153, boot 86) |
-| Smoothness (goal: 60 fps) | `██████░░░░` 65% | 🚧 In progress | 19–54 fps measured (boot 86); the copy to the panel takes ~4 ms on its own thread; backboardd's GL work and a busy CPU are the main costs |
-| Screen fit | `████████░░` 80% | 🧪 Testing | Full-panel mode: iOS draws 375×834 points, scaled by 0.96 onto the whole panel (boot 86); smoother, blended scaling for text and corners (xnu 0155) built, not yet booted |
+| Smoothness (goal: 60 fps) | `███████░░░` 70% | 🚧 In progress | 25–55 fps (boot 90); limited by background iOS daemons and widgets saturating the CPU and the 75 °C limit |
+| Screen fit | `█████████░` 90% | ✅ Works | Full-panel mode: iOS draws 375×834 points; the GPU scales each frame (filtered) into page-flipped screen buffers, no tearing and no CPU copy (boot 90) |
 | Backlight / brightness | `█████████░` 95% | ✅ Works | Brightness slider and Control Center drive the backlight (boot 86); smooth fade on lock/unlock |
-| Heat / power use | `████░░░░░░` 40% | 🚧 In progress | Boot 86: cores stay 40–70% busy even with the screen off, so they never cool down; xnu 0155 adds a per-thread CPU report to find the cause and stops touch polling while dark |
+| Heat / power use | `█████░░░░░` 55% | 🚧 In progress | Idle CPU near zero (boot 88); busy daemons switched off with `quiet-on.txt` / `quiet-max.txt`; widgets and trustd still heavy while in use |
 | Microphone | `███░░░░░░░` 30% | ⏸️ Parked | The WCD938x codec comes up and iOS opens it, but the recording is silent |
 | Battery / charging status | `░░░░░░░░░░` 0% | ❌ Not started |  |
 | Sleep / standby | `░░░░░░░░░░` 0% | ❌ Not started | The panel goes dark when locked, but the phone never suspends |
@@ -56,11 +56,12 @@ The detailed engineering log, with every boot's results, is [`NOTES.md`](NOTES.m
 
 ## Being worked on now
 
-| Patch | What it does | State |
+| Item | What it does | State |
 | --- | --- | --- |
-| **0159** + bridge | The GPU scales each frame (smooth filtering) straight into the flip buffers; no CPU copy | Built, not booted |
-| **0158** | Memory bus kept at its top (suspect for a sudden reset in boot 88); one more busy daemon off | Built, being tested |
-| Next | Whatever boots 89–90 show: resets, frame rate, GPU clock scaling, the microphone | Planned |
+| `quiet-on.txt` / `quiet-max.txt` | Switch off background daemons that spin with no cellular or accessories (correct launchd labels now); `quiet-max` also widgets | Ready, not booted |
+| **0159** + bridge | The GPU scales each frame straight into the page-flipped screen buffers | ✅ Works (boot 90) |
+| Sudden resets | Seen in boots 88 and 89 (not 90); cause not found yet | Watching |
+| Next | trustd if it keeps spinning; big-core scheduling; GPU clock scaling; the microphone | Planned |
 
 ---
 
@@ -257,7 +258,7 @@ None of these files are in git. Each tool runs with the phone in the temporary r
 | `wifi/` | The Linux compatibility layer the Wi-Fi driver (ath11k) is built on |
 | `userland/` | Programs for the phone: Mesa, the CoreAnimation bridge, the audio plug-in, the Bluetooth library, GPU tests ([details](userland/README.md)) |
 | `tools/` | Device tree builder, boot packer, iOS root builder, firmware pullers, log and crash tools |
-| `tools/root-files/` | One-boot file lists that add, move or remove files on the iOS root (e.g. `quiet-on.txt`: switches off daemons that waste CPU) |
+| `tools/root-files/` | One-boot file lists that add, move or remove files on the iOS root (e.g. `quiet-on.txt` / `quiet-max.txt`: switch off daemons that waste CPU) |
 | `.github/workflows/` | CI: the kernel, the iOS programs, and an analysis job for iOS's system libraries (nothing from Apple is stored) |
 | `NOTES.md` | The engineering log: every boot's result, current state, next steps |
 

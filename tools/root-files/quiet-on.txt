@@ -1,10 +1,13 @@
 # Daemons that kept cores busy around the clock (boot 87's SWEET TOP lines, xnu 0155), switched off through launchd's
-# own override list as bt-on.txt does for fairplayd.H2 (Bluetooth stays on: only these are disabled):
+# own override list as bt-on.txt does for fairplayd.H2 (Bluetooth stays on: only these are disabled; quiet-max.txt also widgets and asset downloads):
 #   com.apple.coreduetd       34-78% of a core all the time, the display on or off (Core Duet: app predictions)
 #   com.apple.voicemail.vmd   24-67% (voicemail; no cellular here; ios-sailfish and tools/launchd-edit.py drop it too)
 #   com.apple.ReportCrash     writes a report for every crash (several a minute in boot 87); the kernel logs crashes itself
 #   com.apple.fairplayd.H2    as before (no FairPlay hardware)
-#   com.apple.accessoryupdater (boot 88: two threads 14-22% each while in use; accessory firmware updates; the label is
-#                             the process's name, not checked against this root: a key that matches no job does nothing)
+#   com.apple.accessoryupdaterd  boot 88-90: two to four threads 9-22% each, all the time (accessory firmware updates); boot 90
+#                             showed the earlier key com.apple.accessoryupdater matched no job: the label is from this
+#                             root's /System/Library/xpc/launchd.plist (ios-re run 41184943698), as are the others here
+#   com.apple.geod            boot 90: 4 threads 16-37% while widgets were shown (GeoServices: map tiles, place names; no Maps
+#                             without it)
 # A disabled job's services are not registered: a request to it fails at once instead of waiting. Undo: bt-on.txt.
 /private/var/db/com.apple.xpc.launchd/disabled.plist=tools/root-files/launchd-disabled-quiet.plist 0:0:0644

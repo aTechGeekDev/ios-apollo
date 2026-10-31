@@ -1,0 +1,5 @@
+# quiet-on.txt and two more, for the least heat: com.apple.chronod (the widgets' host: boot 90, widget extensions took
+# 40-83% of a core each while widgets were on screen -- with it off the widgets stay empty) and com.apple.mobileassetd
+# (downloads of voices, fonts and other assets: 9-66% in boots 89/90). Labels from this root's launchd.plist.
+# Use instead of quiet-on.txt (the same file is written); undo: quiet-on.txt (or bt-on.txt for none of these).
+/private/var/db/com.apple.xpc.launchd/disabled.plist=tools/root-files/launchd-disabled-quiet-max.plist 0:0:0644
