@@ -73,8 +73,9 @@ FIX_SETTER(3)
 static const IMP fix_new[FIXES] = { (IMP)fix_setter_0, (IMP)fix_setter_1, (IMP)fix_setter_2, (IMP)fix_setter_3 };
 
 /* ---- the os_log mirror ---- */
-#define MIRROR_MAX 800u
+#define MIRROR_MAX 3000u
 static int mirror_on;
+static int mirror_all;          /* every level, not only errors and keyword lines (fileproviderd) */
 static unsigned mirror_lines;
 
 /* the format with os_log's encoded arguments after it (scalars as |N, C strings as |text) */
@@ -141,7 +142,17 @@ mirror_wanted(uint8_t type, const char *line)
 		"ail", "rror", "enied", "nvalid", "not ", "nable", "can't", "cannot", "missing", "ejected", NULL
 	};
 
-	if (type == 0 || type >= 0x10) {        /* OS_LOG_TYPE_DEFAULT, _ERROR, _FAULT */
+	static const char *const noise[] = {
+		"oucher", "AllKeys", "Cache key", "container lookup", "Query;", "container_", "APS", "apsd",
+		"Topics", "MessageSize", "xpc_activity", "XPC_ACTIVITY", "PASLazyPlist", "TRIClient", NULL
+	};
+
+	for (int i = 0; noise[i] != NULL; i++) {
+		if (strstr(line, noise[i]) != NULL) {
+			return 0;
+		}
+	}
+	if (mirror_all || type == 0 || type >= 0x10) {   /* OS_LOG_TYPE_DEFAULT, _ERROR, _FAULT */
 		return 1;
 	}
 	for (int i = 0; words[i] != NULL; i++) {
@@ -257,6 +268,7 @@ sweet_fix_init(void)
 		for (int i = 0; me != NULL && mirrored[i] != NULL; i++) {
 			if (strcmp(me, mirrored[i]) == 0) {
 				mirror_on = 1;
+				mirror_all = strcmp(me, "fileproviderd") == 0;
 			}
 		}
 		if (mirror_on) {
