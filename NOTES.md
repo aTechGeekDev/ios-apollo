@@ -2,6 +2,8 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 93 (2026-10-31, kernel 41192358448 = 0161): MICROPHONE WORKS ("the audio recorder ... the mic is 100% working"); Files still has no "On My iPhone", screenshots still crash (no log yet) <<<
+
 ### >>> xnu 0161 (2026-10-31, commit 134ab6b; user: "fix the storage now i cant save screenshots and the files app doesnt show anything"): NOT YET BOOTED <<<
 
 **Found (ios-re runs 41190559179, 41191423514, 41191588178):** the crash loops' func_1aaf39c64 is in **PlugInKit**: it calls `sandbox_container_path_for_pid(getpid(), buf, 0x400)` and raises NSInternalInconsistencyException when that fails or the path is empty. Our "Sandbox" MAC policy (0050, bsd/kern/sweet_amfi.c) answered op 4 with ENOENT, so every app extension dies at start: SiriTTS/MacinTalk/Kona synthesizers, AegirPoster, and (guess, to be confirmed) the Files app's file providers and the screenshot/photo extensions.
