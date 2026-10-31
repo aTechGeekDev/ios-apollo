@@ -1,0 +1,152 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -24,11 +24,14 @@
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <kern/debug.h>
++#include <kern/kalloc.h>
+ #include <kern/startup.h>
+ #include <libkern/amfi/amfi.h>
+ #include <mach/kern_return.h>
+ #include <sys/codesign.h>
++#include <sys/errno.h>
+ #include <sys/mount.h>
++#include <sys/param.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
+ #include <sys/systm.h>
+@@ -283,11 +286,121 @@
+  * (checks allow, profile init is accepted); the few that must return
+  * data (container paths, extension tokens) fail with ENOENT. The first
+  * use of each operation number is logged.
++ *
++ * (xnu 0161) Except where iOS cannot do without them. Every app extension
++ * (an executable inside a .appex) asks for its container path when
++ * PlugInKit starts it and throws NSInternalInconsistencyException without
++ * one: the speech synthesizers, the wallpaper posters, the Files app's
++ * file providers, the screenshot and photo extensions died in a loop
++ * (boot 87: objc_exception_throw <- PlugInKit func_1aaf39c64, after
++ * sandbox_container_path_for_pid). Extensions now get their user's home
++ * (/private/var/mobile, root's /private/var/root); everything else still
++ * gets ENOENT, as before. Extension tokens (op 5 issue, op 6 consume) are
++ * handed out and accepted: there is no sandbox for them to open, but the
++ * file-sharing paths (Files, Photos, share sheets) stop at a NULL token.
++ * Argument layouts from 20H392's libsystem_sandbox (ios-re 41191423514,
++ * 41191588178).
+  */
+ static uint64_t sweet_sandbox_seen;
++static uint32_t sweet_sandbox_handles;
++
++struct sweet_sandbox_container_args {   /* op 4 */
++	uint64_t pid;
++	uint64_t pidversion;
++	uint64_t buf;           /* user char[size] */
++	uint64_t size;
++	uint64_t by_token;
++};
++
++static bool
++sweet_sandbox_in_appex(const char *path)
++{
++	for (; *path != '\0'; path++) {
++		if (strncmp(path, ".appex/", 7) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* op 4: an extension's container path (its user's home); ENOENT for anything else */
++static int
++sweet_sandbox_container_path(user_addr_t arg)
++{
++	struct sweet_sandbox_container_args a;
++	char *path;
++	int len = MAXPATHLEN, error;
++	proc_t target;
++	vnode_t vp;
++	uint32_t uid;
++
++	error = copyin(arg, &a, sizeof(a));
++	if (error != 0) {
++		return error;
++	}
++	target = proc_find((int)a.pid);
++	if (target == PROC_NULL) {
++		return ESRCH;
++	}
++	uid = proc_getuid(target);
++	vp = proc_getexecutablevnode(target);
++	proc_rele(target);
++	if (vp == NULLVP) {
++		return ENOENT;
++	}
++	path = kalloc_data(MAXPATHLEN, Z_WAITOK | Z_ZERO);
++	if (path == NULL) {
++		vnode_put(vp);
++		return ENOMEM;
++	}
++	error = vn_getpath(vp, path, &len);
++	vnode_put(vp);
++	if (error == 0 && sweet_sandbox_in_appex(path)) {
++		const char *home = uid == 0 ? "/private/var/root" : "/private/var/mobile";
++		size_t need = strlen(home) + 1;
++
++		error = a.size < need ? ERANGE : copyout(home, (user_addr_t)a.buf, need);
++	} else {
++		error = ENOENT;
++	}
++	kfree_data(path, MAXPATHLEN);
++	return error;
++}
++
++/* op 5: an extension token (args: the token's buffer, 0x800 bytes from malloc, at offset 0x20) */
++static int
++sweet_sandbox_extension_issue(user_addr_t arg)
++{
++	static const char token[] = "0000000000000000000000000000000000000000000000000000000000000000;00;00000000;0000000000000000;0000000000000000;000000000000000;sweet;01;00000000;0000000000000000;/";
++	uint64_t a[6];
++	int error = copyin(arg, a, sizeof(a));
++
++	if (error != 0) {
++		return error;
++	}
++	if (a[4] == 0) {
++		return EINVAL;
++	}
++	return copyout(token, (user_addr_t)a[4], sizeof(token));
++}
++
++/* op 6: consume a token (args: token, its length, int64 *handle) */
++static int
++sweet_sandbox_extension_consume(user_addr_t arg)
++{
++	uint64_t a[3];
++	int64_t handle;
++	int error = copyin(arg, a, sizeof(a));
++
++	if (error != 0) {
++		return error;
++	}
++	handle = (int64_t)(++sweet_sandbox_handles & 0x3fffffff) + 1;   /* any number; nothing looks it up */
++	return a[2] != 0 ? copyout(&handle, (user_addr_t)a[2], sizeof(handle)) : 0;
++}
+ 
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+@@ -297,8 +410,11 @@
+ 	}
+ 	switch (call) {
+ 	case 4:         /* container path (audit token / pid) */
++		return sweet_sandbox_container_path(arg);
+ 	case 5:         /* extension issue */
++		return sweet_sandbox_extension_issue(arg);
+ 	case 6:         /* extension consume */
++		return sweet_sandbox_extension_consume(arg);
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:
