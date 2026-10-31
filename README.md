@@ -175,6 +175,7 @@ Boot options (boot-args) go in `--cmdline`. The most useful ones are below. Each
 | `cpus=N` | Start N cores (`cpus=1` is the safe fallback) |
 | `cpumask=M` | Start the cores in mask M instead (bit n = core n: 0–3 small, 4–6 big, 7 prime). `0xf1` = core 0 + the four big cores. Not together with `cpus=` |
 | `ufslogsecs=1` | Write the log to storage every second (for hangs) |
+| `sweetsetupdone=0` | Don't tell iOS that Setup Assistant has finished (0165; without it, fileproviderd and others wait for a setup that never runs) |
 | `sweetnull=A,B,…` | Copy what these programs print into the kernel log |
 | `sweettouch=0`, `sweetkeys=0` | Turn off touch or the buttons |
 

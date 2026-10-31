@@ -2,6 +2,11 @@
 
 ## Agent handoff / active work
 
+### >>> xnu 0165 (2026-10-31, kernel run 41206906921; user: "make kernel say setup is finished for everything"): NOT YET BOOTED <<<
+
+**Found (ios-re, SetupAssistant 0x1a3af1270):** BYSetupAssistantNeedsToRun = NO if buddyPreferencesInternal ForceNoBuddy; NO on an unsupported device class; else `w19 = LaunchSentinelExists() ^ 1` (the MGGetBoolAnswer after it only decides whether a cached date is logged). LaunchSentinelExists (0x1a3afd9dc) = `sem_open("purplebuddy.sentinel", 0) != SEM_FAILED`. Setup creates that POSIX semaphore each boot; ours is skipped, so nothing did.
+**0165:** bsd/kern/posix_sem.c sem_open: that name opened without O_CREAT is created (value 0, mode 0644). Boot-arg sweetsetupdone=0 = old behaviour. Every program now sees setup finished; libsweet-fix's BYSetupAssistantNeedsToRun hook stays as a second line for the Files programs.
+
 ### >>> BOOT 97 (2026-10-31, kernel 41202590414, userland 41203618358): FILES ROOT CAUSE FOUND -> userland 41206163336 <<<
 
 **Observed (fixlog, hooks worked: "os_log_impl hooked"):** fileproviderd: `[INFO] Not instantiating file providers until setup has been run.` + `[ERROR] denying connection because the device is not set up` (x4); later "file provider server setup", PlugInKit discovery found 8 providers, container lookups for group.com.apple.FileProvider.LocalStorage succeed, but no provider is instantiated. Files: `Could not set domain cache for domain %@ because storageURLs is empty`, `could not find a valid source`.
