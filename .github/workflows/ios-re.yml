@@ -21,7 +21,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Tools
-        run: brew tap blacktop/tap && brew trust blacktop/tap && brew install --formula blacktop/tap/ipsw && ipsw version
+        # ipsw's own release build (the blacktop tap's cask broke brew, 2026-10-31)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eux
+          URL=$(curl -sfL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/blacktop/ipsw/releases/latest |
+            jq -r '.assets[].browser_download_url' | grep -iE 'macOS_arm64\.tar\.gz$' | head -1)
+          mkdir -p ~/ipsw-bin && curl -sfL "$URL" | tar -xz -C ~/ipsw-bin
+          IPSW=$(find ~/ipsw-bin -type f -name ipsw | head -1)
+          sudo install -m 0755 "$IPSW" /usr/local/bin/ipsw
+          ipsw version
       - uses: actions/cache@v4
         id: dsc
         with:
