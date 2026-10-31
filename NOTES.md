@@ -2,6 +2,11 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 107 (2026-10-31, kernel 41216279299, userland 41217755048): /var/jb/.sweet-jb-done already exists, no Sileo icon -> userland 41218791846 <<<
+
+**Observed:** `sweet-fix: usermanagerd[12]/[87], configd[36] uid 0: jailbreak: done 1, archive 1, installer 1` (so 0168 does insert libsweet-fix into configd). An installer run finished in an earlier boot (106 most likely) without its console lines reaching the log; Sileo is not on the home screen.
+**Change:** the installer counts as done only when /var/jb/Applications/Sileo.app exists (else it removes the marker and redoes step 3, then uicache); prep uses /var/jb/usr/bin/sh if /var/jb/bin/sh is missing; libsweet-fix prints `/var/jb: dpkg, Sileo.app, unpacked, prepped` and (configd) the last 6 KiB of /private/var/sweet-jb/install.log to the kernel log every boot.
+
 ### >>> BOOT 106 (2026-10-31, kernel 41216279299 = 0168, userland 41216279313 + jb-install.txt): no installer at all -> userland 41217755048 <<<
 
 **Observed:** the three files written (SWEET FILES), `exec configd`, but no `sweet-jb:` line and nothing from libsweet-fix in configd (its stderr reaches no log); usermanagerd's libsweet-fix loaded as before (no longer a trigger). Unknown: whether 0168 inserted the library into configd and what posix_spawn returned.
