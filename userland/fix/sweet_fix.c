@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -340,17 +341,34 @@ fix_start_jb_installer(void)
 	posix_spawnattr_t attr;
 	struct stat st;
 	pid_t pid;
-	int err;
+	int err, con;
+	char line[200];
 
+	/* configd's and usermanagerd's stderr reach no log (boot 106): these lines go to the console */
+	con = open("/dev/console", O_WRONLY | O_NOCTTY | O_NONBLOCK);
+	snprintf(line, sizeof(line), "sweet-fix: %s[%d] uid %d: jailbreak: done %d, archive %d, installer %d\n", getprogname(),
+	    getpid(), getuid(), stat("/var/jb/.sweet-jb-done", &st) == 0, stat("/private/var/sweet-jb/bootstrap.tar.xz", &st) == 0,
+	    stat(argv[0], &st) == 0);
+	if (con >= 0) {
+		(void)write(con, line, strlen(line));
+	}
 	if (stat("/var/jb/.sweet-jb-done", &st) == 0 || stat("/private/var/sweet-jb/bootstrap.tar.xz", &st) != 0 ||
 	    stat(argv[0], &st) != 0) {
+		if (con >= 0) {
+			close(con);
+		}
 		return;
 	}
 	posix_spawnattr_init(&attr);
 	posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
 	err = posix_spawn(&pid, argv[0], NULL, &attr, argv, env);
 	posix_spawnattr_destroy(&attr);
-	fprintf(stderr, "fixlog: jailbreak installer %s (pid %d, error %d)\n", err == 0 ? "started" : "NOT started", err == 0 ? pid : -1, err);
+	snprintf(line, sizeof(line), "sweet-fix: %s: jailbreak installer %s (pid %d, error %d)\n", getprogname(),
+	    err == 0 ? "started" : "NOT started", err == 0 ? pid : -1, err);
+	if (con >= 0) {
+		(void)write(con, line, strlen(line));
+		close(con);
+	}
 }
 
 __attribute__((constructor))
@@ -376,8 +394,8 @@ sweet_fix_init(void)
 		static const char *const mirrored[] = { "fileproviderd", "Files", "LocalStorageFileProvider", "usermanagerd", NULL };
 		const char *me = getprogname();
 
-		if (me != NULL && strcmp(me, "configd") == 0) {
-			fix_start_jb_installer();
+		if (me != NULL && (strcmp(me, "configd") == 0 || strcmp(me, "usermanagerd") == 0)) {
+			fix_start_jb_installer();       /* configd first; usermanagerd as a second chance (the installer locks) */
 		}
 		for (int i = 0; me != NULL && mirrored[i] != NULL; i++) {
 			if (strcmp(me, mirrored[i]) == 0) {

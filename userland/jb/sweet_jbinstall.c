@@ -17,6 +17,7 @@
 #include <compression.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -409,6 +410,8 @@ main(void)
 {
 	struct stat st;
 
+	signal(SIGHUP, SIG_IGN);        /* the job that started us may end; we stay (SIGKILL aside) */
+	signal(SIGTERM, SIG_IGN);
 	console = open("/dev/console", O_WRONLY | O_NOCTTY | O_NONBLOCK);
 	(void)mkdir(DIR_IN, 0755);
 	logfile = fopen(LOG_FILE, "a");
