@@ -2,6 +2,12 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 87: the crash loops and the shutdown (2026-10-31, user's CRASH grep) <<<
+
+**Observed:** sig 6 (exit reason ns 2 code 6) in a loop: SiriTTSSynthesizer, MacinTalkAUSP, KonaSynthesizer (speech synthesizer extensions) and AegirPoster (wallpaper poster extension), every one at pc 0x210ad3198 (slide 0x4e4bc000), far 0x22d32ee28 = libc++abi's __crash_info. Symbolicated on the runner (ios-re run 41180754700, `ipsw dyld a2s`, unslid = address - slide): __pthread_kill / pthread_kill / abort <- demangling_terminate_handler <- _objc_terminate <- std::__terminate <- __cxa_rethrow-area <- **objc_exception_throw <- __CFDictionaryCreateGeneric <- func_1aaf39c64+248 (image not named yet)** <- (synthesizers) / std::terminate <- _dispatch_client_callout <- _dispatch_block_invoke_direct <- __FBSSERIALQUEUE_IS_CALLING_OUT_TO_A_BLOCK__ <- -[FBSSerialQueue _targetQueue_performNextIfPossible] (posters). = an uncaught ObjC exception building a dictionary (typically "attempt to insert nil object": a value these extensions expect is nil here). Which value: next, the image and code around 0x1aaf39c64.
+**The end of boot 87:** `com.apple.xpc.launchd ... Will be calling reboot(2) with flags: 0x8` (RB_HALT): iOS shut itself down (or the user powered off: asked), then launchd spun at 100% because our kernel does not power the phone off.
+**ios-re.yml:** ipsw now from its GitHub release (the blacktop tap's cask broke `brew`, 2026-10-31); asset pattern `/ipsw_<ver>_macOS_arm64.tar.gz` (not ipswd).
+
 ### >>> BOOT 87's log (2026-10-31): SWEET TOP names the CPU burners -> xnu 0157 + tools/root-files/quiet-on.txt <<<
 
 **Observed (`SWEET TOP`, every 10 s, % of one core):**
