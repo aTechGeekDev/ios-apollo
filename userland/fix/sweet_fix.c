@@ -202,13 +202,34 @@ mirror_entry(void *dso, void *log, uint8_t type, const char *format, uint8_t *bu
 	mirror(type, format, buf, size);
 }
 
+/*
+ * mach_vm_protect as a raw Mach trap (_kernelrpc_mach_vm_protect_trap, -14) from this library's own code:
+ * hooking a system call stub (statfs, boot 103) makes a page of libsystem_kernel writable and so not executable,
+ * and libsystem_kernel's own vm_protect sits on that page -- calling it to restore the page jumped into it
+ * (usermanagerd: "Data/Stack execution not permitted", SIGBUS, no home screen).
+ */
+static kern_return_t
+raw_vm_protect(mach_port_t task, uintptr_t address, uintptr_t size, int set_max, int prot)
+{
+	register long x0 __asm__("x0") = (long)task;
+	register long x1 __asm__("x1") = (long)address;
+	register long x2 __asm__("x2") = (long)size;
+	register long x3 __asm__("x3") = set_max;
+	register long x4 __asm__("x4") = prot;
+	register long x16 __asm__("x16") = -14;
+
+	__asm__ volatile ("svc #0x80" : "+r"(x0) : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x16) : "memory", "cc");
+	return (kern_return_t)x0;
+}
+
 static int
 hook_jump(const char *name, void *to)
 {
 	uint32_t *at = (uint32_t *)dlsym(RTLD_DEFAULT, name);
 	uint32_t words[4];
-	uintptr_t ps = (uintptr_t)getpagesize(), page;
+	uintptr_t ps = (uintptr_t)getpagesize(), page, span;
 	uint64_t target = (uint64_t)(uintptr_t)to;
+	mach_port_t self = mach_task_self();
 
 	if (at == NULL) {
 		return 0;
@@ -218,14 +239,15 @@ hook_jump(const char *name, void *to)
 	words[2] = (uint32_t)target;
 	words[3] = (uint32_t)(target >> 32);
 	page = (uintptr_t)at & ~(ps - 1);
-	if (vm_protect(mach_task_self(), (vm_address_t)page, (vm_size_t)(((uintptr_t)(at + 4) - page + ps - 1) & ~(ps - 1)), FALSE,
-	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
-		fprintf(stderr, "fixlog: %s: cannot make it writable\n", name);
+	span = ((uintptr_t)(at + 4) - page + ps - 1) & ~(ps - 1);
+	/* from here until the page is executable again: no calls into other libraries (they may be on this page) */
+	if (raw_vm_protect(self, page, span, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) {
 		return 0;
 	}
-	memcpy(at, words, sizeof(words));
-	(void)vm_protect(mach_task_self(), (vm_address_t)page, (vm_size_t)(((uintptr_t)(at + 4) - page + ps - 1) & ~(ps - 1)), FALSE,
-	    VM_PROT_READ | VM_PROT_EXECUTE);
+	for (int i = 0; i < 4; i++) {
+		((volatile uint32_t *)at)[i] = words[i];
+	}
+	(void)raw_vm_protect(self, page, span, 0, VM_PROT_READ | VM_PROT_EXECUTE);
 	sys_icache_invalidate(at, sizeof(words));
 	return 1;
 }
@@ -331,7 +353,7 @@ sweet_fix_init(void)
 				mirror_all = strcmp(me, "fileproviderd") == 0;
 			}
 		}
-		if (mirror_on) {
+		if (mirror_on && strcmp(me, "usermanagerd") != 0) {
 			int a = hook_jump("statfs", (void *)fix_statfs);
 			int b = hook_jump("fstatfs", (void *)fix_fstatfs);
 			int c = hook_jump("getfsstat", (void *)fix_getfsstat);
