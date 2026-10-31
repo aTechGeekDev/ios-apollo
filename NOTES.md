@@ -2,6 +2,13 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 108 (2026-10-31, kernel 41216279299, userland 41218791846 + jb-install.txt): /var/jb INSTALLED, SILEO NOT REGISTERED -> sileo-system.txt (466b451) <<<
+
+**Observed (install.log via libsweet-fix):** `/var/jb/usr/bin/dpkg: exit 0` for Sileo's .deb; `uicache -p /var/jb/Applications/Sileo.app` exits 0 but prints `Error: Unable to register` for Sileo and for every /Applications app; state `dpkg 1, Sileo.app 1, unpacked 1, prepped 1`. No Sileo icon.
+**Guess:** lsd refuses Procursus uicache's registration requests (entitlement/container checks under our AMFI); not verified.
+**Change:** `tools/root-files/sileo-system.txt` (one boot, without jb-install.txt): kernel move `/private/var/jb/Applications/Sileo.app -> /Applications/Sileo.app` (single HFS+ volume: rename), removes `/private/var/sweet-jb/bootstrap.tar.xz` (so libsweet-fix stops starting the installer, which would reinstall Sileo into /var/jb), plus the ls-rebuild.txt lines (lsd reseeds and registers /Applications bundles itself). mkadt.py allows `/Applications/`. No symlink back (the kernel cannot make one): dpkg's file list for Sileo points at /var/jb; a Sileo upgrade via dpkg would put a second copy there.
+**Risk:** a reseed re-registers every app and extension (boot 48 saw a reseed deadlock with the ExtensionKit flag; later reseeds worked). If the phone sticks at the logo, boot again without the list.
+
 ### >>> BOOT 107 (2026-10-31, kernel 41216279299, userland 41217755048): /var/jb/.sweet-jb-done already exists, no Sileo icon -> userland 41218791846 <<<
 
 **Observed:** `sweet-fix: usermanagerd[12]/[87], configd[36] uid 0: jailbreak: done 1, archive 1, installer 1` (so 0168 does insert libsweet-fix into configd). An installer run finished in an earlier boot (106 most likely) without its console lines reaching the log; Sileo is not on the home screen.
