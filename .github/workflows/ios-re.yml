@@ -27,7 +27,7 @@ jobs:
         run: |
           set -eux
           URL=$(curl -sfL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/blacktop/ipsw/releases/latest |
-            jq -r '.assets[].browser_download_url' | grep -iE 'macOS_arm64\.tar\.gz$' | head -1)
+            jq -r '.assets[].browser_download_url' | grep -E '/ipsw_[0-9.]+_macOS_arm64\.tar\.gz$' | head -1)
           mkdir -p ~/ipsw-bin && curl -sfL "$URL" | tar -xz -C ~/ipsw-bin
           IPSW=$(find ~/ipsw-bin -type f -name ipsw | head -1)
           sudo install -m 0755 "$IPSW" /usr/local/bin/ipsw
