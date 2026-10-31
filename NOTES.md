@@ -2,6 +2,12 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 99 + CI MOVED TO macos-15 (2026-10-31; kernel 41208843768 = 0166+0167 built with Xcode 16.0, userland 41208843715): Files blocked on usermanagerd's persona list; NOT YET BOOTED <<<
+
+**Boot 99 (kernel 41206906921 = 0165, userland 41207174715) observed:** fileproviderd finds all 8 providers incl. com.apple.FileProvider.LocalStorage ("will be managed by runningboard"), then `Persona List failed with error Error Domain=NSPOSIXErrorDomain Code=2 "No such file or directory"` (UserManagement -> usermanagerd), `{unregistering: ( ), registering: ( )}`: no domain registered. Files: `could not find a valid source for com.apple.DocumentsApp (sourcesByID: { })`, `storageURLs is empty` for Local Storage / iCloud Drive / PhotosFileProvider. AegirPoster still loops: `SWEET FILES: /System/Library/ExtensionKit/Extensions: 0 matches listed`, move "not there" -> the poster lives elsewhere (to find).
+**usermanagerd (ios-re 41208352807, strings):** loads a binary "persona manifest" from disk ("Failed to read persona manifest file from disk", versioned, generation id, persona/user lists); its path is not a plain string. 0166 + libsweet-fix mirror usermanagerd's os_log to find which file and why.
+**CI:** GitHub's macOS 14 images are browned out 2026-10-31/11-01 14:00-00:00 UTC (jobs cancelled before starting: ios-re/xnu/userland runs 41208216111, 41208553922, 41208554061) and retired 2026-11-02; macos-15 has Xcode 16.0-26.3 only. All macOS workflows now run on macos-15; the kernel uses the oldest Xcode (16.0); xnu 0167 backports IORPC.kernelContent (xnu-11215) for Xcode 16's iig. First Xcode-16 kernel: 41208843768 (green). Watch for regressions from the newer compiler.
+
 ### >>> BOOT 98 (2026-10-31, kernel 41202590414, userland 41206163336): setup gate passed in fileproviderd/Files; still no LocalStorage provider -> userland 41207174715 prints %@ objects <<<
 
 **Observed:** `BYSetupAssistantNeedsToRun -> NO: hooked` in both; no more "not set up". fileproviderd: "file provider server setup", PlugInKit discovery 8 matches, container lookups for every provider group succeed, `[NOTICE] %@ -> {unregistering: %@, registering: %@}`, `Registered: %@, result: 0`, later `no registered bundle with URL %@` (x2); no LocalStorageFileProvider exec. Files: still "could not find a valid source", "storageURLs is empty". The %@ arguments were not decoded.
