@@ -2,6 +2,12 @@
 
 ## Agent handoff / active work
 
+### >>> xnu 0163 (2026-10-31, kernel run 41194804367): GPU hang recovery; NOT YET BOOTED <<<
+
+**Boot 94's log (`4582592e-apollo-boot94.txt`, 53297 lines, ring wrapped):** 1149 `MESA: error: flush_submit_list:135: submit failed: -60` each followed by a full msm_dump_submit (the flood pushed the start of the hang out of the 4 MB ring, so the `SWEET GPU: kept: ...` report line is lost), then `SweetGPU: no handles left for a buffer of 32768 bytes` and `CRASH backboardd[57] sig 11 ... far 0x1c` (pc 0x1058a8568, in a non-cache image: Mesa or libsweet-gl); backboardd restarted. -60 = ETIMEDOUT = kIOReturnTimeout from SweetGPU::submit: "the ring stays full" -> gGPUStopped = true for good. So: the 3D core hung once (cause unknown: report lost), and nothing recovered it. `sweet-fix` printed nothing to the kernel log (stderr), but screenshots save, so it worked.
+**0163:** sweet_gpu_recover() (bsd/dev/sweet_gpu.c): CP_SQE_CNTL 0, RBBM_SW_RESET_CMD (0x43) 1/0, SMMU context FSR cleared, core_hw_regs() (step 19's register block, factored out), CP_SQE_CNTL 1, CP_ME_INIT + CP_SET_SECURE_MODE 0 at ring word 0, waits for rptr 11; then kept.at = kept.sent = 11 and the fence word = kept.fence (all earlier submissions done). SweetGPU.cpp calls it on "the ring stays full" (and retries that submission) and on a >= 1 s wait with no answer. Max 32 a boot; `sweetgpurecover=0` = old behaviour. Log: `SWEET GPU: kept: RECOVERED the hung core ...` or `recovery N FAILED ...`.
+**Guesses to check:** whether the soft reset leaves the core in secure mode that CP_SET_SECURE_MODE 0 cannot leave without the zap shader (then the recovery fails and logs FAILED); what hung the core in Settings (the report line will now be logged once before each recovery).
+
 ### >>> BOOT 94 (2026-10-31, kernel 41193711324 = 0162 + userland 41193711326 with libsweet-fix): SCREENSHOTS SAVE (user); Files still without "On My iPhone"; opening Settings froze the display, then it "started going crazy" <<<
 
 The uploaded log `a58b7d53-apollo-boot93.txt` is boot 93's (ScreenshotServic crash at line 9530, no sweet-fix line, no Preferences exec), so the Settings freeze is not in it; boot 94's log asked for.
