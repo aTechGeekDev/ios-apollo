@@ -2,6 +2,10 @@
 
 ## Agent handoff / active work
 
+### >>> Outside confirmation (2026-10-31, user's screenshot of a Reddit reply by the Pixel 5 port's author) <<<
+
+"I got the CPU load under control temporarily by killing the vmd service since it's broken when there's no network. Took me down to 5% on average." = our boot 87 finding (vmd = com.apple.voicemail.vmd, 24-67% of a core). Already in tools/root-files/quiet-on.txt (with coreduetd, ReportCrash, fairplayd.H2). Their "no network" suggests vmd may calm down with cellular/data up; we have no modem, so disabling stays.
+
 ### >>> BOOT 87: the crash loops and the shutdown (2026-10-31, user's CRASH grep) <<<
 
 **Observed:** sig 6 (exit reason ns 2 code 6) in a loop: SiriTTSSynthesizer, MacinTalkAUSP, KonaSynthesizer (speech synthesizer extensions) and AegirPoster (wallpaper poster extension), every one at pc 0x210ad3198 (slide 0x4e4bc000), far 0x22d32ee28 = libc++abi's __crash_info. Symbolicated on the runner (ios-re run 41180754700, `ipsw dyld a2s`, unslid = address - slide): __pthread_kill / pthread_kill / abort <- demangling_terminate_handler <- _objc_terminate <- std::__terminate <- __cxa_rethrow-area <- **objc_exception_throw <- __CFDictionaryCreateGeneric <- func_1aaf39c64+248 (image not named yet)** <- (synthesizers) / std::terminate <- _dispatch_client_callout <- _dispatch_block_invoke_direct <- __FBSSERIALQUEUE_IS_CALLING_OUT_TO_A_BLOCK__ <- -[FBSSerialQueue _targetQueue_performNextIfPossible] (posters). = an uncaught ObjC exception building a dictionary (typically "attempt to insert nil object": a value these extensions expect is nil here). Which value: next, the image and code around 0x1aaf39c64.
