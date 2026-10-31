@@ -1,0 +1,44 @@
+--- a/bsd/kern/posix_sem.c
++++ b/bsd/kern/posix_sem.c
+@@ -48,6 +48,7 @@
+  */
+ 
+ #include <sys/cdefs.h>
++#include <pexpert/pexpert.h>
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
+@@ -469,6 +470,33 @@
+ 
+ 	fmode = (mode_t)FFLAGS(uap->oflag);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * (xnu 0165) "Setup is finished", for every program. SetupAssistant's BYSetupAssistantNeedsToRun()
++	 * is !LaunchSentinelExists(), and that is sem_open("purplebuddy.sentinel", 0) succeeding: iOS's
++	 * setup process creates the semaphore each boot once setup is done. Ours is skipped (prefs in
++	 * tools/sweet-root-tweaks.py), so nothing creates it and every caller believed setup still had to
++	 * run -- fileproviderd refused to start any file provider (boot 97: the Files app's empty "On My
++	 * iPhone"). Opening that name without O_CREAT now creates it (value 0, mode 0644) when it is not
++	 * there. Boot-arg sweetsetupdone=0: as before.
++	 */
++	{
++		static int setup_done = -1;
++
++		if (setup_done < 0) {
++			uint32_t on = 1;
++
++			(void)PE_parse_boot_argn("sweetsetupdone", &on, sizeof(on));
++			setup_done = on != 0;
++		}
++		if (setup_done && !(fmode & O_CREAT) && strcmp(nameptr, "purplebuddy.sentinel") == 0) {
++			fmode |= O_CREAT;
++			cmode = 0644;
++			value = 0;
++		}
++	}
++#endif
++
+ 	if ((fmode & O_CREAT)) {
+ 		if ((value < 0) || (value > SEM_VALUE_MAX)) {
+ 			error = EINVAL;
