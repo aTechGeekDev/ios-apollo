@@ -2,6 +2,12 @@
 
 ## Agent handoff / active work
 
+### >>> In-place jailbreak (2026-10-31; userland 41215357320 has bin/sweet-jbinstall + libsweet-fix trigger): NOT YET BOOTED <<<
+
+**Design:** tools/jb-fetch.sh (host: curl, zstd, xz) -> research/jb/bootstrap.tar.xz (Procursus 1900 rootless bootstrap-iphoneos-arm64, zstd -> xz -6 single-threaded) + sileo.deb (2.5.1 iphoneos-arm64). tools/root-files/jb-install.txt carries /usr/local/bin/sweet-jbinstall, /private/var/sweet-jb/{bootstrap.tar.xz,sileo.deb} (~21 MiB) for one boot. libsweet-fix in usermanagerd (root) posix_spawns the installer (POSIX_SPAWN_SETSID, clean env) unless /var/jb/.sweet-jb-done. Installer (userland/jb/sweet_jbinstall.c): xz via libcompression COMPRESSION_LZMA, tar (ustar/pax/GNU L/K), only ./var/jb entries, owners + modes after chown; markers .sweet-jb-unpacked / -prepped / -done; sleeps 90 s then `NO_PASSWORD_PROMPT=1 /var/jb/bin/sh /var/jb/prep_bootstrap.sh`, `dpkg -i sileo.deb`, `uicache -p /var/jb/Applications/Sileo.app`. Logs `sweet-jb:` to /dev/console + /private/var/sweet-jb/install.log.
+**Checked (ios-re 41215xxxxxx, macOS):** libcompression's LZMA decodes jb-fetch's .tar.xz to the full 108,103,680 bytes (= the zstd original); xz 19.0 MB + deb 2.9 MB.
+**Unknowns:** /var/jb as a plain directory (rootless normally symlinks into /private/preboot); Procursus binaries under our AMFI; uicache registering an app outside /Applications.
+
 ### >>> 🎉 BOOT 104 (2026-10-31, kernel 41208843768, userland 41214268895, `--artwork-subtype 2556` + mgcache-reset): FILES "ON MY IPHONE" WORKS, DYNAMIC ISLAND WORKS (user) <<<
 
 **Files fix chain (boots 93-104):** sandbox container paths for .appex (0161) -> setup finished (BYSetupAssistantNeedsToRun hook; kernel purplebuddy.sentinel 0165) -> the HFS+ root reported as apfs to fileproviderd/Files/LocalStorageFileProvider (libsweet-fix statfs family). The persona list errors were red herrings.
