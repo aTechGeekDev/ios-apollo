@@ -14,7 +14,7 @@ for t in curl zstd xz; do command -v "$t" >/dev/null || { echo "jb-fetch: $t is 
 [ -s "$OUT/bootstrap.tar.zst" ] || curl -fL -o "$OUT/bootstrap.tar.zst" "$BOOTSTRAP"
 [ -s "$OUT/sileo.deb" ] || curl -fL -o "$OUT/sileo.deb" "$SILEO"
 if [ ! -s "$OUT/bootstrap.tar.xz" ]; then
-	zstd -dc "$OUT/bootstrap.tar.zst" | xz -6 -T0 -c > "$OUT/bootstrap.tar.xz.part"
+	zstd -dc "$OUT/bootstrap.tar.zst" | xz -6 -T1 -c > "$OUT/bootstrap.tar.xz.part"
 	mv "$OUT/bootstrap.tar.xz.part" "$OUT/bootstrap.tar.xz"
 fi
 ls -la "$OUT"
