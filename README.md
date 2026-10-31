@@ -188,6 +188,7 @@ Boot options (boot-args) go in `--cmdline`. The most useful ones are below. Each
 | `sweetfb_fit=0` | Crop the iPhone X picture instead of scaling it to fit |
 | `sweetfb_height=2502` | Full-panel mode (0152): build the device tree with `mkadt.py --display-height 2502` and add `--files-from tools/root-files/mgcache-reset.txt` on the first boot |
 | `sweetfb_native=1` | iOS draws at 1080×2400 1:1 (360×800 points; iOS shows a red status bar). Needs `mkadt.py --native-display` |
+| `mkadt.py --artwork-subtype 2556` | (device tree, not a boot-arg) Dynamic Island: MobileGestalt's ArtworkDeviceSubType of the iPhone 14 Pro. Add `--files-from tools/root-files/mgcache-reset.txt` for the first boot with it; drop both to undo |
 | `sweetfb_stats=N` | Every N s, a `SWEET FB` line with frames a second and copy time (default 10) |
 | `sweetscan=0` | Don't let the GPU scale frames into the flip buffers (0159); the CPU copies them |
 | `sweetflip=0` | Copy each frame into the shown buffer instead of page flipping (0156; tears) |
