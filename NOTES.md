@@ -2,6 +2,11 @@
 
 ## Agent handoff / active work
 
+### >>> BOOT 98 (2026-10-31, kernel 41202590414, userland 41206163336): setup gate passed in fileproviderd/Files; still no LocalStorage provider -> userland 41207174715 prints %@ objects <<<
+
+**Observed:** `BYSetupAssistantNeedsToRun -> NO: hooked` in both; no more "not set up". fileproviderd: "file provider server setup", PlugInKit discovery 8 matches, container lookups for every provider group succeed, `[NOTICE] %@ -> {unregistering: %@, registering: %@}`, `Registered: %@, result: 0`, later `no registered bundle with URL %@` (x2); no LocalStorageFileProvider exec. Files: still "could not find a valid source", "storageURLs is empty". The %@ arguments were not decoded.
+**Change:** libsweet-fix decodes os_log object arguments with CFCopyDescription (links CoreFoundation). Next boot shows which bundle URL LaunchServices does not know and what fileproviderd registers.
+
 ### >>> xnu 0165 (2026-10-31, kernel run 41206906921; user: "make kernel say setup is finished for everything"): NOT YET BOOTED <<<
 
 **Found (ios-re, SetupAssistant 0x1a3af1270):** BYSetupAssistantNeedsToRun = NO if buddyPreferencesInternal ForceNoBuddy; NO on an unsupported device class; else `w19 = LaunchSentinelExists() ^ 1` (the MGGetBoolAnswer after it only decides whether a cached date is logged). LaunchSentinelExists (0x1a3afd9dc) = `sem_open("purplebuddy.sentinel", 0) != SEM_FAILED`. Setup creates that POSIX semaphore each boot; ours is skipped, so nothing did.
