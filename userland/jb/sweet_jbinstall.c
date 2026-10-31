@@ -416,7 +416,11 @@ main(void)
 	(void)mkdir(DIR_IN, 0755);
 	logfile = fopen(LOG_FILE, "a");
 	if (stat(DONE, &st) == 0) {
-		return 0;
+		if (stat("/var/jb/Applications/Sileo.app", &st) == 0) {
+			return 0;
+		}
+		/* boot 107: marked done, but no Sileo.app: do step 3 again */
+		(void)unlink(DONE);
 	}
 	/* one installer at a time (boot 105: two ran at once) */
 	int lock = open(DIR_IN "/lock", O_RDWR | O_CREAT, 0600);
@@ -438,9 +442,10 @@ main(void)
 	say("waiting 90 s for the system to come up");
 	sleep(90);
 	if (stat(PREPPED, &st) != 0) {
-		const char *const prep[] = { "/var/jb/bin/sh", "/var/jb/prep_bootstrap.sh", NULL };
+		const char *const prep[] = { stat("/var/jb/bin/sh", &st) == 0 ? "/var/jb/bin/sh" : "/var/jb/usr/bin/sh",
+			"/var/jb/prep_bootstrap.sh", NULL };
 
-		say("step 2: Procursus' prep_bootstrap.sh");
+		say("step 2: Procursus' prep_bootstrap.sh (%s)", stat("/var/jb/prep_bootstrap.sh", &st) == 0 ? "there" : "NOT THERE");
 		if (stat("/var/jb/prep_bootstrap.sh", &st) == 0 && run(prep) != 0) {
 			say("step 2 FAILED; trying again at the next boot");
 			return 1;
@@ -458,7 +463,13 @@ main(void)
 		}
 		(void)run(uic);
 	}
+	say("dpkg %s, Sileo.app %s", stat("/var/jb/usr/bin/dpkg", &st) == 0 ? "there" : "MISSING",
+	    stat("/var/jb/Applications/Sileo.app", &st) == 0 ? "there" : "MISSING");
+	if (stat("/var/jb/Applications/Sileo.app", &st) != 0) {
+		say("Sileo.app is not in /var/jb/Applications; trying again at the next boot");
+		return 1;
+	}
 	touch(DONE);
-	say("DONE: /var/jb is installed%s", stat("/var/jb/Applications/Sileo.app", &st) == 0 ? ", Sileo is on the home screen" : "");
+	say("DONE: /var/jb is installed and Sileo registered");
 	return 0;
 }

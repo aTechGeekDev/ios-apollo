@@ -351,9 +351,37 @@ fix_start_jb_installer(void)
 	    stat(argv[0], &st) == 0);
 	if (con >= 0) {
 		(void)write(con, line, strlen(line));
+		snprintf(line, sizeof(line), "sweet-fix: %s: /var/jb: dpkg %d, Sileo.app %d, unpacked %d, prepped %d\n", getprogname(),
+		    stat("/var/jb/usr/bin/dpkg", &st) == 0, stat("/var/jb/Applications/Sileo.app", &st) == 0,
+		    stat("/var/jb/.sweet-jb-unpacked", &st) == 0, stat("/var/jb/.sweet-jb-prepped", &st) == 0);
+		(void)write(con, line, strlen(line));
+		/* the installer's own log, last 6 KiB, once a boot (configd) */
+		if (strcmp(getprogname(), "configd") == 0) {
+			int lf = open("/private/var/sweet-jb/install.log", O_RDONLY);
+			static char buf[6144];
+
+			if (lf >= 0) {
+				off_t size = lseek(lf, 0, SEEK_END);
+				ssize_t n;
+
+				(void)lseek(lf, size > (off_t)sizeof(buf) ? size - (off_t)sizeof(buf) : 0, SEEK_SET);
+				n = read(lf, buf, sizeof(buf));
+				close(lf);
+				(void)write(con, "sweet-fix: install.log follows\n", 32);
+				if (n > 0) {
+					(void)write(con, buf, (size_t)n);
+				}
+				(void)write(con, "sweet-fix: install.log ends\n", 29);
+			}
+		}
 	}
-	if (stat("/var/jb/.sweet-jb-done", &st) == 0 || stat("/private/var/sweet-jb/bootstrap.tar.xz", &st) != 0 ||
-	    stat(argv[0], &st) != 0) {
+	if (stat("/var/jb/Applications/Sileo.app", &st) == 0 && stat("/var/jb/.sweet-jb-done", &st) == 0) {
+		if (con >= 0) {
+			close(con);
+		}
+		return;
+	}
+	if (stat("/private/var/sweet-jb/bootstrap.tar.xz", &st) != 0 || stat(argv[0], &st) != 0) {
 		if (con >= 0) {
 			close(con);
 		}
