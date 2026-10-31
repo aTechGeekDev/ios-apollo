@@ -2,7 +2,9 @@
 
 ## Agent handoff / active work
 
-### >>> xnu 0160 (2026-10-31, commit ee2508e, xnu run 41186687753): CPU budget for runaway background processes + touch boost; NOT YET BOOTED <<<
+### >>> BOOT 92 (2026-10-31, kernel 41186687753 = 0160, bt-on.txt = every service on): user: "the heat is acceptable a bit now" (no log sent yet; SWEET TAME lines and fps not seen) <<<
+
+### >>> xnu 0160 (2026-10-31, commit ee2508e, xnu run 41186687753): CPU budget for runaway background processes + touch boost; booted in boot 92 <<<
 
 **User after boot 91:** "the phone still heats up after a few minutes, i dont want to disable more services as my goal is to reach a daily drivable state, focus on optimization and performance and mainating heat even at idle I want a stable 60fps everywhere". So boot 92 runs with every service on (`bt-on.txt`: only fairplayd.H2 off); quiet-on/quiet-max stay optional.
 **Boot 91 (observed, all services on, kernel 0159 + bridge 41183892186):** SWEET TOP summed: vmd 4616, coreduetd 2704, launchd 1163, backboardd 516, biomed 423, SpringBoard 209, trustd 190, accessoryupdater 110 (% of a core per 10 s, added up). Busiest cores 64-81% at idle; up to 77 C; 48-58 fps when the processors are free, 20-35 when busy.
