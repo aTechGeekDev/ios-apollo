@@ -72,7 +72,7 @@
 +		return error;
 +	}
 +	target = proc_find((int)a.pid);
-+	if (target == PROC_NULL) {
++	if (target == NULL) {
 +		return ESRCH;
 +	}
 +	uid = proc_getuid(target);
