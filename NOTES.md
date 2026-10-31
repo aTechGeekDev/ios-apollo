@@ -2,6 +2,13 @@
 
 ## Agent handoff / active work
 
+### >>> xnu 0161 (2026-10-31, commit 134ab6b; user: "fix the storage now i cant save screenshots and the files app doesnt show anything"): NOT YET BOOTED <<<
+
+**Found (ios-re runs 41190559179, 41191423514, 41191588178):** the crash loops' func_1aaf39c64 is in **PlugInKit**: it calls `sandbox_container_path_for_pid(getpid(), buf, 0x400)` and raises NSInternalInconsistencyException when that fails or the path is empty. Our "Sandbox" MAC policy (0050, bsd/kern/sweet_amfi.c) answered op 4 with ENOENT, so every app extension dies at start: SiriTTS/MacinTalk/Kona synthesizers, AegirPoster, and (guess, to be confirmed) the Files app's file providers and the screenshot/photo extensions.
+**libsystem_sandbox ABI (20H392):** op 4 args `{u64 pid; u64 pidversion; char *buf; u64 size; u64 by_audit_token}`; op 5 (issue) token buffer (malloc 0x800) pointer at args+0x20; op 6 (consume) `{token; strlen+1; int64 *handle}`; op 7 release `{handle,0,0}`.
+**0161:** op 4 returns the user's home (`/private/var/mobile`, root `/private/var/root`) when the target's executable path contains `.appex/`, ENOENT otherwise (daemons/apps unchanged); op 5 writes a dummy token; op 6 returns a handle. Not compiled locally.
+**To check in the boot:** no more sig 6 loops of the synthesizers/posters; Files shows "On My iPhone"; screenshots land in Photos. If assetsd still aborts, it is another cause (boot 50 showed assetsd sig 6 at the same abort pc, frames not symbolicated).
+
 ### >>> BOOT 92 (2026-10-31, kernel 41186687753 = 0160, bt-on.txt = every service on): user: "the heat is acceptable a bit now" (no log sent yet; SWEET TAME lines and fps not seen) <<<
 
 ### >>> xnu 0160 (2026-10-31, commit ee2508e, xnu run 41186687753): CPU budget for runaway background processes + touch boost; booted in boot 92 <<<
