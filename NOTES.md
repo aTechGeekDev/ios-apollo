@@ -2,11 +2,32 @@
 
 ## Agent handoff / active work
 
-### >>> CURRENT BOOT COMMANDS (as of 2026-11-03; boot 111 = probe, 8 failures; next: probe boot 112 with the fixes) <<<
+### >>> CURRENT BOOT COMMANDS (as of 2026-11-03; next: the Turnip boot (vktest, M3); the probe boot 112 is optional now) <<<
 
 Builds: kernel run 41216279299 (xnu through 0168, Xcode 16.0), userland run 41218791846, metal run 41655855519 (artifact sweet-metal).
 Run on the user's Kali PC from ~/ios-apollo on `main` (research/, shim/out, recovery/recovery.img and sweet-bt/ are local, not in git).
 `--artwork-subtype 2556` stays on every boot (Dynamic Island).
+
+**Turnip boot (next, M3: vktest):** kernel xnu run 41669326908 (0170 + 0169), sweet-metal2 metal2 run 41669743130 (vktest, Turnip), sweet-metal metal run 41669742694 (libsweet-fix with the run file); `--files-from tools/root-files/vktest.txt`; boot-args `sweetmtl=1` (SweetAcceleratorVK: Vulkan only) and vktest in sweetnull; no GL bridge (the GPU is vktest's alone). Read back: `grep -a -E 'SWEET MTL|sweet-fix: configd|vktest|PASS|FAIL|SWEET GPU: kept|SweetGPU:'`.
+
+```sh
+git pull && R=aTechGeekDev/ios-apollo &&
+rm -rf xnu/out sweet-metal sweet-metal2 &&
+gh run download 41669326908 -R $R -n xnu-kernel -D xnu/out &&
+gh run download 41669742694 -R $R -n sweet-metal -D sweet-metal &&
+gh run download 41669743130 -R $R -n sweet-metal2 -D sweet-metal2 &&
+python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --artwork-subtype 2556 \
+    --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
+    --gmu-fw research/apollo-gpu/a650_gmu.bin --sqe-fw research/apollo-gpu/a650_sqe.fw \
+    --zap-mdt research/apollo-gpu/a650_zap.mdt --zap-seg research/apollo-gpu/a650_zap.b02 \
+    --wifi-fw research/apollo-wifi --bt-fw research/apollo-bt \
+    --file /usr/local/lib/libsweet-bt.dylib=sweet-bt/lib/libsweet-bt.dylib \
+    --files-from tools/root-files/files.txt --files-from tools/root-files/bt-on.txt \
+    --files-from tools/root-files/vktest.txt &&
+python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/apollo.adt shim/out/payload.bin \
+    --cmdline 'debug=0xc serial=3 cpumask=0xf1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 sweetfb_noconsole=1 sweetfb_height=2502 sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetgpulevel=6 sweetmtl=1 sweetwifi=12 apollo_audio=5 apollo_sound_gain=0 apollo_sound_below=80 apollo_mic=4 apollo_haptic=5 sweetbt=6 sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool sweetnull=backboardd,SpringBoard,bluetoothd,BlueTool,mediaserverd,vktest' &&
+shim/build.sh ../shim/out/payload.bin && fastboot boot shim/out/shim-boot.img
+```
 
 **Metal probe boot (next, 112: the boot 111 fixes):** NO GL bridge (libsweet-ca dropped from sweetinject: software UI, the probe is the GPU's only
 client, and room on the boot line), `sweet-metal` added to sweetnull (its output goes to /dev/null now: see boot 110),
@@ -65,7 +86,7 @@ grep -a -E 'probe:|sweet-fix: configd: metal|SWEET GPU: kept|SweetGPU:' logs/apo
 
 User preference: give paste-ready commands at once, do not wait on CI (`gh run watch RUN -R $R --exit-status &&` in front when a build is pending); `[skip ci]` on notes-only commits.
 
-### >>> METAL ROUTE CHOSEN: metal2vulkan + Turnip (2026-11-03; user: "go with the metal2vulkan turnip route") -- M1 CI + M2 KERNEL 0170 WRITTEN, NOT YET BUILT GREEN <<<
+### >>> METAL ROUTE CHOSEN: metal2vulkan + Turnip (2026-11-03; user: "go with the metal2vulkan turnip route") -- M1 GREEN (metal2 41669326870 / 41669743130), M2 KERNEL 0170 GREEN (xnu 41669326908); NOT BOOTED <<<
 
 **M1 CI run 41668244271 failed** in tu_knl_darwin.cc: UniXNU's HEAD Mesa patch speaks a newer ABI (NativeAdrenoAbiPriority, MethodSetPriority/Note, ParamsOwnedCoherent, from 2026-10-28) than IOS-26-Hot's NativeAdrenoABI.h. IOS-26-Hot's cache key names the UniXNU commit they built: cd1b9757 (2026-10-26, same Mesa 85fda3b3, 9 patches): fetch-sources.sh pins it now.
 **M2 = xnu 0170 (`0170-apollo-turnip-accelerator.patch`):** iokit/Kernel/arm/SweetAccelerator.cpp (new; after IOS-26-Hot's, MIT) + SweetGPUABI.h (= the ABI header); sweet_accelerator_start() from SweetGPUStart: sweetmtl=1 -> SweetAcceleratorVK (IOService, invisible to Metal: Vulkan only; Turnip needs TU_DARWIN_SERVICE=SweetAcceleratorVK), sweetmtl=2 -> SweetAccelerator (IOAcceleratorES, MetalPluginName SweetMetal2 / SweetMTL2Device). User client: open type 0x4147 or 2, NTNL tunnel or selector = method; per-client 4 GiB GPU window at (i+1)*4 GiB (64 windows); BoAlloc = WC IOBufferMemoryDescriptor (as SweetGPU's gemNew), zeroed; BoImport pins task pages; BoMap at the client's IOVA in 4K steps (read-only without perm bit 1); Submit up to 16 IBs through sweet_gpu_v2_submit (SweetGPU.cpp, under gGPULock, 0163 recovery on a full ring); WaitFence via gpuWait (ns -> ms, max 5 s); GetStatus faults = recoveries that happened while the client had work; GetTimestamp = CP_ALWAYS_ON_COUNTER (0x0980/0x0981); per-process cap sweetgpucap (MB, default 512; backboardd/SpringBoard none). Device info: chip 0x06050002, GMEM 0x120000 at base 0, UCHE trap 0x1fffffffff000, hbb 16, swizzle 6, macrotile 1, UBWC 3, ClientIova. sweet_gpu.c: GPU_SPACE_TABLES 8192 / HASH 16384, sweet_gpu_recovery_count(), sweet_gpu_timestamp(). validate-repo 170 OK; the series reproduces the three files. Not compiled locally (no XNU headers here).
