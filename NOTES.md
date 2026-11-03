@@ -2,32 +2,33 @@
 
 ## Agent handoff / active work
 
-### >>> CURRENT BOOT COMMANDS (as of 2026-11-03; boot 109 DONE: Sileo works; next: the Metal probe boot) <<<
+### >>> CURRENT BOOT COMMANDS (as of 2026-11-03; boot 110 = first probe boot, output lost; next: probe boot 111) <<<
 
 Builds: kernel run 41216279299 (xnu through 0168, Xcode 16.0), userland run 41218791846, metal run 41655855519 (artifact sweet-metal).
 Run on the user's Kali PC from ~/ios-apollo on `main` (research/, shim/out, recovery/recovery.img and sweet-bt/ are local, not in git).
 `--artwork-subtype 2556` stays on every boot (Dynamic Island).
 
-**Metal probe boot (next):** the everyday command with sweet-metal downloaded, `--files-from tools/root-files/metal-probe.txt`, and
-WITHOUT the sweet-userland libsweet-fix `--file` line (metal-probe.txt writes the newer libsweet-fix, which also starts the probe):
+**Metal probe boot (next, 111):** NO GL bridge (libsweet-ca dropped from sweetinject: software UI, the probe is the GPU's only
+client, and room on the boot line), `sweet-metal` added to sweetnull (its output goes to /dev/null now: see boot 110),
+`--files-from tools/root-files/metal-probe.txt`, no sweet-userland download (libsweet-fix comes from sweet-metal), kernel with 0169
+(xnu run 41657437961: FAULTS counts resets). METAL_RUN = the metal.yml run of the commit that made libsweet-fix write to /dev/null.
 
 ```sh
 git pull && R=aTechGeekDev/ios-apollo &&
-rm -rf xnu/out sweet-userland sweet-metal &&
-gh run download 41216279299 -R $R -n xnu-kernel -D xnu/out &&
-gh run download 41218791846 -R $R -n sweet-userland -D sweet-userland &&
-gh run download 41655855519 -R $R -n sweet-metal -D sweet-metal &&
+gh run watch 41657437961 -R $R --exit-status && gh run watch METAL_RUN -R $R --exit-status &&
+rm -rf xnu/out sweet-metal &&
+gh run download 41657437961 -R $R -n xnu-kernel -D xnu/out &&
+gh run download METAL_RUN -R $R -n sweet-metal -D sweet-metal &&
 python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --artwork-subtype 2556 \
     --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
     --gmu-fw research/apollo-gpu/a650_gmu.bin --sqe-fw research/apollo-gpu/a650_sqe.fw \
     --zap-mdt research/apollo-gpu/a650_zap.mdt --zap-seg research/apollo-gpu/a650_zap.b02 \
     --wifi-fw research/apollo-wifi --bt-fw research/apollo-bt \
-    --file /usr/local/lib/libsweet-gl.dylib=sweet-userland/lib/libsweet-gl.dylib \
     --file /usr/local/lib/libsweet-bt.dylib=sweet-bt/lib/libsweet-bt.dylib \
     --files-from tools/root-files/files.txt --files-from tools/root-files/bt-on.txt \
     --files-from tools/root-files/metal-probe.txt &&
 python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/apollo.adt shim/out/payload.bin \
-    --cmdline 'debug=0xc serial=3 cpumask=0xf1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 sweetfb_noconsole=1 sweetfb_height=2502 sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetgpulevel=6 sweetwifi=12 apollo_audio=5 apollo_sound_gain=0 apollo_sound_below=80 apollo_mic=4 apollo_haptic=5 sweetbt=6 sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd;/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool sweetnull=backboardd,SpringBoard,bluetoothd,BlueTool,mediaserverd' &&
+    --cmdline 'debug=0xc serial=3 cpumask=0xf1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 sweetfb_noconsole=1 sweetfb_height=2502 sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetgpulevel=6 sweetwifi=12 apollo_audio=5 apollo_sound_gain=0 apollo_sound_below=80 apollo_mic=4 apollo_haptic=5 sweetbt=6 sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool sweetnull=backboardd,SpringBoard,bluetoothd,BlueTool,mediaserverd,sweet-metal' &&
 shim/build.sh ../shim/out/payload.bin && fastboot boot shim/out/shim-boot.img
 ```
 
@@ -63,6 +64,12 @@ grep -a -E 'probe:|sweet-fix: configd: metal|SWEET GPU: kept|SweetGPU:' logs/apo
 ```
 
 User preference: give paste-ready commands at once, do not wait on CI (`gh run watch RUN -R $R --exit-status &&` in front when a build is pending); `[skip ci]` on notes-only commits.
+
+### >>> BOOT 110 (2026-11-03, kernel 41216279299, metal run 41655855519 via metal-probe.txt, GL bridge on): PROBE RAN, ITS OUTPUT LOST; GPU HUNG 8x, 0163 RECOVERED EACH; UI FROZE <<<
+
+**Observed (user's grep):** `sweet-fix: configd: metal probe started (pid 93, error 0)`, `probe: ... waits 60 s` -- then no other `probe:` line at all (not even the GPU/chip line). Later: `SWEET GPU: kept: no answer` / `the ring stays full` x8 (submissions 3261 .. 4679), each `RECOVERED the hung core (recovery N, 2 ms; smmu fsr was 0x400)`: **0163's recovery works** (first time exercised). Hang reports: status 0xc00905 (0xe71da7 the last), cp fault 0, protect 0, int 0; ib1 with 0 words to go (the first three: fetched to the end, then waiting) or 1809 / 1403 words to go. `SweetGPU: the GPU is not done with a buffer of 1212416 / 737280 bytes: it stays its own` x3 (leaked to be safe). User: lock screen opened, after a swipe the display hung (each reset also drops backboardd's queued frames).
+**Cause of the lost output (inferred):** /dev/console reaches the kernel log only early in the boot (the probe's first line was written right after configd started; boots 106-107 lost the jailbreak installer's console lines the same way). **Not known:** which client hung the core (probe or Mesa in backboardd) and at which probe stage -- most likely the probe (no hang in boots 95-109 with the same bridge).
+**Changes for boot 111:** libsweet-fix starts the probe with stdout/stderr on /dev/null (kernel tee via sweetnull=...,sweet-metal); the probe boot runs without the GL bridge (software UI; isolates the GPU to the probe; frees boot-line room); kernel with 0169 (FAULTS = resets, so the probe marks submissions a reset gave up). sweetnull's buffer is 192 bytes (0164): 117 used with the built-ins.
 
 ### >>> METAL PROBE BOOT (2026-11-03; user: "i wanna test metal"): tools/root-files/metal-probe.txt + artifact sweet-metal from metal run 41655855519 (a9840b8, ios green); NOT YET BOOTED <<<
 

@@ -402,9 +402,11 @@ fix_start_jb_installer(void)
 /*
  * (Metal) In configd: run userland/metal's probe (sweet-metal = hakios-metal-probe) once, when the boot image put it
  * on the root with its marker (tools/root-files/metal-probe.txt). The marker is removed before the start, so the probe
- * runs in this boot only, whatever happens to it. Its output goes to the console, which reaches the kernel's log
- * (as the jailbreak lines above do): no sweetnull entry needed. SWEET_METAL_DELAY: the probe waits that long first,
- * so that the boot and the GL bridge have settled before it takes the GPU.
+ * runs in this boot only, whatever happens to it. Its output goes to /dev/null, which the kernel copies into its log
+ * for the programs named in boot-arg sweetnull (xnu 0048): `sweetnull=...,sweet-metal`. Not the console: boot 110
+ * showed /dev/console reaching the log only early in the boot (the probe's first line came through, nothing after
+ * its 60 s wait; boots 106-107 lost the jailbreak installer's console lines the same way). SWEET_METAL_DELAY: the
+ * probe waits that long first, so that the boot has settled before it takes the GPU.
  */
 static void
 fix_start_metal_probe(void)
@@ -425,7 +427,7 @@ fix_start_metal_probe(void)
 	(void)unlink(marker);
 	posix_spawn_file_actions_init(&files);
 	posix_spawn_file_actions_addopen(&files, 0, "/dev/null", O_RDONLY, 0);
-	posix_spawn_file_actions_addopen(&files, 1, "/dev/console", O_WRONLY | O_NOCTTY, 0);
+	posix_spawn_file_actions_addopen(&files, 1, "/dev/null", O_WRONLY, 0);
 	posix_spawn_file_actions_adddup2(&files, 1, 2);
 	posix_spawnattr_init(&attr);
 	posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
