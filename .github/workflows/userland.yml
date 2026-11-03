@@ -15,6 +15,7 @@ on:
       - "!userland/audio/**"
       - "!userland/bt-inject/**"
       - "!userland/metal/**"
+      - "!userland/metal2/**"
       - ".github/workflows/userland.yml"
 
 jobs:

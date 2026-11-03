@@ -1,0 +1,105 @@
+name: metal2
+
+# Metal on the Adreno 650 through metal2vulkan + Mesa Turnip (userland/metal2: IOS-26-Hot's phone/metal2 + phone/turnip,
+# MIT; UniXNU's Mesa patches, BSD-2-Clause-Patent, fetched at a pinned commit). Built for iOS 16 arm64, ad-hoc signed.
+# Artifact sweet-metal2:
+#   SweetMetal2.bundle/          the Metal plug-in (HotMetal2 executable + libvulkan_freedreno.dylib): goes to
+#                                /System/Library/Extensions/SweetMetal2.bundle; the kernel names it with sweetmtl=2
+#   lib/libvulkan_freedreno.dylib  Turnip with the darwin kernel backend (turnip/NativeAdrenoABI.h)
+#   bin/vktest                   Turnip smoke test: device, buffer fill/copy, a compute shader, a triangle (sweetmtl=1)
+#   bin/m2vtest                  the metal2vulkan bridge's self-test
+#   SHA256SUMS
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "userland/metal2/**"
+      - ".github/workflows/metal2.yml"
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 150
+    env:
+      METAL2_WORK: ${{ github.workspace }}/work/metal2
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache Turnip (libvulkan_freedreno.dylib)
+        id: cache-turnip
+        uses: actions/cache@v4
+        with:
+          path: work/metal2/turnip/build-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib
+          key: turnip-ios-85fda3b3-c1ecc5b7-${{ hashFiles('userland/metal2/turnip/**', 'userland/metal2/build-turnip-ios.sh', 'userland/metal2/fetch-sources.sh', 'userland/metal2/ios-cc') }}
+
+      - name: Cache metal2vulkan bridge (libnative_metal_bridge.a)
+        id: cache-m2v
+        uses: actions/cache@v4
+        with:
+          path: work/metal2/m2v-bridge/ios/libnative_metal_bridge.a
+          key: m2v-lib-720ef1ce-${{ hashFiles('userland/metal2/metal2/bridge/**', 'userland/metal2/build-m2v-bridge.sh', 'userland/metal2/fetch-sources.sh') }}
+
+      - name: Cache Cargo
+        if: steps.cache-m2v.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            work/metal2/m2v-bridge/target
+          key: m2v-cargo-720ef1ce-${{ hashFiles('userland/metal2/metal2/bridge/**', 'userland/metal2/build-m2v-bridge.sh') }}
+          restore-keys: |
+            m2v-cargo-720ef1ce-
+
+      - name: Tools (Homebrew, meson, Rust)
+        run: |
+          set -eux
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          brew install bison flex ninja pkg-config glslang spirv-tools llvm
+          if [ ! -x /opt/homebrew/opt/llvm/bin/llvm-as ]; then
+            sudo mkdir -p /opt/homebrew/opt/llvm/bin
+            sudo ln -sf "$(brew --prefix llvm)/bin/llvm-as" /opt/homebrew/opt/llvm/bin/llvm-as
+          fi
+          mkdir -p work/metal2/turnip
+          python3 -m venv work/metal2/turnip/venv
+          work/metal2/turnip/venv/bin/pip install -q meson mako pyyaml packaging
+          rustup toolchain install 1.98.0 --profile minimal --target aarch64-apple-ios
+          chmod +x userland/metal2/*.sh userland/metal2/ios-cc userland/metal2/*/build.sh
+
+      # (always: vktest builds against Mesa's Vulkan headers even when Turnip comes from the cache)
+      - name: Fetch and patch Mesa (Turnip) and metal2vulkan
+        run: userland/metal2/fetch-sources.sh
+
+      - name: Build Turnip for iOS 16 arm64
+        if: steps.cache-turnip.outputs.cache-hit != 'true'
+        run: sh userland/metal2/build-turnip-ios.sh ios
+
+      - name: Build the metal2vulkan bridge for iOS
+        if: steps.cache-m2v.outputs.cache-hit != 'true'
+        run: |
+          find work/metal2/metal2vulkan -not -path '*/.git/*' -exec touch -t 202501010000 {} +
+          sh userland/metal2/build-m2v-bridge.sh ios
+
+      - name: Build SweetMetal2.bundle, m2vtest and vktest
+        run: |
+          set -eux
+          sh userland/metal2/metal2/build.sh
+          sh userland/metal2/turnip/build.sh
+          mkdir -p out/bin out/lib
+          cp -R userland/metal2/metal2/out/SweetMetal2.bundle out/
+          cp userland/metal2/metal2/out/m2vtest out/bin/
+          cp userland/metal2/turnip/out/vktest out/bin/
+          cp userland/metal2/turnip/out/libvulkan_freedreno.dylib out/lib/
+          otool -L out/SweetMetal2.bundle/HotMetal2 out/bin/vktest
+          ls -laR out
+
+      - name: Checksums
+        run: cd out && find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 > SHA256SUMS && cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweet-metal2
+          path: out/

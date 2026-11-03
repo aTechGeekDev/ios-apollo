@@ -18,3 +18,8 @@ sweet-userland/
 sweet-audio/
 sweet-bt/
 sweet-metal/
+# the Metal-on-Vulkan build's fetched sources and outputs (userland/metal2), and downloaded artifacts
+work/
+sweet-metal2/
+userland/metal2/metal2/out/
+userland/metal2/turnip/out/

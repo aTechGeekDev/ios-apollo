@@ -1,0 +1,3 @@
+#!/bin/sh
+# clang for iOS 16 arm64 (IOS-26-Hot's work/userland/bin/ios-cc, MIT)
+exec "$(xcrun -f clang)" -arch arm64 -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" -miphoneos-version-min=16.0 "$@"
