@@ -1,0 +1,10 @@
+# Turnip (Mesa's Vulkan driver, darwin kernel backend) on the Adreno 650 through the kernel's NativeAdreno user client
+# (xnu 0170, boot-arg sweetmtl=1: SweetAcceleratorVK): vktest once, 90 s after configd starts. Its lines (PASS/FAIL per
+# step: device info, buffer fill + copy, a compute shader compiled on the phone, a triangle read back) go to /dev/null:
+# put vktest in boot-arg sweetnull. One boot; the files stay on the root, the run file is used up.
+# Downloads first: the kernel (xnu run with 0170), sweet-metal2 (metal2.yml) and sweet-metal (metal.yml: libsweet-fix
+# with the run file).
+/usr/local/bin/vktest=sweet-metal2/bin/vktest 0:0:0755
+/usr/local/lib/libvulkan_freedreno.dylib=sweet-metal2/lib/libvulkan_freedreno.dylib 0:0:0755
+/usr/local/lib/libsweet-fix.dylib=sweet-metal/lib/libsweet-fix.dylib 0:0:0755
+/private/var/sweet-metal/run=tools/root-files/vktest-run 0:0:0644

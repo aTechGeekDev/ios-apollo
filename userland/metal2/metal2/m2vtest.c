@@ -42,6 +42,9 @@ static void mark(uint32_t m)
 
 int main(int argc, char **argv)
 {
+	/* sweet (ios-apollo): line by line, so that the kernel's copy of /dev/null (boot-arg sweetnull) keeps every line
+	 * before a crash or a hang */
+	setvbuf(stdout, NULL, _IOLBF, 0);
 	const char *lib = argc > 1 ? argv[1] : "/var/local/lib/libvulkan_freedreno.dylib";
 	const char *cache = argc > 2 ? argv[2] : "/var/local/m2v-cache";
 	const char *qc = argc > 3 ? argv[3] : "/System/Library/Frameworks/QuartzCore.framework/default.metallib";

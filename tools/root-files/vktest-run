@@ -1,0 +1,4 @@
+# libsweet-fix (configd) reads this once and removes it: Turnip's smoke test, after the GPU is kept on
+delay 90
+env TU_DARWIN_SERVICE=SweetAcceleratorVK
+/usr/local/bin/vktest /usr/local/lib/libvulkan_freedreno.dylib

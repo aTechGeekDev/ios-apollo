@@ -39,6 +39,7 @@
 #include <sys/syscall.h>
 #include <sys/stat.h>
 #include <spawn.h>
+#include <pthread.h>
 
 typedef void (*setter_fn)(id, SEL, id);
 
@@ -408,23 +409,16 @@ fix_start_jb_installer(void)
  * its 60 s wait; boots 106-107 lost the jailbreak installer's console lines the same way). SWEET_METAL_DELAY: the
  * probe waits that long first, so that the boot has settled before it takes the GPU.
  */
+/* One program, detached in its own session, its output on /dev/null (the kernel's sweetnull copy), logged to the console */
 static void
-fix_start_metal_probe(void)
+fix_spawn_once(char *const argv[], char *const env[], const char *what)
 {
-	static char *const argv[] = { "/usr/local/bin/sweet-metal", NULL };
-	static char *const env[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "SWEET_METAL_DELAY=60", "SWEET_METAL_WAIT=180", NULL };
-	static const char marker[] = "/private/var/sweet-metal/once";
 	posix_spawn_file_actions_t files;
 	posix_spawnattr_t attr;
-	struct stat st;
 	pid_t pid;
 	int err, con;
-	char line[200];
+	char line[256];
 
-	if (stat(marker, &st) != 0 || stat(argv[0], &st) != 0) {
-		return;
-	}
-	(void)unlink(marker);
 	posix_spawn_file_actions_init(&files);
 	posix_spawn_file_actions_addopen(&files, 0, "/dev/null", O_RDONLY, 0);
 	posix_spawn_file_actions_addopen(&files, 1, "/dev/null", O_WRONLY, 0);
@@ -436,10 +430,99 @@ fix_start_metal_probe(void)
 	posix_spawn_file_actions_destroy(&files);
 	con = open("/dev/console", O_WRONLY | O_NOCTTY | O_NONBLOCK);
 	if (con >= 0) {
-		snprintf(line, sizeof(line), "sweet-fix: %s: metal probe %s (pid %d, error %d)\n", getprogname(),
+		snprintf(line, sizeof(line), "sweet-fix: %s: %s %s %s (pid %d, error %d)\n", getprogname(), what, argv[0],
 		    err == 0 ? "started" : "NOT started", err == 0 ? pid : -1, err);
 		(void)write(con, line, strlen(line));
 		close(con);
+	}
+}
+
+/*
+ * (Metal) In configd: run userland/metal's probe (sweet-metal = hakios-metal-probe) once, when the boot image put it
+ * on the root with its marker (tools/root-files/metal-probe.txt). The marker is removed before the start, so the probe
+ * runs in this boot only, whatever happens to it. Its output goes to /dev/null, which the kernel copies into its log
+ * for the programs named in boot-arg sweetnull (xnu 0048): `sweetnull=...,sweet-metal`. Not the console: boot 110
+ * showed /dev/console reaching the log only early in the boot (the probe's first line came through, nothing after
+ * its 60 s wait; boots 106-107 lost the jailbreak installer's console lines the same way). SWEET_METAL_DELAY: the
+ * probe waits that long first, so that the boot has settled before it takes the GPU.
+ *
+ * And any one program the boot image asks for (tools/root-files/vktest.txt and the like): /private/var/sweet-metal/run
+ * holds lines "env KEY=VALUE", "delay SECONDS" and one command line "PROGRAM ARG ..." (blanks between words, '#'
+ * comments); the file is removed first and the program started once, the same way (its name in sweetnull for its
+ * output), after the delay (a thread of configd's sleeps: configd starts long before the GPU is kept on).
+ */
+static char *run_argv[17], *run_env[17] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL };
+static unsigned run_delay;
+
+static void *
+fix_run_later(void *unused)
+{
+	(void)unused;
+	sleep(run_delay);
+	fix_spawn_once(run_argv, run_env, "run file:");
+	return NULL;
+}
+
+static void
+fix_start_metal_probe(void)
+{
+	static char *const argv[] = { "/usr/local/bin/sweet-metal", NULL };
+	static char *const env[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "SWEET_METAL_DELAY=60", "SWEET_METAL_WAIT=180", NULL };
+	static const char marker[] = "/private/var/sweet-metal/once", runfile[] = "/private/var/sweet-metal/run";
+	struct stat st;
+	int rf;
+
+	if (stat(marker, &st) == 0 && stat(argv[0], &st) == 0) {
+		(void)unlink(marker);
+		fix_spawn_once(argv, env, "metal probe");
+	}
+	rf = open(runfile, O_RDONLY);
+	if (rf >= 0) {
+		static char text[1024];
+		char **rargv = run_argv, **renv = run_env;
+		unsigned na = 0, ne = 1;
+		ssize_t n = read(rf, text, sizeof(text) - 1);
+
+		close(rf);
+		(void)unlink(runfile);
+		text[n > 0 ? n : 0] = '\0';
+		for (char *l = text, *next; l != NULL && *l != '\0'; l = next) {
+			next = strchr(l, '\n');
+			if (next != NULL) {
+				*next++ = '\0';
+			}
+			while (*l == ' ' || *l == '\t') {
+				l++;
+			}
+			if (*l == '#' || *l == '\0') {
+				continue;
+			}
+			if (strncmp(l, "delay ", 6) == 0) {
+				run_delay = (unsigned)strtoul(l + 6, NULL, 10);
+				continue;
+			}
+			if (strncmp(l, "env ", 4) == 0) {
+				if (ne < 16) {
+					renv[ne++] = l + 4;
+				}
+				continue;
+			}
+			if (na != 0) {
+				continue;       /* one command line */
+			}
+			for (char *t = strtok(l, " \t"); t != NULL && na < 16; t = strtok(NULL, " \t")) {
+				rargv[na++] = t;
+			}
+		}
+		if (na != 0 && stat(rargv[0], &st) == 0) {
+			pthread_t t;
+
+			if (run_delay == 0 || pthread_create(&t, NULL, fix_run_later, NULL) != 0) {
+				fix_spawn_once(rargv, renv, "run file:");
+			} else {
+				pthread_detach(t);
+			}
+		}
 	}
 }
 
