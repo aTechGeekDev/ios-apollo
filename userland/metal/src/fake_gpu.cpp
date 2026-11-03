@@ -1403,6 +1403,10 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
         // bins of the targets written apart -- gmemSpans, checked below; a sysmem draw has none)
         if (inTile_) {
             gmemSpans[t][0] = reg(regRbMrt(REG_A6XX_RB_MRT_BASE_GMEM, t));
+            // (sweet: where turnip may start an attachment's share, 8 * tile_align_w * tile_align_h; boot 111 hung on 0x88000)
+            if (gmemSpans[t][0] % kGmemBaseAlign != 0) {
+                fault("RB_MRT_BASE_GMEM[" + which + "] " + text("is %#llx: ", gmemSpans[t][0]) + text("not a multiple of %#llx (turnip's gmem_align)", kGmemBaseAlign));
+            }
             gmemSpans[t][1] = gmemSpans[t][0] + uint64_t(binW) * binH * bpp;
         } else if (reg(regRbMrt(REG_A6XX_RB_MRT_BASE_GMEM, t)) != 0) {
             fault("RB_MRT_BASE_GMEM[" + which + "] " + text("is %#llx: a sysmem draw has no GMEM base", reg(regRbMrt(REG_A6XX_RB_MRT_BASE_GMEM, t))));

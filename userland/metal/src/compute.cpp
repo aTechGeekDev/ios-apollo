@@ -401,6 +401,12 @@ bool encodeAny(pm4::Stream& stream, const Kernel& k, const uint32_t groups[3], u
     }
 
     // --- nothing is refused from here on: the stream, in computerator's order ---
+    // sweet: on the A650 the caches are invalidated before the state loads below read the table (a6xx.hpp
+    // kInvalidateBeforeStateLoads), as a Gallium batch begins; the invalidate before the dispatch stays as it was
+    if (kInvalidateBeforeStateLoads && o.invalidate) {
+        event(stream, CACHE_INVALIDATE);
+        stream.waitForIdle();
+    }
     if (o.prelude) {
         reg(stream, REG_A6XX_SP_MODE_CONTROL, A6XX_SP_MODE_CONTROL_CONSTANT_DEMOTION_ENABLE | A6XX_SP_MODE_CONTROL_ISAMMODE(ISAMMODE_GL));
         reg(stream, REG_A6XX_SP_PERFCTR_ENABLE, A6XX_SP_PERFCTR_ENABLE_CS);

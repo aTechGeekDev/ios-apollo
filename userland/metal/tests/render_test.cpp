@@ -815,7 +815,7 @@ TEST(render_encodes_the_first_triangles_registers) {
     CHECK_EQ(e.reg(REG_A6XX_GRAS_SU_POINT_MINMAX), 0xffc00001u);
     CHECK_EQ(e.reg(REG_A6XX_GRAS_SU_POINT_SIZE), 0x10u);
     CHECK_EQ(e.reg(REG_A6XX_GRAS_SU_POLY_OFFSET_OFFSET_CLAMP), 0u);
-    CHECK_EQ(e.reg(REG_A6XX_RB_UNKNOWN_8A30), 0u);
+    CHECK_EQ(e.reg(REG_A6XX_RB_UNKNOWN_8A30), CHIP(0u, Encoded::kNone));   // (sweet: gen4's shading-rate registers; none on the A650)
     CHECK_EQ(e.reg(REG_A6XX_GRAS_SC_CNTL), 2u);
     CHECK_EQ(e.reg(REG_A6XX_PC_PRIMITIVE_CNTL_0), 0u);
     // the viewport: offsets 32, x scale 32, y scale MINUS 32 (Metal's orientation: the probe's orientation line decides),
@@ -5466,9 +5466,10 @@ TEST(a_pass_of_two_attachments_in_gmem_loads_and_stores_those_drawn) {
         a.more[0].load = LoadAction::kLoad;
         render::GmemPlan p;
         CHECK(render::gmemPlan(a, &p, nullptr));
-        // (sweet: on the A650 the two halves of 0x114000, each a multiple of 16 KiB: 0x88000 and 0x8c000; 240 rows fit, 11 rows of 224)
+        // (sweet: on the A650 the two halves of 0x114000 on turnip's 12 KiB gmem_align: 0x8a000 each (boot 111 hung on 16 KiB's
+        // 0x88000); 240 rows fit, 11 rows of 224)
         CHECK(CHIP(p.binW == 576 && p.binH == 96 && p.base[0] == 0 && p.base[1] == 0x3c000 && p.room[0] == 0x3c000 && p.room[1] == 0x3c000,
-                   p.binW == 576 && p.binH == 224 && p.base[0] == 0 && p.base[1] == 0x88000 && p.room[0] == 0x88000 && p.room[1] == 0x8c000));
+                   p.binW == 576 && p.binH == 224 && p.base[0] == 0 && p.base[1] == 0x8a000 && p.room[0] == 0x8a000 && p.room[1] == 0x8a000));
         auto cb = r.queue->commandBuffer();
         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));

@@ -1973,10 +1973,12 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         reg(stream, REG_A6XX_VPC_UNKNOWN_9107, 0);
         regs(stream, REG_A6XX_GRAS_SU_POINT_MINMAX, {grasSuPointMinmax(1, 0xffc0), grasSuPointSize(16)});
         regs(stream, REG_A6XX_GRAS_SU_POLY_OFFSET_SCALE, {0, 0, 0});
-        reg(stream, REG_A6XX_RB_UNKNOWN_8A00, 0);
-        reg(stream, REG_A6XX_RB_UNKNOWN_8A10, 0);
-        reg(stream, REG_A6XX_RB_UNKNOWN_8A20, 0);
-        reg(stream, REG_A6XX_RB_UNKNOWN_8A30, 0);
+        if (kHasLegacyPipelineShadingRate) {   // (sweet: gen4 only; the A650 has none of the four)
+            reg(stream, REG_A6XX_RB_UNKNOWN_8A00, 0);
+            reg(stream, REG_A6XX_RB_UNKNOWN_8A10, 0);
+            reg(stream, REG_A6XX_RB_UNKNOWN_8A20, 0);
+            reg(stream, REG_A6XX_RB_UNKNOWN_8A30, 0);
+        }
         // a framebuffer fetch in raster order, as Metal's programmable blending reads: the rasterizer holds back a
         // fragment over one not yet written and flushes between them (turnip's rasterization_order_attachment_access,
         // tu_pipeline.cc:3351-3380 and 3955-3983: FLUSH_PER_OVERLAP_AND_OVERWRITE in sysmem, FLUSH_PER_OVERLAP in GMEM)
@@ -2195,17 +2197,19 @@ bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why) {
         }
         bytes += f.bytesPerPixel;
     }
-    // GMEM below the colour cache in shares by bytes a pixel, each 16 KiB aligned (bins of whole 32 x 16 granules fit
-    // their share whatever the bins' shape)
+    // GMEM below the colour cache in shares by bytes a pixel, each starting at a multiple of kGmemBaseAlign (upstream:
+    // 16 KiB; sweet: turnip's 8 * tile_align_w * tile_align_h on the A650, 12 KiB) so that bins of whole tile granules fit
+    // their share whatever the bins' shape
     GmemPlan p;
     uint32_t before = 0;
     for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
         const Attachment a = attachmentOf(pass, i);
         if (a.texture == nullptr) continue;
         p.bpp[i] = a.texture->info().bytesPerPixel;
-        p.base[i] = uint32_t(uint64_t(kGmemCcuColorOffset) * before / bytes) & ~0x3fffu;
+        const auto down = [](uint32_t v) { return v - v % kGmemBaseAlign; };
+        p.base[i] = down(uint32_t(uint64_t(kGmemCcuColorOffset) * before / bytes));
         before += p.bpp[i];
-        p.room[i] = (uint32_t(uint64_t(kGmemCcuColorOffset) * before / bytes) & ~0x3fffu) - p.base[i];
+        p.room[i] = down(uint32_t(uint64_t(kGmemCcuColorOffset) * before / bytes)) - p.base[i];
     }
     const uint32_t whole[4] = {0, 0, W - 1, H - 1};
     if (!gmemTiles(&p, whole)) return refuse(why, "a bin too wide for GMEM");

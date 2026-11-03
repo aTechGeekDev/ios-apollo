@@ -1445,6 +1445,11 @@ inline constexpr uint32_t kNumCcu = 2;                            // not-in-head
 // tiled rendering: the on-chip memory and the tile grid (a6xx_gen4 / adreno_7c3 in freedreno_devices.py)
 inline constexpr uint32_t kGmemBytes = 512 * 1024;                // not-in-headers: freedreno_devices.py adreno_7c3 gmem_size (Linux a6xx_gpu adreno_7c3 SZ_512K)
 inline constexpr uint32_t kTileAlignW = 32, kTileAlignH = 16;      // not-in-headers: freedreno_devices.py a6xx_gen4 tile_align_w/h
+// where an attachment's share of GMEM may start: upstream's own 16 KiB (a multiple of turnip's 8 * 32 * 16 = 4 KiB here)
+inline constexpr uint32_t kGmemBaseAlign = 0x4000;                // not-in-headers: hakios-metal's choice (render.cpp gmemPlan)
+inline constexpr bool kHasLegacyPipelineShadingRate = true;       // not-in-headers: freedreno_devices.py a6xx_gen4.has_legacy_pipeline_shading_rate
+// (computerator and the dispatch here load their state before the dispatch's CACHE_INVALIDATE; measured fine on the A635)
+inline constexpr bool kInvalidateBeforeStateLoads = false;
 #else
 // a6xx_gen3 sets has_early_preamble: fd6_emit_static_regs then resets SP_FS_CTRL_REG0 at every batch start, so that a
 // leftover EARLYPREAMBLE bit of another process's last draw is never run (kStaticStateEarlyPreamble below)
@@ -1454,6 +1459,18 @@ inline constexpr uint32_t kNumCcu = 3;                            // not-in-head
 // 0x120000); tiles 96 pixels wide (NOT a power of two: render.cpp's gmemTiles rounds with % and the fetch rule below)
 inline constexpr uint32_t kGmemBytes = 0x120000;                  // not-in-headers: Linux a650 gmem; sweet_gpu.c MSM_PARAM_GMEM_SIZE
 inline constexpr uint32_t kTileAlignW = 96, kTileAlignH = 16;      // not-in-headers: freedreno_devices.py GPUId(650) tile_align_w/h
+// sweet: where an attachment's share of GMEM may start. turnip lays attachments out in blocks of
+// 8 * tile_align_w * tile_align_h bytes (tu_pass.cc tu_render_pass_gmem_config: gmem_align, block_align_shift 3), 12 KiB
+// here (96 = 3 x 32: the three CCUs). Boot 111: upstream's 16 KiB put a second target at 0x88000, not a multiple of 12 KiB,
+// and every two-target GMEM pass hung (mrt; "GMEM pass shape"), while one target (base 0) and sysmem passes drew right.
+inline constexpr uint32_t kGmemBaseAlign = 8 * kTileAlignW * kTileAlignH;   // not-in-headers: tu_pass.cc gmem_align
+// a6xx_gen3 has no RB_UNKNOWN_8A00..8A30 (fd6_rasterizer.cc and tu_pipeline.cc write them only with this flag)
+inline constexpr bool kHasLegacyPipelineShadingRate = false;      // not-in-headers: freedreno_devices.py: a6xx_gen3 lacks has_legacy_pipeline_shading_rate
+// sweet: a dispatch's CP_LOAD_STATE6 loads (program, constants, IBO and texture descriptors, all from its table) come
+// after a CACHE_INVALIDATE here, as every Gallium batch begins (fd6_emit_restore), not only after them. Boot 111: a
+// dispatch whose table took memory another one had used read the old contents through the cache (fill_id_air over 64
+// groups wrote nothing; tex_fill's constant read 7 instead of 0x5678), and the same dispatch again was right.
+inline constexpr bool kInvalidateBeforeStateLoads = true;
 #endif
 // the border color table both TP base registers point at: Gallium's is FD6_MAX_BORDER_COLORS (256) entries of
 // sizeof(struct fd6_bcolor_entry) (128 bytes: 32 fp32/fp16/int words); zeros are a valid table (black, transparent)

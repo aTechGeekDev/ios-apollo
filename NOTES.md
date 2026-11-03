@@ -2,7 +2,7 @@
 
 ## Agent handoff / active work
 
-### >>> CURRENT BOOT COMMANDS (as of 2026-11-03; boot 110 = first probe boot, output lost; next: probe boot 111) <<<
+### >>> CURRENT BOOT COMMANDS (as of 2026-11-03; boot 111 = probe, 8 failures; next: probe boot 112 with the fixes) <<<
 
 Builds: kernel run 41216279299 (xnu through 0168, Xcode 16.0), userland run 41218791846, metal run 41655855519 (artifact sweet-metal).
 Run on the user's Kali PC from ~/ios-apollo on `main` (research/, shim/out, recovery/recovery.img and sweet-bt/ are local, not in git).
@@ -64,6 +64,17 @@ grep -a -E 'probe:|sweet-fix: configd: metal|SWEET GPU: kept|SweetGPU:' logs/apo
 ```
 
 User preference: give paste-ready commands at once, do not wait on CI (`gh run watch RUN -R $R --exit-status &&` in front when a build is pending); `[skip ci]` on notes-only commits.
+
+### >>> 🎉 BOOT 111 (2026-11-03, kernel 41657437961 = 0169, metal run 41658698582, no GL bridge, sweet-metal in sweetnull): THE METAL DRIVER RUNS ON THE ADRENO 650 -- 8 FAILURES OF ~250 CHECKS -> 2bf... fixes (see commit after this entry) <<<
+
+**Observed (the whole probe output reached the log):** `probe: GPU 650, chip id 0x6050002, 587 MHz, FAULTS 0`; blits (CP_MEMCPY 697 MB/s commit-to-fence; 16 MiB copy 22.58 GB/s), compute (precompiled A635 ir3 kernels: chains to 700 steps, fetch past the preload, private and threadgroup memory, pointer phis, indirect dispatch), textures/samplers in compute (every address mode, arrays, 3D, views, R8..RG32 copies), and draws: tri_flat/pair/orientation/top-left rule, vertex descriptors, Clear in six formats, six blend equations, FS textures (ASTC LDR/HDR, 3D, arrays, cube, cube arrays, 1D arrays, bicubic), depth (6 setups), shadow maps, MSAA 2/4 incl. 375x812, indexed/instanced, UBO/IBO vertex pulling, constant ranges at offsets, derivatives, halfs, null texture, 200 draws in one pass in **486 us of GPU time** (15702 us as 200 command buffers), framebuffer fetch (sysmem and GMEM), formats A8/R16F/RG16F/RG32F/BGR5A1/B5G6R5/R16Unorm, mips + generateMipmaps, rotations, GMEM vs sysmem byte-identical over 1125x2436 (single target), hardware binning, stencil, driver params, lines, points, occlusion, a 447-unit FS, VS textures, cull modes, indirect draws, IOSurface. **The precompiled A635 shaders all ran right on the A650** (the gen3/gen4 ISA worry did not materialize in these kernels).
+**The 8 FAILs and their causes (from the code; fixed in the next commit, to confirm in boot 112):**
+1-2. `fill_id_air over 64 groups`: nothing written, completed, no hang; `tex_fill R32Uint 64x32 c=0x5678`: every pixel 7 -- and the same dispatches again (controls) right. Cause (inferred): compute.cpp issues its CP_LOAD_STATE6 loads (program, constants, IBO/texture descriptors from the dispatch's table) BEFORE its CACHE_INVALIDATE, so a table at an address used before was read stale through the cache; the draw path invalidates first (Gallium's batch start) and had no such failure. Fix: `kInvalidateBeforeStateLoads` (A650): CACHE_INVALIDATE + WFI before the loads.
+3-4, 7. `mrt, the pair into two targets` (target 0 right, target 1 untouched), `mrt, [[color(1)]] written alone`, `GMEM pass shape` (two 1125x2436 targets: GMEM hung, sysmem 436/483 us): every TWO-TARGET GMEM pass hung (kernel: no answer, 0 or 1809 words to go; 0163 recovered each, recoveries 1-7). Cause (inferred): gmemPlan put attachment 1 at a 16 KiB multiple (0x88000) while turnip lays GMEM out in blocks of 8 * tile_align_w * tile_align_h = 12 KiB on the A650 (96 = 3 x 32: three CCUs); 0x88000 is not a 12 KiB multiple (target 0 at base 0 always is). Fix: `kGmemBaseAlign` = 12 KiB (A650), the fake GPU faults a misaligned RB_MRT_BASE_GMEM.
+5-6. `GMEM: 5 blended triangles ... in 12 tiles: 0 pixels differ` and `framebuffer fetch 4 times ... in 12 tiles: 0 pixels differ`: correct results judged against upstream's literal 24 tiles (A635's 512 KiB GMEM). Fix: the probe takes the tile count from the plan.
+8. `ycbcr: a YCbCr8_420_2P texture over the surface`: the IOSurface's chroma plane reported rows of 0 bytes -- our kernel's IOSurface stand-in (SweetSurface) gives no per-plane bytes-per-row for a two-plane surface. Not the Metal driver's; open (kernel).
+**Also changed:** RB_UNKNOWN_8A00..8A30 written only with has_legacy_pipeline_shading_rate (gen4; Mesa writes none on the A650).
+**The UI** (software, no bridge) kept working during the probe (user: no complaint this time).
 
 ### >>> BOOT 110 (2026-11-03, kernel 41216279299, metal run 41655855519 via metal-probe.txt, GL bridge on): PROBE RAN, ITS OUTPUT LOST; GPU HUNG 8x, 0163 RECOVERED EACH; UI FROZE <<<
 
