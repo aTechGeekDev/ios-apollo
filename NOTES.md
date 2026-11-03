@@ -2,6 +2,68 @@
 
 ## Agent handoff / active work
 
+### >>> CURRENT BOOT COMMANDS (as of 2026-11-03; boot 109 DONE: Sileo works; next: the Metal probe boot) <<<
+
+Builds: kernel run 41216279299 (xnu through 0168, Xcode 16.0), userland run 41218791846, metal run 41655855519 (artifact sweet-metal).
+Run on the user's Kali PC from ~/ios-apollo on `main` (research/, shim/out, recovery/recovery.img and sweet-bt/ are local, not in git).
+`--artwork-subtype 2556` stays on every boot (Dynamic Island).
+
+**Metal probe boot (next):** the everyday command with sweet-metal downloaded, `--files-from tools/root-files/metal-probe.txt`, and
+WITHOUT the sweet-userland libsweet-fix `--file` line (metal-probe.txt writes the newer libsweet-fix, which also starts the probe):
+
+```sh
+git pull && R=aTechGeekDev/ios-apollo &&
+rm -rf xnu/out sweet-userland sweet-metal &&
+gh run download 41216279299 -R $R -n xnu-kernel -D xnu/out &&
+gh run download 41218791846 -R $R -n sweet-userland -D sweet-userland &&
+gh run download 41655855519 -R $R -n sweet-metal -D sweet-metal &&
+python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --artwork-subtype 2556 \
+    --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
+    --gmu-fw research/apollo-gpu/a650_gmu.bin --sqe-fw research/apollo-gpu/a650_sqe.fw \
+    --zap-mdt research/apollo-gpu/a650_zap.mdt --zap-seg research/apollo-gpu/a650_zap.b02 \
+    --wifi-fw research/apollo-wifi --bt-fw research/apollo-bt \
+    --file /usr/local/lib/libsweet-gl.dylib=sweet-userland/lib/libsweet-gl.dylib \
+    --file /usr/local/lib/libsweet-bt.dylib=sweet-bt/lib/libsweet-bt.dylib \
+    --files-from tools/root-files/files.txt --files-from tools/root-files/bt-on.txt \
+    --files-from tools/root-files/metal-probe.txt &&
+python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/apollo.adt shim/out/payload.bin \
+    --cmdline 'debug=0xc serial=3 cpumask=0xf1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 sweetfb_noconsole=1 sweetfb_height=2502 sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetgpulevel=6 sweetwifi=12 apollo_audio=5 apollo_sound_gain=0 apollo_sound_below=80 apollo_mic=4 apollo_haptic=5 sweetbt=6 sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd;/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool sweetnull=backboardd,SpringBoard,bluetoothd,BlueTool,mediaserverd' &&
+shim/build.sh ../shim/out/payload.bin && fastboot boot shim/out/shim-boot.img
+```
+
+**Everyday boot:**
+
+```sh
+git pull && R=aTechGeekDev/ios-apollo &&
+rm -rf xnu/out sweet-userland &&
+gh run download 41216279299 -R $R -n xnu-kernel -D xnu/out &&
+gh run download 41218791846 -R $R -n sweet-userland -D sweet-userland &&
+python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --artwork-subtype 2556 \
+    --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
+    --gmu-fw research/apollo-gpu/a650_gmu.bin --sqe-fw research/apollo-gpu/a650_sqe.fw \
+    --zap-mdt research/apollo-gpu/a650_zap.mdt --zap-seg research/apollo-gpu/a650_zap.b02 \
+    --wifi-fw research/apollo-wifi --bt-fw research/apollo-bt \
+    --file /usr/local/lib/libsweet-gl.dylib=sweet-userland/lib/libsweet-gl.dylib \
+    --file /usr/local/lib/libsweet-fix.dylib=sweet-userland/lib/libsweet-fix.dylib \
+    --file /usr/local/lib/libsweet-bt.dylib=sweet-bt/lib/libsweet-bt.dylib \
+    --files-from tools/root-files/files.txt --files-from tools/root-files/bt-on.txt &&
+python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/apollo.adt shim/out/payload.bin \
+    --cmdline 'debug=0xc serial=3 cpumask=0xf1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 sweetfb_noconsole=1 sweetfb_height=2502 sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetgpulevel=6 sweetwifi=12 apollo_audio=5 apollo_sound_gain=0 apollo_sound_below=80 apollo_mic=4 apollo_haptic=5 sweetbt=6 sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd;/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool sweetnull=backboardd,SpringBoard,bluetoothd,BlueTool,mediaserverd' &&
+shim/build.sh ../shim/out/payload.bin && fastboot boot shim/out/shim-boot.img
+```
+
+Boot line is ~600 of 607 characters: add new injections as kernel built-ins (xnu 0162/0164/0168) or libsweet-fix starts (the probe), not on the cmdline.
+
+**Log pull (recovery):**
+
+```sh
+fastboot boot recovery/recovery.img && adb wait-for-recovery &&
+tools/sweet-log-pull.sh logs/apollo-bootNN.txt &&
+grep -a -E 'probe:|sweet-fix: configd: metal|SWEET GPU: kept|SweetGPU:' logs/apollo-bootNN.txt ; adb reboot bootloader
+```
+
+User preference: give paste-ready commands at once, do not wait on CI (`gh run watch RUN -R $R --exit-status &&` in front when a build is pending); `[skip ci]` on notes-only commits.
+
 ### >>> METAL PROBE BOOT (2026-11-03; user: "i wanna test metal"): tools/root-files/metal-probe.txt + artifact sweet-metal from metal run 41655855519 (a9840b8, ios green); NOT YET BOOTED <<<
 
 **How it runs:** libsweet-fix in configd (sweet_fix.c fix_start_metal_probe) starts /usr/local/bin/sweet-metal once when /private/var/sweet-metal/once exists (removed before the start), stdout+stderr on /dev/console (reaches the kernel log, as the jailbreak lines did: no sweetnull entry), env SWEET_METAL_DELAY=60 (the probe sleeps first) and SWEET_METAL_WAIT=180. metal-probe.txt puts the probe, the marker and the new libsweet-fix (artifact `sweet-metal`, metal.yml now builds libsweet-fix too, no Mesa rebuild) on the root for one boot. Same kernel 41216279299 (0169 not needed: FAULTS just reads 0), GPU kept on (`sweetgpu=22 sweetgpukeep=1`, already in the normal command). The bridge (libsweet-ca in backboardd) shares the GPU; if a probe hang freezes the UI, a second probe boot without the libsweet-ca group isolates it.
@@ -18,7 +80,7 @@
 **What:** hakios-metal (MIT; hakios's Metal driver: Metal's command model written straight as A6xx PM4 for compute, blits and sysmem/GMEM draws through the msm requests, no Mesa at run time; measured upstream on an Adreno 7c+ Gen 3 = A635, a6xx gen4) imported unchanged at upstream 9d52b51 (commit acfeafc), then ported to SweetGPU and our Adreno 650 (a6xx gen3). Full list: `userland/metal/SWEET.md`.
 **Port (observed facts from Mesa 25.0 freedreno_devices.py / tu_device.cc, read from github.com/mirror/mesa branch 25.0 = 25.0.0; archive.mesa3d.org and gitlab.freedesktop.org are blocked from the agent container):** transport opens `SweetGPU` (then `HakiosGPU`), IOKit calls declared in-file (no IOKit headers in Xcode's iOS SDK); chip block in a6xx.hpp: num_ccu 3 / 3 SP cores, no LPAC (HLSQ_CS_CTRL_REG1 + SP_CS_CNTL_0/1 copies not written), has_early_preamble (batch start writes SP_FS_CTRL_REG0 = 0, as fd6_emit_static_regs), GMEM 0x120000, tile_align_w 96 (gmemTiles no longer assumes a power of two; doubled to keep a bin row a multiple of 64 bytes, turnip's rule), A650 magic regs (PC_POWER_CNTL 2, TPL1_DBG_ECO_CNTL 0x01008000, UCHE_CLIENT_PF 4, SP_DBG_ECO_CNTL 0x01000000), RB_CCU_CNTL sysmem 0x18000000 / GMEM 0x8a400000 (static_asserts), fd_dev_id carries gpu_id 650 (Mesa's GPUId(650) row matches by GPU id). `-DHAKIOS_METAL_A635` builds upstream's chip.
 **Checked locally:** host tests (fake GPU) 259 tests, 0 failed checks for the A650; the same for -DHAKIOS_METAL_A635; and under ASan (A650). Tests use `CHIP(a635, a650)` for the chip literals (A650 values computed by hand from the formulas and matching the code: screen 1125x2436 BGRA8 in GMEM = 2 x 6 tiles of 576x416). The iOS build compiles only on CI (metal.yml, on pushes to claude/** and main).
-**Probe on the phone:** artifact `sweet-metal`, `bin/sweet-metal` (= hakios-metal-probe; waits up to 180 s for SweetGPU, `SWEET_METAL_WAIT`; stdout line-buffered). Install: `tools/sweet-root-add.sh sweet-metal/bin/sweet-metal com.sweet.metal` (recovery); boot with `sweetgpu=22 sweetgpukeep=1` and `sweet-metal` in `sweetnull` (boot line is near its 607-byte limit: drop something else if needed). Lines `probe: ok/FAIL ...`, last line the count.
+**Probe on the phone:** artifact `sweet-metal`, `bin/sweet-metal` (= hakios-metal-probe); started once by libsweet-fix in configd via tools/root-files/metal-probe.txt (see the probe boot section and the command above). Lines `probe: ok/FAIL ...`, last line the count.
 **xnu 0169 (`0169-apollo-gpu-faults-count.patch`):** SweetGPU's GET_PARAM FAULTS (0x09) = how many times sweet_gpu_recover() (0163) reset the core this boot (was always 0); the driver's command.cpp reads it to mark submissions a reset gave up. validate-repo 169 OK; not compiled (no CI run yet).
 **Guesses / risks:** the precompiled kernels in tests/fixtures are ir3 code compiled for chip 0x06030500 (gen4); gen3 lacks some instructions gen4 ir3 may emit (dp4acc, getfiberid, isam.v, SSBO imm offsets) -- a probe FAIL/hang in a stage should be checked against that first; regenerating needs a host Mesa build (tools/compiler.mk, MESA=1). The probe and backboardd's GL bridge share one GPU context: a probe hang may freeze the UI until 0163 recovers.
 **Next, in order:** (1) done: metal.yml green; (2) kernel run with 0169 (xnu.yml, after merging to main); (3) probe boot; (4) A650 fixtures + in-driver compiler (MESA=1 with hakios's AIR front end from github.com/oosexgang/hakios tools/mesa); (5) Metal plug-in (plugin/HakiosMetal.m) + SweetGPU registry properties so MTLCreateSystemDefaultDevice() finds it (hakios: boot-arg metal=1 + two properties on the service).
