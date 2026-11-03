@@ -16,3 +16,5 @@ logs/
 /*.bin
 sweet-userland/
 sweet-audio/
+sweet-bt/
+sweet-metal/
