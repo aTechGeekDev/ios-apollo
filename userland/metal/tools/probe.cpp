@@ -396,6 +396,16 @@ int main(int argc, char** argv) {
     // before it. And launchd starts the job at boot, before sweet_gpu.c has kept the GPU on and SweetGPU is there, so
     // it is waited for, as sweet-gpu-test does (SWEET_METAL_WAIT seconds, 180 by default; 0: not at all).
     setvbuf(stdout, nullptr, _IOLBF, 0);
+    setvbuf(stderr, nullptr, _IOLBF, 0);
+    // (SWEET_METAL_DELAY seconds first: started by libsweet-fix in configd early in the boot, the probe lets the
+    // boot and backboardd's GL bridge settle before it takes the GPU)
+    if (const char* delayEnv = getenv("SWEET_METAL_DELAY")) {
+        const int delay = atoi(delayEnv);
+        if (delay > 0) {
+            std::printf("probe: sweet-metal (hakios-metal-probe) waits %d s before it starts\n", delay);
+            sleep(unsigned(delay));
+        }
+    }
     std::string why;
     auto transport = openKernelGpu(&why);
     {

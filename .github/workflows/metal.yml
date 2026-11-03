@@ -5,7 +5,8 @@ name: metal
 #         (-DHAKIOS_METAL_A635, so upstream's measured literals keep being checked), and under AddressSanitizer
 #   ios:  hakios-metal-probe (the core on the phone's GPU: blits, compute, draws, each checked against its own rule)
 #         and libhakios-metal.a, built with Xcode's iPhoneOS SDK and ad-hoc signed. Artifact sweet-metal:
-#         bin/sweet-metal (= hakios-metal-probe), lib/libhakios-metal.a, SHA256SUMS. Without MESA=1: no compiler in the driver
+#         bin/sweet-metal (= hakios-metal-probe), lib/libhakios-metal.a, lib/libsweet-fix.dylib (starts the probe once:
+#         tools/root-files/metal-probe.txt), SHA256SUMS. Without MESA=1: no compiler in the driver
 #         (compiling AIR / .metallib refuses by name); the probe's own precompiled kernels run.
 # Apart from userland.yml so that a change here does not rebuild Mesa.
 on:
@@ -14,6 +15,7 @@ on:
     branches: [main, "claude/**"]
     paths:
       - "userland/metal/**"
+      - "userland/fix/**"
       - ".github/workflows/metal.yml"
 
 jobs:
@@ -55,6 +57,17 @@ jobs:
           codesign -s - -f ../../out/bin/sweet-metal
           file ../../out/bin/sweet-metal
           otool -L ../../out/bin/sweet-metal
+      # the run-time fixes the kernel inserts (as userland.yml builds it, without rebuilding Mesa): its configd half starts
+      # the probe once (tools/root-files/metal-probe.txt)
+      - name: Build libsweet-fix.dylib
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" \
+            -O2 -Wall -Wextra -Werror -dynamiclib -install_name /usr/local/lib/libsweet-fix.dylib \
+            -framework CoreFoundation -framework Foundation -framework Metal -lobjc -o out/lib/libsweet-fix.dylib userland/fix/sweet_fix.c
+          codesign -s - -f out/lib/libsweet-fix.dylib
+          otool -L out/lib/libsweet-fix.dylib
       - name: Checksums
         run: |
           cd out && find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 > SHA256SUMS && cat SHA256SUMS

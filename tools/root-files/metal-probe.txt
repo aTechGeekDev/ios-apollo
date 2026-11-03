@@ -1,0 +1,9 @@
+# The Metal driver's probe (userland/metal: hakios-metal ported to SweetGPU; .github/workflows/metal.yml, artifact
+# sweet-metal) run once on the phone's GPU, in this boot only: the probe, its one-shot marker, and the libsweet-fix that
+# starts it from configd (and does everything the earlier libsweet-fix did). Its lines ("probe: ok ..." /
+# "probe: FAIL ...", a last line with the count) reach the kernel's log through the console: no sweetnull entry.
+# Needs the GPU kept on (sweetgpu=22 sweetgpukeep=1). It waits 60 s after configd starts, then up to 180 s for SweetGPU.
+# Download first: gh run download RUN_ID -n sweet-metal -D sweet-metal
+/usr/local/bin/sweet-metal=sweet-metal/bin/sweet-metal 0:0:0755
+/usr/local/lib/libsweet-fix.dylib=sweet-metal/lib/libsweet-fix.dylib 0:0:0755
+/private/var/sweet-metal/once=tools/root-files/sweet-metal-once 0:0:0644

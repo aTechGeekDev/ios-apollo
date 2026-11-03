@@ -399,6 +399,48 @@ fix_start_jb_installer(void)
 	}
 }
 
+/*
+ * (Metal) In configd: run userland/metal's probe (sweet-metal = hakios-metal-probe) once, when the boot image put it
+ * on the root with its marker (tools/root-files/metal-probe.txt). The marker is removed before the start, so the probe
+ * runs in this boot only, whatever happens to it. Its output goes to the console, which reaches the kernel's log
+ * (as the jailbreak lines above do): no sweetnull entry needed. SWEET_METAL_DELAY: the probe waits that long first,
+ * so that the boot and the GL bridge have settled before it takes the GPU.
+ */
+static void
+fix_start_metal_probe(void)
+{
+	static char *const argv[] = { "/usr/local/bin/sweet-metal", NULL };
+	static char *const env[] = { "PATH=/usr/bin:/bin:/usr/sbin:/sbin", "SWEET_METAL_DELAY=60", "SWEET_METAL_WAIT=180", NULL };
+	static const char marker[] = "/private/var/sweet-metal/once";
+	posix_spawn_file_actions_t files;
+	posix_spawnattr_t attr;
+	struct stat st;
+	pid_t pid;
+	int err, con;
+	char line[200];
+
+	if (stat(marker, &st) != 0 || stat(argv[0], &st) != 0) {
+		return;
+	}
+	(void)unlink(marker);
+	posix_spawn_file_actions_init(&files);
+	posix_spawn_file_actions_addopen(&files, 0, "/dev/null", O_RDONLY, 0);
+	posix_spawn_file_actions_addopen(&files, 1, "/dev/console", O_WRONLY | O_NOCTTY, 0);
+	posix_spawn_file_actions_adddup2(&files, 1, 2);
+	posix_spawnattr_init(&attr);
+	posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+	err = posix_spawn(&pid, argv[0], &files, &attr, argv, env);
+	posix_spawnattr_destroy(&attr);
+	posix_spawn_file_actions_destroy(&files);
+	con = open("/dev/console", O_WRONLY | O_NOCTTY | O_NONBLOCK);
+	if (con >= 0) {
+		snprintf(line, sizeof(line), "sweet-fix: %s: metal probe %s (pid %d, error %d)\n", getprogname(),
+		    err == 0 ? "started" : "NOT started", err == 0 ? pid : -1, err);
+		(void)write(con, line, strlen(line));
+		close(con);
+	}
+}
+
 __attribute__((constructor))
 static void
 sweet_fix_init(void)
@@ -424,6 +466,9 @@ sweet_fix_init(void)
 
 		if (me != NULL && (strcmp(me, "configd") == 0 || strcmp(me, "usermanagerd") == 0)) {
 			fix_start_jb_installer();       /* configd first; usermanagerd as a second chance (the installer locks) */
+			if (strcmp(me, "configd") == 0) {
+				fix_start_metal_probe();
+			}
 		}
 		for (int i = 0; me != NULL && mirrored[i] != NULL; i++) {
 			if (strcmp(me, mirrored[i]) == 0) {

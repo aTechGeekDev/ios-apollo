@@ -2,10 +2,14 @@
 
 ## Agent handoff / active work
 
-### >>> NEXT ON THE PHONE: BOOT 109 = boot 108's command with `--files-from tools/root-files/jb-install.txt` replaced by `--files-from tools/root-files/sileo-system.txt` (one boot; same kernel 41216279299, same userland 41218791846: nothing to rebuild). Keep `--artwork-subtype 2556`. <<<
+### >>> METAL PROBE BOOT (2026-11-03; user: "i wanna test metal"): tools/root-files/metal-probe.txt, NOT YET BOOTED <<<
 
-**Re-checked 2026-11-03 (fresh agent, code read, nothing booted):** the kernel's move (xnu 0140, bsd/dev/sweet_files.c) accepts any absolute path without `..` (`sweet_file_allowed`), so `>/private/var/jb/Applications/Sileo.app=/Applications/Sileo.app` is carried out by the kernel as `renameat` before launchd (mkadt.py's prefix list, extended in 466b451, is the only gate). With bootstrap.tar.xz removed and /var/jb/Applications/Sileo.app gone, libsweet-fix in configd logs `done 1, archive 0` and does not start the installer (sweet_fix.c fix_start_jb_installer: returns when the archive is missing).
-**Look for in the log:** `SWEET FILES: /private/var/jb/Applications/Sileo.app -> /Applications/Sileo.app: moved`, the `SWEET FILES` lines removing the LaunchServices `*.csstore` files, `sweet-fix: configd[..]: jailbreak: done 1, archive 0, installer 1` and `/var/jb: dpkg 1, Sileo.app 0`; on the phone: a Sileo icon after the reseed. If the phone sticks at the logo (reseed deadlock, boot 48), boot again without the list. The Metal work below needs no boot until its probe (separate).
+**How it runs:** libsweet-fix in configd (sweet_fix.c fix_start_metal_probe) starts /usr/local/bin/sweet-metal once when /private/var/sweet-metal/once exists (removed before the start), stdout+stderr on /dev/console (reaches the kernel log, as the jailbreak lines did: no sweetnull entry), env SWEET_METAL_DELAY=60 (the probe sleeps first) and SWEET_METAL_WAIT=180. metal-probe.txt puts the probe, the marker and the new libsweet-fix (artifact `sweet-metal`, metal.yml now builds libsweet-fix too, no Mesa rebuild) on the root for one boot. Same kernel 41216279299 (0169 not needed: FAULTS just reads 0), GPU kept on (`sweetgpu=22 sweetgpukeep=1`, already in the normal command). The bridge (libsweet-ca in backboardd) shares the GPU; if a probe hang freezes the UI, a second probe boot without the libsweet-ca group isolates it.
+**Read back:** `grep -a -E 'probe:|sweet-fix: configd: metal|SWEET GPU: kept|SweetGPU:' logs/apollo-bootNN.txt`.
+
+### >>> 🎉 BOOT 109 (2026-11-03 report, kernel 41216279299, userland 41218791846 + sileo-system.txt): SILEO ON THE HOME SCREEN, OPENS AND WORKS (user); tweaks not tested yet <<<
+
+**Result:** the /Applications move + LaunchServices reseed registered Sileo (no log sent). Next for the jailbreak (later, user): tweaks (a tweak injector such as ElleKit). Keep sileo-system.txt out of later boots. dpkg's record still says /var/jb/Applications/Sileo.app: a Sileo upgrade through dpkg would put a second copy there.
 
 ### >>> METAL PORT STARTED (2026-11-03; user: "start porting https://github.com/oosexgang/hakios-metal into our repo"): userland/metal + xnu 0169; metal.yml run 41652342144 (a41d6aa): ios GREEN (artifact sweet-metal), host tests GREEN (A650, A635, ASan); kernel with 0169 NOT BUILT; NOT BOOTED <<<
 
