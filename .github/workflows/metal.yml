@@ -22,6 +22,10 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+      # (a checkout's file times are arbitrary: the precompiled fixtures must read as newer than the kernel sources,
+      # or make tries to regenerate them with Mesa's ir3 tools and llvm-as, which the runner does not have)
+      - name: Fixtures newer than their sources
+        run: touch userland/metal/tests/fixtures/*
       - name: Tests, Adreno 650
         working-directory: userland/metal
         run: make test -j4
@@ -37,6 +41,8 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+      - name: Fixtures newer than their sources
+        run: touch userland/metal/tests/fixtures/*
       - name: Build the probe and the library
         working-directory: userland/metal
         run: |

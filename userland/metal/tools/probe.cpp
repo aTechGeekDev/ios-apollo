@@ -1506,7 +1506,10 @@ int main(int argc, char** argv) {
                 const uint64_t words = t->buffer()->length() / 4;
                 for (uint64_t i = 0; i < words; i++) w[i] = canary;
                 const uint32_t groups[3] = {W / 8, H / 2, D - 1}, local82[3] = {8, 2, 1};
-                auto cb = runTex(is3d ? kernels::tex_fill_3d_air : kernels::tex_fill_arr_air, groups, local82, Bindings{{}, {t.get()}});
+                // (sweet: every field named: Xcode's clang -Werror refuses the partly initialised aggregate)
+                Bindings tb;
+                tb.textures = {t.get()};
+                auto cb = runTex(is3d ? kernels::tex_fill_3d_air : kernels::tex_fill_arr_air, groups, local82, tb);
                 uint32_t right = 0, covered = 0, leftCanary = 0, left = 0, gapCanary = 0, gap = 0;
                 const uint64_t slice = t->sliceBytes(), row = t->bytesPerRow();
                 for (uint32_t z = 0; z < D; z++) {

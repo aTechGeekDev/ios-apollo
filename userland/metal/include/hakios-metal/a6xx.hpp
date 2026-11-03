@@ -4021,7 +4021,9 @@ constexpr uint32_t regVfdDestCntlInstr(uint32_t i) { return REG_A6XX_VFD_DEST_CN
 // by 2^23 (exact: a float has 24 significant bits). A finite value round-trips exactly (tests/a6xx_test.cpp holds it
 // to memcpy); NaN gives the quiet NaN, an infinity 0x7f800000 with its sign.
 constexpr uint32_t fui(float f) {
-    uint32_t sign = __builtin_signbit(f) ? 0x80000000u : 0u;
+    // sweet: copysign, not __builtin_signbit: Xcode 16's clang does not evaluate signbit in a constant expression
+    // (-Winvalid-constexpr, an error); copysign it does, as GCC does, and -0.0 still gives the sign bit
+    uint32_t sign = __builtin_copysign(1.0f, f) < 0.0f ? 0x80000000u : 0u;
     if (f != f) {
         return 0x7fc00000u;
     }
