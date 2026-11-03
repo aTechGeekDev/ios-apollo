@@ -10,7 +10,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
 WORK=${METAL2_WORK:-$ROOT/work/metal2}
 MESA_COMMIT=85fda3b36405bcaea8bffc64aa4f2651dc90770d
-UNIXNU_COMMIT=c1ecc5b74c9dc4ced13bcfbd81a2c3998025a5e5
+UNIXNU_COMMIT=cd1b9757fd5d730bf85aabb37a4bce729ede9e58   # 2026-10-26: the NativeAdreno ABI v1 that IOS-26-Hot's turnip/NativeAdrenoABI.h is (UniXNU changed it on 10-28: SetPriority, Note, OwnedCoherent)
 M2V_COMMIT=720ef1ce9ae2a2068999a8675717418b9416283e
 mkdir -p "$WORK"
 

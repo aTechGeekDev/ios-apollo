@@ -15,7 +15,7 @@ the kernel's NativeAdreno user client (`turnip/NativeAdrenoABI.h`).
 | `turnip/` (NativeAdrenoABI.h, vktest.c, v2test.cpp, shaders/, patches/) | IOS-26-Hot `phone/turnip` at d249939b, unchanged | MIT |
 | `build-turnip-ios.sh`, `build-m2v-bridge.sh`, `ios-cc`, `*/build.sh` | IOS-26-Hot's `tools/` and build scripts, paths changed for this repository | MIT |
 | Mesa (Turnip) | gitlab.freedesktop.org/mesa/mesa 85fda3b3, fetched by `fetch-sources.sh` | MIT |
-| UniXNU's Mesa patches (the darwin kernel backend `tu_knl_darwin.cc` and Turnip fixes) | github.com/UniXNU/UniXNU c1ecc5b7, `patches/mesa`, in `scripts/data/adreno-compiler-inputs.json` order | BSD-2-Clause-Patent |
+| UniXNU's Mesa patches (the darwin kernel backend `tu_knl_darwin.cc` and Turnip fixes) | github.com/UniXNU/UniXNU cd1b9757, `patches/mesa`, in `scripts/data/adreno-compiler-inputs.json` order | BSD-2-Clause-Patent |
 | metal2vulkan | github.com/steelbrain/metal2vulkan 720ef1ce + `metal2/bridge/patches` | see the project |
 
 IOS-26-Hot's kernel series for iOS 16 (`xnu/patches`, xnu-8796.141.3) shares this repository's 0001-0081 (the ios-sweet
