@@ -11,14 +11,14 @@ Run on the user's Kali PC from ~/ios-apollo on `main` (research/, shim/out, reco
 **Metal probe boot (next, 111):** NO GL bridge (libsweet-ca dropped from sweetinject: software UI, the probe is the GPU's only
 client, and room on the boot line), `sweet-metal` added to sweetnull (its output goes to /dev/null now: see boot 110),
 `--files-from tools/root-files/metal-probe.txt`, no sweet-userland download (libsweet-fix comes from sweet-metal), kernel with 0169
-(xnu run 41657437961: FAULTS counts resets). METAL_RUN = the metal.yml run of the commit that made libsweet-fix write to /dev/null.
+(xnu run 41657437961: FAULTS counts resets). metal run 41658698582 (098a449: libsweet-fix gives the probe /dev/null).
 
 ```sh
 git pull && R=aTechGeekDev/ios-apollo &&
-gh run watch 41657437961 -R $R --exit-status && gh run watch METAL_RUN -R $R --exit-status &&
+gh run watch 41657437961 -R $R --exit-status && gh run watch 41658698582 -R $R --exit-status &&
 rm -rf xnu/out sweet-metal &&
 gh run download 41657437961 -R $R -n xnu-kernel -D xnu/out &&
-gh run download METAL_RUN -R $R -n sweet-metal -D sweet-metal &&
+gh run download 41658698582 -R $R -n sweet-metal -D sweet-metal &&
 python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --artwork-subtype 2556 \
     --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
     --gmu-fw research/apollo-gpu/a650_gmu.bin --sqe-fw research/apollo-gpu/a650_sqe.fw \
