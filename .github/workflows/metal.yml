@@ -12,7 +12,7 @@ name: metal
 on:
   workflow_dispatch:
   push:
-    branches: [main, "claude/**"]
+    branches: [main]
     paths:
       - "userland/metal/**"
       - "userland/fix/**"

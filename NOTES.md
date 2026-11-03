@@ -8,17 +8,17 @@ Builds: kernel run 41216279299 (xnu through 0168, Xcode 16.0), userland run 4121
 Run on the user's Kali PC from ~/ios-apollo on `main` (research/, shim/out, recovery/recovery.img and sweet-bt/ are local, not in git).
 `--artwork-subtype 2556` stays on every boot (Dynamic Island).
 
-**Metal probe boot (next, 111):** NO GL bridge (libsweet-ca dropped from sweetinject: software UI, the probe is the GPU's only
+**Metal probe boot (next, 112: the boot 111 fixes):** NO GL bridge (libsweet-ca dropped from sweetinject: software UI, the probe is the GPU's only
 client, and room on the boot line), `sweet-metal` added to sweetnull (its output goes to /dev/null now: see boot 110),
 `--files-from tools/root-files/metal-probe.txt`, no sweet-userland download (libsweet-fix comes from sweet-metal), kernel with 0169
-(xnu run 41657437961: FAULTS counts resets). metal run 41658698582 (098a449: libsweet-fix gives the probe /dev/null).
+(xnu run 41657437961: FAULTS counts resets). metal run 41664647955 (258b947: the boot 111 fixes).
 
 ```sh
 git pull && R=aTechGeekDev/ios-apollo &&
-gh run watch 41657437961 -R $R --exit-status && gh run watch 41658698582 -R $R --exit-status &&
+gh run watch 41657437961 -R $R --exit-status && gh run watch 41664647955 -R $R --exit-status &&
 rm -rf xnu/out sweet-metal &&
 gh run download 41657437961 -R $R -n xnu-kernel -D xnu/out &&
-gh run download 41658698582 -R $R -n sweet-metal -D sweet-metal &&
+gh run download 41664647955 -R $R -n sweet-metal -D sweet-metal &&
 python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --artwork-subtype 2556 \
     --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
     --gmu-fw research/apollo-gpu/a650_gmu.bin --sqe-fw research/apollo-gpu/a650_sqe.fw \
@@ -65,7 +65,7 @@ grep -a -E 'probe:|sweet-fix: configd: metal|SWEET GPU: kept|SweetGPU:' logs/apo
 
 User preference: give paste-ready commands at once, do not wait on CI (`gh run watch RUN -R $R --exit-status &&` in front when a build is pending); `[skip ci]` on notes-only commits.
 
-### >>> 🎉 BOOT 111 (2026-11-03, kernel 41657437961 = 0169, metal run 41658698582, no GL bridge, sweet-metal in sweetnull): THE METAL DRIVER RUNS ON THE ADRENO 650 -- 8 FAILURES OF ~250 CHECKS -> 2bf... fixes (see commit after this entry) <<<
+### >>> 🎉 BOOT 111 (2026-11-03, kernel 41657437961 = 0169, metal run 41658698582, no GL bridge, sweet-metal in sweetnull): THE METAL DRIVER RUNS ON THE ADRENO 650 -- 8 FAILURES OF ~250 CHECKS -> fixes in 258b947 (metal run 41664647955) <<<
 
 **Observed (the whole probe output reached the log):** `probe: GPU 650, chip id 0x6050002, 587 MHz, FAULTS 0`; blits (CP_MEMCPY 697 MB/s commit-to-fence; 16 MiB copy 22.58 GB/s), compute (precompiled A635 ir3 kernels: chains to 700 steps, fetch past the preload, private and threadgroup memory, pointer phis, indirect dispatch), textures/samplers in compute (every address mode, arrays, 3D, views, R8..RG32 copies), and draws: tri_flat/pair/orientation/top-left rule, vertex descriptors, Clear in six formats, six blend equations, FS textures (ASTC LDR/HDR, 3D, arrays, cube, cube arrays, 1D arrays, bicubic), depth (6 setups), shadow maps, MSAA 2/4 incl. 375x812, indexed/instanced, UBO/IBO vertex pulling, constant ranges at offsets, derivatives, halfs, null texture, 200 draws in one pass in **486 us of GPU time** (15702 us as 200 command buffers), framebuffer fetch (sysmem and GMEM), formats A8/R16F/RG16F/RG32F/BGR5A1/B5G6R5/R16Unorm, mips + generateMipmaps, rotations, GMEM vs sysmem byte-identical over 1125x2436 (single target), hardware binning, stencil, driver params, lines, points, occlusion, a 447-unit FS, VS textures, cull modes, indirect draws, IOSurface. **The precompiled A635 shaders all ran right on the A650** (the gen3/gen4 ISA worry did not materialize in these kernels).
 **The 8 FAILs and their causes (from the code; fixed in the next commit, to confirm in boot 112):**
