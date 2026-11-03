@@ -2,6 +2,11 @@
 
 ## Agent handoff / active work
 
+### >>> NEXT ON THE PHONE: BOOT 109 = boot 108's command with `--files-from tools/root-files/jb-install.txt` replaced by `--files-from tools/root-files/sileo-system.txt` (one boot; same kernel 41216279299, same userland 41218791846: nothing to rebuild). Keep `--artwork-subtype 2556`. <<<
+
+**Re-checked 2026-11-03 (fresh agent, code read, nothing booted):** the kernel's move (xnu 0140, bsd/dev/sweet_files.c) accepts any absolute path without `..` (`sweet_file_allowed`), so `>/private/var/jb/Applications/Sileo.app=/Applications/Sileo.app` is carried out by the kernel as `renameat` before launchd (mkadt.py's prefix list, extended in 466b451, is the only gate). With bootstrap.tar.xz removed and /var/jb/Applications/Sileo.app gone, libsweet-fix in configd logs `done 1, archive 0` and does not start the installer (sweet_fix.c fix_start_jb_installer: returns when the archive is missing).
+**Look for in the log:** `SWEET FILES: /private/var/jb/Applications/Sileo.app -> /Applications/Sileo.app: moved`, the `SWEET FILES` lines removing the LaunchServices `*.csstore` files, `sweet-fix: configd[..]: jailbreak: done 1, archive 0, installer 1` and `/var/jb: dpkg 1, Sileo.app 0`; on the phone: a Sileo icon after the reseed. If the phone sticks at the logo (reseed deadlock, boot 48), boot again without the list. The Metal work below needs no boot until its probe (separate).
+
 ### >>> METAL PORT STARTED (2026-11-03; user: "start porting https://github.com/oosexgang/hakios-metal into our repo"): userland/metal + xnu 0169; metal.yml run 41652342144 (a41d6aa): ios GREEN (artifact sweet-metal), host tests GREEN (A650, A635, ASan); kernel with 0169 NOT BUILT; NOT BOOTED <<<
 
 **CI:** run 41651201633 (f38ba1e) failed at once: the checkout's file times made make regenerate tests/fixtures (no ir3 tools / llvm-as on the runner), and Xcode 16.4's clang refused upstream's constexpr fui() (`__builtin_signbit`, -Winvalid-constexpr) -- fixed in a41d6aa (touch fixtures; copysign; one probe aggregate clang -Werror refused). Run **41652342144**: ios job green, artifact `sweet-metal` (bin/sweet-metal sha256 f6829f8b..., lib/libhakios-metal.a); host: A650 tests, A635 tests and A650 under ASan all green. The xnu kernel (0169) has not been built: xnu.yml runs on main only.
