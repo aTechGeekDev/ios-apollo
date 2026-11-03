@@ -2,6 +2,46 @@
 
 ## Agent handoff / active work
 
+### >>> CURRENT BOOT COMMANDS (as of 2026-11-03; boot 109 NOT YET RUN) <<<
+
+Builds: kernel run 41216279299 (xnu through 0168, Xcode 16.0), userland run 41218791846. Run on the user's Kali PC from ~/ios-apollo
+(research/, shim/out, recovery/recovery.img and sweet-bt/ are local, not in git). `--artwork-subtype 2556` stays on every boot (Dynamic Island).
+**Boot 109** = the boot 108 command with `jb-install.txt` replaced by `sileo-system.txt` (one boot only: Sileo.app -> /Applications + LaunchServices rebuild):
+
+```sh
+git pull && R=aTechGeekDev/ios-apollo &&
+rm -rf xnu/out sweet-userland &&
+gh run download 41216279299 -R $R -n xnu-kernel -D xnu/out &&
+gh run download 41218791846 -R $R -n sweet-userland -D sweet-userland &&
+python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --artwork-subtype 2556 \
+    --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
+    --gmu-fw research/apollo-gpu/a650_gmu.bin --sqe-fw research/apollo-gpu/a650_sqe.fw \
+    --zap-mdt research/apollo-gpu/a650_zap.mdt --zap-seg research/apollo-gpu/a650_zap.b02 \
+    --wifi-fw research/apollo-wifi --bt-fw research/apollo-bt \
+    --file /usr/local/lib/libsweet-gl.dylib=sweet-userland/lib/libsweet-gl.dylib \
+    --file /usr/local/lib/libsweet-fix.dylib=sweet-userland/lib/libsweet-fix.dylib \
+    --file /usr/local/lib/libsweet-bt.dylib=sweet-bt/lib/libsweet-bt.dylib \
+    --files-from tools/root-files/files.txt --files-from tools/root-files/bt-on.txt \
+    --files-from tools/root-files/sileo-system.txt &&
+python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/apollo.adt shim/out/payload.bin \
+    --cmdline 'debug=0xc serial=3 cpumask=0xf1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 sweetfb_noconsole=1 sweetfb_height=2502 sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetgpulevel=6 sweetwifi=12 apollo_audio=5 apollo_sound_gain=0 apollo_sound_below=80 apollo_mic=4 apollo_haptic=5 sweetbt=6 sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd;/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool sweetnull=backboardd,SpringBoard,bluetoothd,BlueTool,mediaserverd' &&
+shim/build.sh ../shim/out/payload.bin && fastboot boot shim/out/shim-boot.img
+```
+
+**Everyday boot (after 109):** the same command without the `--files-from tools/root-files/sileo-system.txt` line.
+Boot line is ~600 of 607 characters: add new injections as kernel built-ins (xnu 0162/0164/0168), not on the cmdline.
+
+**Log pull (recovery):**
+
+```sh
+fastboot boot recovery/recovery.img && adb wait-for-recovery &&
+tools/sweet-log-pull.sh logs/apollo-boot109.txt &&
+grep -a -E 'SWEET FILES|sweet-fix: [a-z]+(\[|:)|Sileo' logs/apollo-boot109.txt | head -60 ; adb reboot bootloader
+```
+
+**Expect in boot 109:** `SWEET FILES` lines for the move and the csstore removals; a slower first boot (lsd reseeds); a Sileo icon. If stuck at the logo: everyday boot (no list) and pull the log.
+User preference: give paste-ready commands at once, do not wait on CI (`gh run watch RUN -R $R --exit-status &&` in front when a build is pending); `[skip ci]` on notes-only commits.
+
 ### >>> BOOT 108 (2026-10-31, kernel 41216279299, userland 41218791846 + jb-install.txt): /var/jb INSTALLED, SILEO NOT REGISTERED -> sileo-system.txt (466b451) <<<
 
 **Observed (install.log via libsweet-fix):** `/var/jb/usr/bin/dpkg: exit 0` for Sileo's .deb; `uicache -p /var/jb/Applications/Sileo.app` exits 0 but prints `Error: Unable to register` for Sileo and for every /Applications app; state `dpkg 1, Sileo.app 1, unpacked 1, prepped 1`. No Sileo icon.
