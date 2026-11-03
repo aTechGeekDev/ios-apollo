@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "hakios-metal/a6xx.hpp"
 #include "hakios-metal/kernel.hpp"
 #include "hakios-metal/pm4.hpp"
 
@@ -106,7 +107,9 @@ static_assert(kTableIbosAt + kMaxIbos * 64 <= kTableTexConstAt && kTableTexConst
 struct Options {
     bool prelude = true;        // SP_MODE_CONTROL, SP_PERFCTR_ENABLE, SP_FLOAT_CNTL, as computerator opens with
     bool invalidateCmd = true;  // HLSQ_INVALIDATE_CMD before the program
-    bool hlsqCopies = true;     // the gen4 (has_lpac) copies: HLSQ_CS_CTRL_REG1, SP_CS_CNTL_0/1
+    // the gen4 (has_lpac) copies: HLSQ_CS_CTRL_REG1, SP_CS_CNTL_0/1. sweet: on by default only where the chip has LPAC
+    // (the A635); the A650 (gen3) has none and Gallium/computerator write none there (fd6_compute.cc, a6xx.cc)
+    bool hlsqCopies = a6xx::kHasLpac;
     bool pvtmemZero = true;     // the private-memory registers written as zero (Gallium does; computerator leaves them)
     bool invalidate = true;     // CP_EVENT_WRITE CACHE_INVALIDATE before the dispatch (Gallium's barrier)
     bool marker = true;         // CP_SET_MARKER RM6_COMPUTE

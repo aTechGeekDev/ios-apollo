@@ -7,6 +7,8 @@
 // One line per check, "probe: ok ..." or "probe: FAIL ...", and a last line with the count; the exit status is the
 // number of failures. Run it from a job list (hakios: RC_JOBS, EXTRA=).
 #include <algorithm>
+#include <cstdlib>
+#include <unistd.h>
 #include <cmath>
 #include <chrono>
 #include <cstdio>
@@ -389,8 +391,29 @@ int main(int argc, char** argv) {
             i += 2;
         }
     }
+    // sweet (ios-apollo): launchd points a job's stdout at /dev/null, which the kernel copies into its console log for
+    // the programs named in boot-arg sweetnull (xnu 0048): a line at a time, so that a hang or a crash keeps every line
+    // before it. And launchd starts the job at boot, before sweet_gpu.c has kept the GPU on and SweetGPU is there, so
+    // it is waited for, as sweet-gpu-test does (SWEET_METAL_WAIT seconds, 180 by default; 0: not at all).
+    setvbuf(stdout, nullptr, _IOLBF, 0);
     std::string why;
     auto transport = openKernelGpu(&why);
+    {
+        const char* waitEnv = getenv("SWEET_METAL_WAIT");
+        const int patience = waitEnv != nullptr ? atoi(waitEnv) : 180;
+        // (SweetGPU may be there and still answer kIOReturnNotReady, EAGAIN here, until the GPU is kept on)
+        const auto answers = [](Transport& t) {
+            MsmParam q{kPipe3D, kParamChipId, 0, 0, 0};
+            return t.call(kGetParam, &q, sizeof(q)) == 0;
+        };
+        int waited = 0;
+        while (waited < patience && (transport == nullptr || !answers(*transport))) {
+            sleep(1);
+            waited++;
+            transport = openKernelGpu(&why);
+        }
+        if (waited != 0) std::printf("probe: waited %d s for the GPU\n", waited);
+    }
     if (transport == nullptr) {
         std::printf("probe: no GPU: %s\n", why.c_str());
         return 100;

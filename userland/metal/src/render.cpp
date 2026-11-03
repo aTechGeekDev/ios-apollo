@@ -1164,6 +1164,10 @@ void passStart(pm4::Stream& stream, uint32_t W, uint32_t H, uint64_t table, cons
         reg64(stream, REG_A6XX_SP_TP_BORDER_COLOR_BASE_ADDR, table + kTableBorderColorAt);
         reg64(stream, REG_A6XX_SP_PS_TP_BORDER_COLOR_BASE_ADDR, table + kTableBorderColorAt);
         for (const RegWrite& w : kStaticStateTail) reg(stream, w.reg, w.value);
+        // sweet: fd6_emit_static_regs' last write on an early-preamble chip (the A650)
+        if (kHasEarlyPreamble) {
+            for (const RegWrite& w : kStaticStateEarlyPreamble) reg(stream, w.reg, w.value);
+        }
     }
     // 2. RB_CCU_CNTL for sysmem after a WFI ("isn't pipelined", tu_cmd_buffer.cc:373-377; fd6_emit.cc:828 "early a6xx
     // needed this"): 0x10000000 in both witnesses (rbCcuCntlSysmem); bit 2, CONCURRENT_RESOLVE, is what hakios's kernel
@@ -1679,7 +1683,8 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         reg(stream, REG_A6XX_RB_BLIT_GMEM_MSAA_CNTL, 0);
     }
     // 7. RB_RENDER_CNTL: CCUSINGLECACHELINESIZE 2 in both pipelines (tu_cmd_buffer.cc:633-693; fd6_gmem.cc:531-552), 0 in
-    // r3d_dst (tu_clear_blit.cc:1408) -- renderCntlZero for the bisect. A plain type-4: has_cp_reg_write is false here.
+    // r3d_dst (tu_clear_blit.cc:1408) -- renderCntlZero for the bisect. A plain type-4: has_cp_reg_write is false on the A635 (the A650 has CP_REG_WRITE, which Gallium uses only to
+    // track RB_RENDER_CNTL for preemption: a type-4 write of the register is the same write).
     if (o.renderCntl) {
         uint32_t flagMrts = 0;
         for (uint32_t i = 0; i < numRt; i++) flagMrts |= mrts[i].flagPitch != 0 ? 1u << i : 0u;
@@ -2210,15 +2215,26 @@ bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why) {
 
 bool gmemTiles(GmemPlan* plan, const uint32_t area[4]) {
     GmemPlan p = *plan;
-    p.x0 = area[0] & ~(kTileAlignW - 1);
+    // sweet: the A650's tile_align_w is 96, not a power of two, so the corner is rounded down with %, not a mask; and a
+    // bin's rows are a texture's rows for a framebuffer fetch (its pitch binW * bpp), which must run in multiples of 64
+    // bytes, so the alignment doubles until every target's rows do (tu_pass.cc tu_render_pass_gmem_config: "texture
+    // pitch must be aligned to 64, use a tile_align_w that is a multiple of 64 for cpp==1"). On the A635 (32) the
+    // upstream rule stands unchanged.
+    uint32_t tileAlignW = kTileAlignW;
+#if !defined(HAKIOS_METAL_A635)
+    for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+        while (p.bpp[i] != 0 && (tileAlignW * p.bpp[i]) % 64 != 0) tileAlignW *= 2;
+    }
+#endif
+    p.x0 = area[0] - area[0] % tileAlignW;
     p.y0 = area[1] & ~(kTileAlignH - 1);
     const uint32_t w = area[2] + 1 - p.x0, h = area[3] + 1 - p.y0;
     // The bin width is fixed once a plan has one: a framebuffer fetch's descriptor holds it as its pitch (encodeInPass,
     // written before the area was known), and a tile laid out narrower read through it as sheared rows (the screen in
     // stripes over two tile columns). Only the grid's corner, the columns, the rows and the bin height follow the area.
     if (p.binW == 0) {
-        p.cols = divUp(alignUp(w, kTileAlignW), kTileMaxW);
-        p.binW = alignUp(divUp(w, p.cols), kTileAlignW);
+        p.cols = divUp(alignUp(w, tileAlignW), kTileMaxW);
+        p.binW = alignUp(divUp(w, p.cols), tileAlignW);
     } else {
         p.cols = divUp(w, p.binW);
     }

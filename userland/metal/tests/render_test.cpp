@@ -656,11 +656,11 @@ TEST(render_encodes_the_first_triangles_registers) {
     CHECK_EQ(e.reg(REG_A6XX_SP_TP_BORDER_COLOR_BASE_ADDR), uint32_t(border));
     CHECK_EQ(e.reg(REG_A6XX_SP_TP_BORDER_COLOR_BASE_ADDR + 1), uint32_t(border >> 32));
     CHECK_EQ(e.reg(REG_A6XX_SP_PS_TP_BORDER_COLOR_BASE_ADDR), uint32_t(border));
-    // RB_CCU_CNTL 0x10000000 right after a WFI
+    // RB_CCU_CNTL 0x10000000 (A650: 0x18000000) right after a WFI
     {
         size_t ccu = e.findReg(REG_A6XX_RB_CCU_CNTL);
         CHECK(ccu != size_t(-1));
-        CHECK_EQ(w[ccu], 0x10000000u);
+        CHECK_EQ(w[ccu], CHIP(0x10000000u, 0x18000000u));
         pm4::Header before = pm4::decode(w[ccu - 2]);
         CHECK(before.kind == pm4::Header::kCommand && before.opcode == pm4::kWaitForIdle && before.count == 0);
     }
@@ -964,7 +964,7 @@ TEST(render_options_switch_each_group_and_each_alternative) {
         CHECK_EQ(e.find(CP_SET_DRAW_STATE), size_t(-1));
         CHECK_EQ(e.reg(REG_A6XX_SP_TP_BORDER_COLOR_BASE_ADDR), Encoded::kNone);
         CHECK_EQ(e.writes(REG_A6XX_RB_ALPHA_CONTROL), 1u);   // blendZsa's alone
-        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), 0x10000000u);   // ccuCntl is its own group
+        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), CHIP(0x10000000u, 0x18000000u));   // ccuCntl is its own group
         CHECK(e.stream.size() < whole.stream.size());
     }
     {
@@ -974,7 +974,7 @@ TEST(render_options_switch_each_group_and_each_alternative) {
     }
     {
         Encoded e = with([](render::Options& o) { o.ccuConcurrentResolve = true; });
-        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), 0x10000004u);
+        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), CHIP(0x10000004u, 0x18000004u));
     }
     {
         Encoded e = with([](render::Options& o) { o.passBegin = false; });
@@ -1037,7 +1037,8 @@ TEST(render_options_switch_each_group_and_each_alternative) {
         CHECK_EQ(e.findLoad(CP_LOAD_STATE6_GEOM, ST6_SHADER, SB6_VS_SHADER), size_t(-1));
         CHECK(e.findLoad(CP_LOAD_STATE6_FRAG, ST6_SHADER, SB6_FS_SHADER) != size_t(-1));
         Encoded f = with([](render::Options& o) { o.programFs = false; });
-        CHECK_EQ(f.reg(REG_A6XX_SP_FS_CTRL_REG0), Encoded::kNone);
+        // (sweet: on the A650 the batch start resets it to 0, kStaticStateEarlyPreamble, and nothing writes it after)
+        CHECK_EQ(f.reg(REG_A6XX_SP_FS_CTRL_REG0), CHIP(Encoded::kNone, 0u));
         CHECK_EQ(f.findLoad(CP_LOAD_STATE6_FRAG, ST6_SHADER, SB6_FS_SHADER), size_t(-1));
     }
     {
@@ -1254,7 +1255,8 @@ TEST(a_draw_of_tri_flat_holds_together_and_the_fake_does_not_rasterize_it) {
         CHECK_EQ(d.windowScissor[i], 0u);
         CHECK_EQ(d.screenScissor[i], 0u);
         CHECK_EQ(d.viewportScissor[i], 0u);
-        CHECK_EQ(d.windowScissor[2 + i], 63u);
+        // (sweet: a tile is whole multiples of tile_align_w wide, 96 on the A650, and the window is the tile's as turnip's)
+        CHECK_EQ(d.windowScissor[2 + i], i == 0 ? CHIP(63u, 95u) : 63u);
         CHECK_EQ(d.screenScissor[2 + i], 63u);
         CHECK_EQ(d.viewportScissor[2 + i], 63u);
     }
@@ -1851,7 +1853,7 @@ TEST(the_fake_refuses_a_draw_with_msaa_without_the_ccu_cntl_or_without_its_flush
         Twin w;
         size_t ccu = w.e.findReg(REG_A6XX_RB_CCU_CNTL);
         w.words[ccu - 2] = pm4::type7(pm4::kNop, 0);   // the WFI before it, gone
-        CHECK(has(w.fault(), "RB_CCU_CNTL (0x10000000) was not written in this submission right after a CP_WAIT_FOR_IDLE"));
+        CHECK(has(w.fault(), (std::string(CHIP("RB_CCU_CNTL (0x10000000)", "RB_CCU_CNTL (0x18000000)")) + " was not written in this submission right after a CP_WAIT_FOR_IDLE").c_str()));
     }
     {
         Twin w;
@@ -2148,7 +2150,7 @@ TEST(a_stage_that_wants_private_memory_gets_the_queues) {
     CHECK(scratch != nullptr);
     CHECK_EQ(pm.perFiber, 512u);
     CHECK_EQ(pm.perSp, 512u * 4096u);
-    CHECK_EQ(scratch->length(), 2ull * 512u * 4096u);
+    CHECK_EQ(scratch->length(), uint64_t(a6xx::kNumSpCores) * 512u * 4096u);   // (2 SP cores on the A635, 3 on the A650)
     Bindings fsb;
     fsb.privateMemory = pm;
     Encoded e(r, p, pass, wholeDraw(3), render::Options{}, Bindings{}, fsb);
@@ -4411,7 +4413,8 @@ TEST(a_draw_that_reads_its_target_gets_the_target_as_a_texture_and_a_barrier_bef
     if (gd.size() == 64) memcpy(gw, gd.data(), 64);
     CHECK_EQ((gw[0] & A6XX_TEX_CONST_0_TILE_MODE__MASK) >> A6XX_TEX_CONST_0_TILE_MODE__SHIFT, uint32_t(TILE6_2));
     CHECK_EQ(gw[0] & A6XX_TEX_CONST_0_SWAP__MASK, 0u);
-    CHECK_EQ((gw[2] & A6XX_TEX_CONST_2_PITCH__MASK) >> A6XX_TEX_CONST_2_PITCH__SHIFT, 64u * 4);
+    // (the bin's rows: 64 pixels on the A635, one 96-pixel tile_align_w on the A650)
+    CHECK_EQ((gw[2] & A6XX_TEX_CONST_2_PITCH__MASK) >> A6XX_TEX_CONST_2_PITCH__SHIFT, CHIP(64u, 96u) * 4);
     CHECK(gw[4] == 0 && (gw[5] & A6XX_TEX_CONST_5_BASE_HI__MASK) == 0);
     pm4::Stream gb;
     std::string gwhy;
@@ -5345,7 +5348,8 @@ TEST(the_gmem_plan_fits_the_bins_in_gmem_and_covers_the_target) {
         a.color0 = t.get();
         render::GmemPlan p;
         CHECK(render::gmemPlan(a, &p, nullptr));
-        CHECK(p.cols == 2 && p.rows == 12 && p.binW == 576 && p.binH == 208);
+        // (sweet: the A650's 1152 KiB of GMEM below a colour cache at 0x114000 holds 480 rows of 576: 2 x 6 tiles of 576 x 416)
+        CHECK(CHIP(p.cols == 2 && p.rows == 12 && p.binW == 576 && p.binH == 208, p.cols == 2 && p.rows == 6 && p.binW == 576 && p.binH == 416));
     }
     // what stays in sysmem: a second colour attachment of another size, an integer target
     {
@@ -5462,7 +5466,9 @@ TEST(a_pass_of_two_attachments_in_gmem_loads_and_stores_those_drawn) {
         a.more[0].load = LoadAction::kLoad;
         render::GmemPlan p;
         CHECK(render::gmemPlan(a, &p, nullptr));
-        CHECK(p.binW == 576 && p.binH == 96 && p.base[0] == 0 && p.base[1] == 0x3c000 && p.room[0] == 0x3c000 && p.room[1] == 0x3c000);
+        // (sweet: on the A650 the two halves of 0x114000, each a multiple of 16 KiB: 0x88000 and 0x8c000; 240 rows fit, 11 rows of 224)
+        CHECK(CHIP(p.binW == 576 && p.binH == 96 && p.base[0] == 0 && p.base[1] == 0x3c000 && p.room[0] == 0x3c000 && p.room[1] == 0x3c000,
+                   p.binW == 576 && p.binH == 224 && p.base[0] == 0 && p.base[1] == 0x88000 && p.room[0] == 0x88000 && p.room[1] == 0x8c000));
         auto cb = r.queue->commandBuffer();
         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
@@ -5696,7 +5702,9 @@ TEST(a_clear_in_gmem_comes_out_as_the_fill_does) {
 // (CP_SET_BIN_DATA5) and draws USE_VISIBILITY; the target comes back as it was through the tiles' loads and stores
 TEST(a_binned_gmem_pass_bins_its_draws_then_tells_each_tile_its_streams) {
     Rig r;
-    auto t = target(r, 1125, 300, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    // (sweet: 1125 x 300 is 2 tiles in the A650's bigger GMEM; 1000 rows make the 3 the twin below needs: 2 x 3)
+    const uint32_t H = CHIP(300u, 1000u);
+    auto t = target(r, 1125, H, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
     fillCoords(*t);
     RenderPass a;
     a.color0 = t.get();
@@ -5705,7 +5713,7 @@ TEST(a_binned_gmem_pass_bins_its_draws_then_tells_each_tile_its_streams) {
     render::Options o;
     o.gmemBinning = true;
     auto cb = r.queue->commandBuffer();
-    for (int i = 0; i < 3; i++) CHECK(cb->draw(flatProgram(), a, wholeDraw(3, 1125, 300), Bindings{}, Bindings{}, o));
+    for (int i = 0; i < 3; i++) CHECK(cb->draw(flatProgram(), a, wholeDraw(3, 1125, H), Bindings{}, Bindings{}, o));
     cb->commit();
     cb->waitUntilCompleted();
     CHECK(cb->status() == CommandBuffer::kCompleted);
@@ -5722,7 +5730,7 @@ TEST(a_binned_gmem_pass_bins_its_draws_then_tells_each_tile_its_streams) {
         render::Options twin = o;
         twin.gmemBinningStage = 9;
         auto c2 = r.queue->commandBuffer();
-        for (int i = 0; i < 3; i++) CHECK(c2->draw(flatProgram(), a, wholeDraw(3, 1125, 300), Bindings{}, Bindings{}, twin));
+        for (int i = 0; i < 3; i++) CHECK(c2->draw(flatProgram(), a, wholeDraw(3, 1125, H), Bindings{}, Bindings{}, twin));
         c2->commit();
         c2->waitUntilCompleted();
         CHECK(r.fake->stats().faults > s.faults);

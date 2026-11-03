@@ -463,6 +463,7 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
             if (staging == nullptr) return nullptr;
         }
         fd_dev_id id{};
+        id.gpu_id = a6xx::kGpuId;   // sweet: see compiler.cpp
         id.chip_id = a6xx::kChipId;
         const struct ::fd_dev_info* dev = ::fd_dev_info_raw(&id);
         fdl_layout l{};

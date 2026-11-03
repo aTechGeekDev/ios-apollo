@@ -24,21 +24,33 @@
 namespace hakios::metal::a6xx {
 
 // --- this chip -----------------------------------------------------------------------------------------------------
-// From Mesa's src/freedreno/common/freedreno_devices.py: the entry for chip_id ...06030500 ("Adreno 7c+ Gen 3", every
-// speedbin of the A635) is a6xx_base + a6xx_gen4 with num_ccu = 2.
-
+// sweet (ios-apollo): this tree is built for the Mi 10T's Adreno 650 (SM8250, chip id 0x06050002, Mesa's GPUId(650):
+// a6xx_base + a6xx_gen3 with num_ccu = 3). -DHAKIOS_METAL_A635 builds upstream's chip, the Adreno 7c+ Gen 3 (chip_id
+// ...06030500: a6xx_base + a6xx_gen4 with num_ccu = 2), so that upstream's literals can still be checked. Every A650
+// value below is from Mesa 25.0's freedreno_devices.py (the GPUId(650) entry and the a6xx_gen3 template).
+#if defined(HAKIOS_METAL_A635)
 inline constexpr uint32_t kChipId = 0x06030500;             // not-in-headers: freedreno_devices.py GPUId(chip_id=0x..06030500)
+inline constexpr uint32_t kGpuId = 0;                        // not-in-headers: the A635 rows are matched by chip id alone
 inline constexpr bool kHasLpac = true;                       // not-in-headers: freedreno_devices.py a6xx_gen4.has_lpac
+inline constexpr uint32_t kNumSpCores = 2;                   // not-in-headers: freedreno_devices.py num_sp_cores = num_ccu for the A635
+#else
+inline constexpr uint32_t kChipId = 0x06050002;             // not-in-headers: SweetGPU's CHIP_ID (sweet_gpu.c, the a650v2 Linux names)
+// Mesa's A650 row is GPUId(650): it matches on the GPU id, not the chip id (freedreno_dev_info.c dev_id_compare), so
+// an fd_dev_id for Mesa's tables carries both
+inline constexpr uint32_t kGpuId = 650;                      // not-in-headers: freedreno_devices.py GPUId(650); SweetGPU's GPU_ID
+inline constexpr bool kHasLpac = false;                      // not-in-headers: freedreno_devices.py a6xx_gen3 has no has_lpac
+inline constexpr uint32_t kNumSpCores = 3;                   // not-in-headers: freedreno_devices.py num_sp_cores = num_ccu = 3 for the A650
+#endif
 inline constexpr bool kSupportsDoubleThreadsize = true;      // not-in-headers: freedreno_devices.py a6xx_base.supports_double_threadsize
 // CP_LOAD_STATE6_0_NUM_UNIT for a shader (ST6_SHADER) is capped at this many instruction groups: Mesa's comment says
 // the blob allows 128 but 128 hangs this generation, so 127 it is (a longer shader is fetched past the preload).
-inline constexpr uint32_t kInstrCacheSize = 127;             // not-in-headers: freedreno_devices.py a6xx_gen4.instr_cache_size
-inline constexpr uint32_t kFibersPerSp = 128 * 2 * 16;       // not-in-headers: freedreno_devices.py, the A635 entry (fibers_per_sp)
-inline constexpr uint32_t kNumSpCores = 2;                   // not-in-headers: freedreno_devices.py num_sp_cores = num_ccu for the A635
-inline constexpr uint32_t kCsSharedMemSize = 32 * 1024;      // not-in-headers: freedreno_devices.py, the A635 entry (cs_shared_mem_size)
+// (gen3 and gen4 alike)
+inline constexpr uint32_t kInstrCacheSize = 127;             // not-in-headers: freedreno_devices.py a6xx_gen3/a6xx_gen4.instr_cache_size
+inline constexpr uint32_t kFibersPerSp = 128 * 2 * 16;       // not-in-headers: freedreno_devices.py, the A650 and A635 entries (fibers_per_sp)
+inline constexpr uint32_t kCsSharedMemSize = 32 * 1024;      // not-in-headers: freedreno_devices.py, the A650 and A635 entries (cs_shared_mem_size)
 inline constexpr uint32_t kThreadsizeBase = 64;              // not-in-headers: freedreno_devices.py A6xxGPUInfo default threadsize_base
 inline constexpr uint32_t kMaxWaves = 16;                    // not-in-headers: freedreno_devices.py A6xxGPUInfo default max_waves
-inline constexpr uint32_t kWaveGranularity = 2;              // not-in-headers: freedreno_devices.py, the A635 entry (wave_granularity)
+inline constexpr uint32_t kWaveGranularity = 2;              // not-in-headers: freedreno_devices.py, the A650 and A635 entries (wave_granularity)
 // ir3's "no register": regid(63, 0) = 63 << 2 | 0. The *CONSTID / *REGID fields take it for a value the shader does
 // not read (the work group size and offset constants, the linear local id), and it is what Mesa writes there.
 inline constexpr uint32_t kRegidNone = 0xfc;                 // not-in-headers: ir3/instr-a3xx.h INVALID_REG = regid(63, 0)
@@ -1388,8 +1400,10 @@ struct RegWrite {
     uint32_t value;
 };
 
-// Mesa's per-chip "magic" values, as its generated freedreno_devices.h has them for this chip (__info14, the entry every
-// A635 chip id maps to). Mesa does not know what most of them mean either; they are what the blob writes.
+// Mesa's per-chip "magic" values, as freedreno_devices.py has them for this chip. Mesa does not know what most of them
+// mean either; they are what the blob writes.
+#if defined(HAKIOS_METAL_A635)
+// (freedreno_devices.h __info14, the entry every A635 chip id maps to)
 inline constexpr uint32_t kMagicPcPowerCntl = 1;                  // not-in-headers: freedreno_devices.h __info14 .magic.PC_POWER_CNTL
 inline constexpr uint32_t kMagicTpl1DbgEcoCntl = 0x05008000;      // not-in-headers: freedreno_devices.h __info14 .magic.TPL1_DBG_ECO_CNTL (83918848)
 inline constexpr uint32_t kMagicGrasDbgEcoCntl = 0;               // not-in-headers: freedreno_devices.h __info14 .magic.GRAS_DBG_ECO_CNTL
@@ -1402,19 +1416,45 @@ inline constexpr uint32_t kMagicHlsqDbgEcoCntl = 0;               // not-in-head
 inline constexpr uint32_t kMagicRbUnknown8E01 = 0;                // not-in-headers: freedreno_devices.h __info14 .magic.RB_UNKNOWN_8E01
 inline constexpr uint32_t kMagicVpcDbgEcoCntl = 0x02000000;       // not-in-headers: freedreno_devices.h __info14 .magic.VPC_DBG_ECO_CNTL (33554432)
 inline constexpr uint32_t kMagicUcheUnknown0E12 = 1;              // not-in-headers: freedreno_devices.h __info14 .magic.UCHE_UNKNOWN_0E12
+#else
+// (freedreno_devices.py, GPUId(650)'s magic_regs)
+inline constexpr uint32_t kMagicPcPowerCntl = 2;                  // not-in-headers: freedreno_devices.py GPUId(650) magic_regs PC_POWER_CNTL
+inline constexpr uint32_t kMagicTpl1DbgEcoCntl = 0x01008000;      // not-in-headers: freedreno_devices.py GPUId(650) magic_regs TPL1_DBG_ECO_CNTL ("fixes cubic filtering")
+inline constexpr uint32_t kMagicGrasDbgEcoCntl = 0;               // not-in-headers: freedreno_devices.py GPUId(650) magic_regs GRAS_DBG_ECO_CNTL
+inline constexpr uint32_t kMagicSpChickenBits = 0x00001400;       // not-in-headers: freedreno_devices.py GPUId(650) magic_regs SP_CHICKEN_BITS
+inline constexpr uint32_t kMagicUcheClientPf = 0x00000004;        // not-in-headers: freedreno_devices.py GPUId(650) magic_regs UCHE_CLIENT_PF
+inline constexpr uint32_t kMagicPcModeCntl = 0x1f;                // not-in-headers: freedreno_devices.py GPUId(650) magic_regs PC_MODE_CNTL
+inline constexpr uint32_t kMagicSpDbgEcoCntl = 0x01000000;        // not-in-headers: freedreno_devices.py GPUId(650) magic_regs SP_DBG_ECO_CNTL
+inline constexpr uint32_t kMagicRbDbgEcoCntl = 0x04100000;        // not-in-headers: freedreno_devices.py GPUId(650) magic_regs RB_DBG_ECO_CNTL
+inline constexpr uint32_t kMagicHlsqDbgEcoCntl = 0;               // not-in-headers: freedreno_devices.py GPUId(650) magic_regs HLSQ_DBG_ECO_CNTL
+inline constexpr uint32_t kMagicRbUnknown8E01 = 0;                // not-in-headers: freedreno_devices.py GPUId(650) magic_regs RB_UNKNOWN_8E01
+inline constexpr uint32_t kMagicVpcDbgEcoCntl = 0x02000000;       // not-in-headers: freedreno_devices.py GPUId(650) magic_regs VPC_DBG_ECO_CNTL
+inline constexpr uint32_t kMagicUcheUnknown0E12 = 1;              // not-in-headers: freedreno_devices.py GPUId(650) magic_regs UCHE_UNKNOWN_0E12
+#endif
 // and the chip facts fd6_emit_static_regs and fd6_emit_ccu_cntl branch on
-inline constexpr bool kHasGmemFastClear = true;                   // not-in-headers: freedreno_devices.h __info14 .has_gmem_fast_clear
-inline constexpr bool kConcurrentResolve = false;                 // not-in-headers: freedreno_devices.h __info14 has no .concurrent_resolve (false)
+inline constexpr bool kHasGmemFastClear = true;                   // not-in-headers: freedreno_devices.py a6xx_base.has_gmem_fast_clear
+inline constexpr bool kConcurrentResolve = false;                 // not-in-headers: freedreno_devices.py: neither gen3 nor gen4 sets concurrent_resolve
+inline constexpr uint32_t kSysmemPerCcuDepthCacheSize = 0x10000;  // not-in-headers: freedreno_devices.py a6xx_base.sysmem_per_ccu_depth_cache_size (65536)
+inline constexpr uint32_t kSysmemPerCcuColorCacheSize = 0x10000;  // not-in-headers: freedreno_devices.py a6xx_base.sysmem_per_ccu_color_cache_size (65536)
+inline constexpr uint32_t kGmemCcuColorCacheFraction = 4;          // not-in-headers: freedreno_devices.py a6xx_base gmem_ccu_color_cache_fraction QUARTER
+inline constexpr uint32_t kGmemAlignW = 16, kGmemAlignH = 4;       // not-in-headers: freedreno_devices.py A6xxGPUInfo gmem_align_w/h (the event blit's granule)
+inline constexpr uint32_t kTileMaxW = 1024, kTileMaxH = 1008;      // not-in-headers: freedreno_devices.py A6xxGPUInfo tile_max_w/h for CHIP.A6XX
+#if defined(HAKIOS_METAL_A635)
 inline constexpr bool kHasEarlyPreamble = false;                  // not-in-headers: freedreno_devices.h __info14 has no .has_early_preamble (a6xx_gen4 leaves it off)
 inline constexpr uint32_t kNumCcu = 2;                            // not-in-headers: freedreno_devices.h __info14 .num_ccu
-inline constexpr uint32_t kSysmemPerCcuDepthCacheSize = 0x10000;  // not-in-headers: freedreno_devices.h __info14 .sysmem_per_ccu_depth_cache_size (65536)
-inline constexpr uint32_t kSysmemPerCcuColorCacheSize = 0x10000;  // not-in-headers: freedreno_devices.h __info14 .sysmem_per_ccu_color_cache_size (65536)
 // tiled rendering: the on-chip memory and the tile grid (a6xx_gen4 / adreno_7c3 in freedreno_devices.py)
 inline constexpr uint32_t kGmemBytes = 512 * 1024;                // not-in-headers: freedreno_devices.py adreno_7c3 gmem_size (Linux a6xx_gpu adreno_7c3 SZ_512K)
-inline constexpr uint32_t kGmemCcuColorCacheFraction = 4;          // not-in-headers: freedreno_devices.py a6xx_gen4 gmem_ccu_color_cache_fraction QUARTER
 inline constexpr uint32_t kTileAlignW = 32, kTileAlignH = 16;      // not-in-headers: freedreno_devices.py a6xx_gen4 tile_align_w/h
-inline constexpr uint32_t kGmemAlignW = 16, kGmemAlignH = 4;       // not-in-headers: freedreno_devices.py a6xx_gen4 gmem_align_w/h (the event blit's granule)
-inline constexpr uint32_t kTileMaxW = 1024, kTileMaxH = 1008;      // not-in-headers: freedreno_devices.py a6xx_gen4 tile_max_w/h
+#else
+// a6xx_gen3 sets has_early_preamble: fd6_emit_static_regs then resets SP_FS_CTRL_REG0 at every batch start, so that a
+// leftover EARLYPREAMBLE bit of another process's last draw is never run (kStaticStateEarlyPreamble below)
+inline constexpr bool kHasEarlyPreamble = true;                   // not-in-headers: freedreno_devices.py a6xx_gen3.has_early_preamble
+inline constexpr uint32_t kNumCcu = 3;                            // not-in-headers: freedreno_devices.py GPUId(650) num_ccu
+// tiled rendering: 1 MiB + 128 KiB of GMEM (Linux adreno_device.c a650 gmem SZ_1M + SZ_128K; SweetGPU's GMEM_SIZE
+// 0x120000); tiles 96 pixels wide (NOT a power of two: render.cpp's gmemTiles rounds with % and the fetch rule below)
+inline constexpr uint32_t kGmemBytes = 0x120000;                  // not-in-headers: Linux a650 gmem; sweet_gpu.c MSM_PARAM_GMEM_SIZE
+inline constexpr uint32_t kTileAlignW = 96, kTileAlignH = 16;      // not-in-headers: freedreno_devices.py GPUId(650) tile_align_w/h
+#endif
 // the border color table both TP base registers point at: Gallium's is FD6_MAX_BORDER_COLORS (256) entries of
 // sizeof(struct fd6_bcolor_entry) (128 bytes: 32 fp32/fp16/int words); zeros are a valid table (black, transparent)
 inline constexpr uint32_t kBorderColorBytes = 256 * 128;          // not-in-headers: fd6_texture.h FD6_MAX_BORDER_COLORS * FD6_BORDER_COLOR_SIZE
@@ -1722,6 +1762,12 @@ inline constexpr RegWrite kStaticStateAfterDrawState[] = {
 inline constexpr RegWrite kStaticStateTail[] = {
     {REG_A6XX_PC_DGEN_SU_CONSERVATIVE_RAS_CNTL, 0},
     {REG_A6XX_RB_ALPHA_CONTROL, 0},
+};
+// sweet: the last write of fd6_emit_static_regs on a chip with an early preamble (a6xx_gen3, the A650): SP_FS_CTRL_REG0
+// to 0 so that "a random FS preamble from the last draw" (fd6_emit.cc, the comment above it) is never run; nothing on
+// the A635. render.cpp writes it after kStaticStateTail when kHasEarlyPreamble.
+inline constexpr RegWrite kStaticStateEarlyPreamble[] = {
+    {REG_A6XX_SP_FS_CTRL_REG0, 0},
 };
 
 // CP_SET_DRAW_STATE, 3 words per group: Gallium's batch start sends one group with DISABLE_ALL_GROUPS and no address,
@@ -4085,18 +4131,24 @@ constexpr uint32_t binControlGmem(bool lrzFeedback, uint32_t binw, uint32_t binh
 }
 // RB_CCU_CNTL for tiled rendering: the colour cache shrunk to its GMEM fraction and moved to GMEM's end, so the tiles
 // own everything below it (tu_cmd_buffer.cc tu6_emit_ccu_cntl, gmem: ccu_offset_gmem = gmem - num_ccu * color cache /
-// fraction); depth cache unused (no depth attachment in a GMEM pass here). 0x3c400000 on this chip
+// fraction); depth cache unused (no depth attachment in a GMEM pass here). 0x3c400000 on the A635, 0x8a400000 on the A650
 constexpr uint32_t kGmemCcuColorOffset = kGmemBytes - kNumCcu * kSysmemPerCcuColorCacheSize / kGmemCcuColorCacheFraction;
 constexpr uint32_t rbCcuCntlGmem() {
     return (kHasGmemFastClear ? 0u : A6XX_RB_CCU_CNTL_GMEM_FAST_CLEAR_DISABLE) | A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI(kGmemCcuColorOffset >> 21) |
            A6XX_RB_CCU_CNTL_COLOR_CACHE_SIZE(CCU_CACHE_SIZE_QUARTER) | A6XX_RB_CCU_CNTL_COLOR_OFFSET(kGmemCcuColorOffset & 0x1fffff);
 }
+#if defined(HAKIOS_METAL_A635)
 static_assert(rbCcuCntlGmem() == 0x3c400000, "the GMEM CCU layout turnip computes for this chip");
+#else
+// sweet: the A650's, as tu_device.cc computes it (ccu_offset_gmem = 0x120000 - 3 * 64 KiB / 4 = 0x114000)
+static_assert(kGmemCcuColorOffset == 0x114000 && rbCcuCntlGmem() == 0x8a400000, "the GMEM CCU layout turnip computes for the A650");
+static_assert(rbCcuCntlSysmem() == 0x18000000, "the sysmem CCU layout (colour cache after 3 x 64 KiB of depth cache)");
+#endif
 
 // hardware binning (fd6_gmem.cc emit_binning_pass, update_vsc_pipe, fd6_emit_tile_prep): the binning pass runs every draw's
 // vertex stage once over the whole window and the VSC writes, for each pipe of bins, which draws and primitives reach
 // each bin; a tile then draws only those (CP_SET_BIN_DATA5, CP_SET_VISIBILITY_OVERRIDE 0, the draws USE_VISIBILITY)
-inline constexpr uint32_t kNumVscPipes = 32;                      // not-in-headers: freedreno_devices.py A635 num_vsc_pipes
+inline constexpr uint32_t kNumVscPipes = 32;                      // not-in-headers: freedreno_devices.py num_vsc_pipes (A650 and A635 alike)
 inline constexpr uint32_t REG_A6XX_VSC_BIN_SIZE = 0x0c02;                                    // a6xx.xml.h:4147  WIDTH >> 5 at 0, HEIGHT >> 4 at 8
 inline constexpr uint32_t REG_A6XX_VSC_DRAW_STRM_SIZE_ADDRESS = 0x0c03;                      // a6xx.xml.h:4164  64-bit: each pipe's draw-stream size written back
 inline constexpr uint32_t REG_A6XX_VSC_BIN_COUNT = 0x0c06;                                   // a6xx.xml.h:4167  NX at 1, NY at 11

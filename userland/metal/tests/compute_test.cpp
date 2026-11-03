@@ -180,7 +180,11 @@ TEST(a_dispatch_gets_private_memory_and_the_threadgroup_memory_its_encoder_sets)
     Encoded big(r, kernels::fill_id, kGroups16, nullptr, tg);
     CHECK(big.ok);
     CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_SP_CS_CTRL_REG1)]), 7u);
-    CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1)]), 7u);
+    if (kHasLpac) {
+        CHECK_EQ(sharedField(big.stream.words()[big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1)]), 7u);
+    } else {
+        CHECK_EQ(big.findReg(REG_A6XX_HLSQ_CS_CTRL_REG1), size_t(-1));   // sweet: the A650 has no LPAC copy
+    }
     tg.sharedBytes = 32 * 1024 + 1;
     Encoded over(r, kernels::fill_id, kGroups16, nullptr, tg);
     CHECK(!over.ok);
@@ -517,6 +521,16 @@ TEST(an_event_with_the_timestamp_bit_writes_a_timestamp_not_the_value) {
 }
 
 TEST(the_fake_refuses_id_registers_whose_two_copies_differ) {
+    // sweet: the SP's copies are an LPAC chip's (the A635); on the A650 neither the driver nor Gallium writes them
+    if (!a6xx::kHasLpac) {
+        Rig r;
+        auto out = buffer(r, 4096, 0);
+        Encoded e(r, kernels::fill_id, kGroups16, nullptr, {Binding{out.get(), 0}});
+        CHECK(e.ok);
+        CHECK_EQ(e.findReg(a6xx::REG_A6XX_SP_CS_CNTL_0), size_t(-1));
+        CHECK_EQ(e.findReg(a6xx::REG_A6XX_HLSQ_CS_CTRL_REG1), size_t(-1));
+        return;
+    }
     Rig r;
     auto out = buffer(r, 4096, 0);
     Encoded e(r, kernels::fill_id, kGroups16, nullptr, {Binding{out.get(), 0}});

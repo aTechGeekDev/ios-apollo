@@ -6,6 +6,14 @@
 #include <string>
 #include <vector>
 
+// sweet (ios-apollo): a literal that differs between the two chips the tree builds for, the A635 upstream measured
+// (-DHAKIOS_METAL_A635) and the Mi 10T's A650 (the default): CHIP(a635, a650)
+#if defined(HAKIOS_METAL_A635)
+#define CHIP(a635, a650) (a635)
+#else
+#define CHIP(a635, a650) (a650)
+#endif
+
 namespace test {
 
 struct Case {

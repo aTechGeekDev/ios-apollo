@@ -1,0 +1,66 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1089,6 +1089,10 @@
+ 	return kept.on;
+ }
+ 
++/* (xnu 0169) how many times sweet_gpu_recover() has reset the hung core this boot: msm's FAULTS, which the Metal
++ * driver (userland/metal, command.cpp) reads to tell a submission a reset gave up from one that ran */
++static uint32_t sweet_gpu_recoveries;
++
+ /* msm GET_PARAM (msm_drm.h numbers; Linux adreno_get_param and a6xx_calc_ubwc_config for the a650) */
+ bool
+ sweet_gpu_parameter(uint32_t which, uint64_t *value)
+@@ -1109,9 +1113,11 @@
+ 	case 0x05:                              /* TIMESTAMP: the 19.2 MHz counter, as CP_ALWAYS_ON_COUNTER */
+ 		*value = mach_absolute_time();
+ 		return true;
++	case 0x09:                              /* FAULTS: the core's resets after hangs (0169) */
++		*value = sweet_gpu_recoveries;
++		return true;
+ 	case 0x06:                              /* GMEM_BASE: 0 for the a650 family */
+ 	case 0x08:                              /* PP_PGTABLE */
+-	case 0x09:                              /* FAULTS */
+ 	case 0x0a:                              /* SUSPENDS */
+ 	case 0x11:                              /* RAYTRACING */
+ 		*value = 0;
+@@ -1417,7 +1423,6 @@
+ bool
+ sweet_gpu_recover(void)
+ {
+-	static uint32_t recoveries;
+ 	static const uint32_t me_init[8] = { 0x2f, 0x3, 0x20000000u, 0, 0, 0, 0, 0 };
+ 	uint32_t enabled = 1, at = 0, rptr = ~0u, status = ~0u, cb, fsr;
+ 	vm_offset_t gpu = kept.gpu;
+@@ -1428,11 +1433,11 @@
+ 	if (!kept.on || !enabled) {
+ 		return false;
+ 	}
+-	if (recoveries >= SWEET_GPU_RECOVERIES) {
+-		printf("SWEET GPU: kept: the core hung again; %u recoveries this boot are the limit: it stays stopped\n", recoveries);
++	if (sweet_gpu_recoveries >= SWEET_GPU_RECOVERIES) {
++		printf("SWEET GPU: kept: the core hung again; %u recoveries this boot are the limit: it stays stopped\n", sweet_gpu_recoveries);
+ 		return false;
+ 	}
+-	recoveries++;
++	sweet_gpu_recoveries++;
+ 	gpu_wr(gpu, GPU_CP_SQE_CNTL, 0);
+ 	gpu_wr(gpu, GPU_RBBM_SW_RESET_CMD, 1);
+ 	(void)gpu_rd(gpu, GPU_RBBM_SW_RESET_CMD);
+@@ -1463,14 +1468,14 @@
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - began, &took_ns);
+ 	if (rptr != at || (status & GPU_BUSY) || gpu_rd(gpu, GPU_CP_HW_FAULT) != 0) {
+ 		printf("SWEET GPU: kept: recovery %u FAILED: rptr %u of %u, status %#x cp fault %#x smmu fsr was %#x: the core stays stopped\n",
+-		    recoveries, rptr, at, status, gpu_rd(gpu, GPU_CP_HW_FAULT), fsr);
++		    sweet_gpu_recoveries, rptr, at, status, gpu_rd(gpu, GPU_CP_HW_FAULT), fsr);
+ 		return false;
+ 	}
+ 	kept.at = kept.sent = at;
+ 	*(volatile uint32_t *)(kept.scratch + KEPT_FENCE_AT) = kept.fence;   /* everything before: done */
+ 	gpu_to_memory(kept.scratch + KEPT_FENCE_AT, 4);
+ 	printf("SWEET GPU: kept: RECOVERED the hung core (recovery %u, %llu ms; smmu fsr was %#x); submissions up to %u count as done\n",
+-	    recoveries, took_ns / 1000000ull, fsr, kept.fence);
++	    sweet_gpu_recoveries, took_ns / 1000000ull, fsr, kept.fence);
+ 	return true;
+ }
+ 

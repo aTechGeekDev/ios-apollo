@@ -42,13 +42,13 @@ TEST(gpu_params) {
     Rig r;
     uint64_t v = 0;
     CHECK_EQ(r.gpu->param(kParamGpuId, &v), 0);
-    CHECK_EQ(v, 0ull);                                      // "GPU_ID: none, the chip ID says it"
+    CHECK_EQ(v, CHIP(0ull, 650ull));                        // "GPU_ID: none, the chip ID says it"; SweetGPU: 650
     CHECK_EQ(r.gpu->param(kParamChipId, &v), 0);
-    CHECK_EQ(uint32_t(v), 0x06030500u);                     // GPU_CHIP_ID (dt qcom,chipid) ...
+    CHECK_EQ(uint32_t(v), CHIP(0x06030500u, 0x06050002u));  // GPU_CHIP_ID (dt qcom,chipid) ...
     CHECK_EQ(v >> 32, FakeGpu::kSpeedBin);                  // ... "with the speed bin above it"
-    CHECK_EQ(r.gpu->chipId(), 0x06030500u);
+    CHECK_EQ(r.gpu->chipId(), CHIP(0x06030500u, 0x06050002u));
     CHECK_EQ(r.gpu->param(kParamGmemSize, &v), 0);
-    CHECK_EQ(v, 512ull * 1024);
+    CHECK_EQ(v, CHIP(512ull * 1024, 0x120000ull));          // A650: 1 MiB + 128 KiB
     CHECK_EQ(r.gpu->param(kParamMaxFreq, &v), 0);
     CHECK_EQ(v, 550000000ull);                              // core_khz * 1000, the default clock
     CHECK_EQ(r.gpu->param(kParamFaults, &v), 0);
@@ -56,7 +56,7 @@ TEST(gpu_params) {
     CHECK_EQ(r.gpu->param(kParamPriorities, &v), 0);
     CHECK_EQ(v, 1ull);
     CHECK_EQ(r.gpu->param(kParamHighestBankBit, &v), 0);
-    CHECK_EQ(v, 14ull);
+    CHECK_EQ(v, CHIP(14ull, 16ull));
     CHECK_EQ(r.gpu->param(kParamUbwcSwizzle, &v), 0);
     CHECK_EQ(v, 6ull);
     CHECK_EQ(r.gpu->param(kParamMacrotileMode, &v), 0);

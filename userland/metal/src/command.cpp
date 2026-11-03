@@ -556,9 +556,10 @@ std::shared_ptr<Texture> CommandQueue::nullTexture(std::string* why) {
 }
 
 namespace {
-// the A635's SP cores and fibers an SP (freedreno_devices.py, the 7c+ Gen 3 entry: num_ccu 2, fibers_per_sp 128 * 2 * 16)
-constexpr uint32_t kSpCores = 2;
-constexpr uint32_t kFibersPerSp = 128 * 2 * 16;
+// the chip's SP cores and fibers an SP (freedreno_devices.py: num_sp_cores = num_ccu, 3 on the A650 and 2 on the A635;
+// fibers_per_sp 128 * 2 * 16 on both). sweet: from a6xx.hpp, which knows the chip, instead of the A635's 2 here.
+constexpr uint32_t kSpCores = a6xx::kNumSpCores;
+constexpr uint32_t kFibersPerSp = a6xx::kFibersPerSp;
 }  // namespace
 
 std::shared_ptr<Buffer> CommandQueue::privateMemory(uint32_t bytes, bool perWave, PrivateMemory* out, std::string* why) {

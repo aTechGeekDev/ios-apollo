@@ -284,7 +284,7 @@ TEST(a6xx_private_memory_fields_are_scaled) {
     CHECK_EQ(A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(0x10000), 0x20u);
     // this chip: 4096 fibers per SP, 2 SPs; a 512-byte private memory per fiber is 2 MiB per SP, 4 MiB in all
     CHECK_EQ(kFibersPerSp, 4096u);
-    CHECK_EQ(kNumSpCores, 2u);
+    CHECK_EQ(kNumSpCores, CHIP(2u, 3u));
     CHECK_EQ(A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(512 * kFibersPerSp), 512u);
 }
 
@@ -333,7 +333,7 @@ TEST(a6xx_batch_start_words) {
     // RB_CCU_CNTL for rendering to memory on this chip: depth cache at 0, color cache after it at
     // num_ccu (2) * 64 KiB = 0x20000 bytes, in 4 KiB units: 0x20 << 23 = 0x10000000; both cache sizes FULL (0);
     // the chip has fast clear (bit 0 clear) and no concurrent resolve (bit 2 clear)
-    CHECK_EQ(rbCcuCntlSysmem(), 0x10000000u);
+    CHECK_EQ(rbCcuCntlSysmem(), CHIP(0x10000000u, 0x18000000u));   // A650: the colour cache after 3 x 64 KiB
     CHECK_EQ(A6XX_RB_CCU_CNTL_COLOR_OFFSET(0x20000), 0x10000000u);
     CHECK_EQ(A6XX_RB_CCU_CNTL_DEPTH_OFFSET(0x1000), 0x1000u);
     CHECK_EQ(A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI(1), 0x200u);
@@ -365,7 +365,7 @@ TEST(a6xx_batch_start_words) {
     CHECK_EQ(kStaticState[1].reg, REG_A6XX_SP_FLOAT_CNTL);
     CHECK_EQ(kStaticState[1].value, 0x8u);
     CHECK_EQ(kStaticState[5].reg, REG_A6XX_TPL1_DBG_ECO_CNTL);
-    CHECK_EQ(kStaticState[5].value, 0x05008000u);
+    CHECK_EQ(kStaticState[5].value, CHIP(0x05008000u, 0x01008000u));
     CHECK_EQ(kStaticState[19].reg, REG_A6XX_SP_MODE_CONTROL);
     CHECK_EQ(kStaticState[19].value, 0x5u);
     CHECK_EQ(kStaticState[23].reg, REG_A6XX_PC_MODE_CNTL);
@@ -386,11 +386,11 @@ TEST(a6xx_batch_start_words) {
     for (const RegWrite& w : kStaticState) {
         CHECK(w.reg >= 0x0e12 && w.reg <= 0xbe04);
     }
-    CHECK_EQ(kMagicTpl1DbgEcoCntl, 83918848u);
+    CHECK_EQ(kMagicTpl1DbgEcoCntl, CHIP(83918848u, 0x01008000u));
     CHECK_EQ(kMagicRbDbgEcoCntl, 68157440u);
     CHECK_EQ(kMagicVpcDbgEcoCntl, 33554432u);
     CHECK_EQ(kMagicSpChickenBits, 5120u);
-    CHECK_EQ(kMagicUcheClientPf, 132u);
+    CHECK_EQ(kMagicUcheClientPf, CHIP(132u, 4u));
     CHECK_EQ(kBorderColorBytes, 32768u);
 }
 

@@ -667,11 +667,12 @@ bool FakeGpu::execCs(const uint32_t* p, uint32_t count, bool indirect) {
         fault("SP_CS_CTRL_REG0 and HLSQ_CS_CNTL_1 disagree about the thread size");
         return false;
     }
-    if (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1)) {
+    // (the SP's copies exist with LPAC only: gen4's A635 has them, gen3's A650 does not, and Gallium writes them only then)
+    if (kHasLpac && (reg(REG_A6XX_HLSQ_CS_CNTL_0) != reg(REG_A6XX_SP_CS_CNTL_0) || reg(REG_A6XX_HLSQ_CS_CNTL_1) != reg(REG_A6XX_SP_CS_CNTL_1))) {
         fault("the HLSQ's and the SP's copies of the id registers (CS_CNTL_0, CS_CNTL_1) differ");
         return false;
     }
-    if (reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
+    if (kHasLpac && reg(REG_A6XX_SP_CS_CTRL_REG1) != reg(REG_A6XX_HLSQ_CS_CTRL_REG1)) {
         fault("SP_CS_CTRL_REG1 and HLSQ_CS_CTRL_REG1 differ about shared memory and the constant split");
         return false;
     }
@@ -2436,7 +2437,7 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
         auto* p = static_cast<MsmParam*>(data);
         // the kernel's table (bsd/dev/hakios.adreno.c, hakios_gpu_parameter), number for number
         switch (p->param) {
-        case kParamGpuId: p->value = 0; return 0;                   // "none, the chip ID says it"
+        case kParamGpuId: p->value = kGpuId; return 0;              // A635: 0, "none, the chip ID says it"; SweetGPU: 650
         case kParamGmemSize: p->value = kGmemBytes; return 0;
         case kParamChipId: p->value = kChipId | kSpeedBin << 32; return 0;
         case kParamMaxFreq: p->value = kMaxFrequencyHz; return 0;
@@ -2446,7 +2447,7 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
         case kParamPpPgtable: p->value = 0; return 0;
         case kParamFaults: p->value = stats_.recoveries; return 0;
         case kParamSuspends: p->value = 0; return 0;
-        case kParamHighestBankBit: p->value = 14; return 0;
+        case kParamHighestBankBit: p->value = kHighestBankBit; return 0;
         case kParamRaytracing: p->value = 0; return 0;
         case kParamUbwcSwizzle: p->value = 6; return 0;
         case kParamMacrotileMode: p->value = 1; return 0;

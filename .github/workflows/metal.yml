@@ -1,0 +1,58 @@
+name: metal
+
+# The Metal driver core (userland/metal: hakios-metal ported to SweetGPU and the Adreno 650).
+#   host: its tests against the fake GPU on Linux, for the A650 (the default) and for upstream's A635
+#         (-DHAKIOS_METAL_A635, so upstream's measured literals keep being checked), and under AddressSanitizer
+#   ios:  hakios-metal-probe (the core on the phone's GPU: blits, compute, draws, each checked against its own rule)
+#         and libhakios-metal.a, built with Xcode's iPhoneOS SDK and ad-hoc signed. Artifact sweet-metal:
+#         bin/sweet-metal (= hakios-metal-probe), lib/libhakios-metal.a, SHA256SUMS. Without MESA=1: no compiler in the driver
+#         (compiling AIR / .metallib refuses by name); the probe's own precompiled kernels run.
+# Apart from userland.yml so that a change here does not rebuild Mesa.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, "claude/**"]
+    paths:
+      - "userland/metal/**"
+      - ".github/workflows/metal.yml"
+
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tests, Adreno 650
+        working-directory: userland/metal
+        run: make test -j4
+      - name: Tests, Adreno 635 (upstream's chip)
+        working-directory: userland/metal
+        run: make test -j4 HOSTOUT=out/host-a635 CXXFLAGS="-O2 -g -DHAKIOS_METAL_A635"
+      - name: Tests under AddressSanitizer, Adreno 650
+        working-directory: userland/metal
+        run: make asan -j4
+
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the probe and the library
+        working-directory: userland/metal
+        run: |
+          set -eux
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          make ios -j4 SDK="$SDK" IOS_CXX="xcrun --sdk iphoneos clang++ -arch arm64 -isysroot $SDK -miphoneos-version-min=16.0"
+          mkdir -p ../../out/bin ../../out/lib
+          cp out/ios/hakios-metal-probe ../../out/bin/sweet-metal   # (a short name: it goes into boot-arg sweetnull)
+          cp out/ios/libhakios-metal.a ../../out/lib/
+          codesign -s - -f ../../out/bin/sweet-metal
+          file ../../out/bin/sweet-metal
+          otool -L ../../out/bin/sweet-metal
+      - name: Checksums
+        run: |
+          cd out && find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweet-metal
+          path: out/
