@@ -2,7 +2,7 @@
 
 ## Agent handoff / active work
 
-### >>> METAL PROBE BOOT (2026-11-03; user: "i wanna test metal"): tools/root-files/metal-probe.txt, NOT YET BOOTED <<<
+### >>> METAL PROBE BOOT (2026-11-03; user: "i wanna test metal"): tools/root-files/metal-probe.txt + artifact sweet-metal from metal run 41655855519 (a9840b8, ios green); NOT YET BOOTED <<<
 
 **How it runs:** libsweet-fix in configd (sweet_fix.c fix_start_metal_probe) starts /usr/local/bin/sweet-metal once when /private/var/sweet-metal/once exists (removed before the start), stdout+stderr on /dev/console (reaches the kernel log, as the jailbreak lines did: no sweetnull entry), env SWEET_METAL_DELAY=60 (the probe sleeps first) and SWEET_METAL_WAIT=180. metal-probe.txt puts the probe, the marker and the new libsweet-fix (artifact `sweet-metal`, metal.yml now builds libsweet-fix too, no Mesa rebuild) on the root for one boot. Same kernel 41216279299 (0169 not needed: FAULTS just reads 0), GPU kept on (`sweetgpu=22 sweetgpukeep=1`, already in the normal command). The bridge (libsweet-ca in backboardd) shares the GPU; if a probe hang freezes the UI, a second probe boot without the libsweet-ca group isolates it.
 **Read back:** `grep -a -E 'probe:|sweet-fix: configd: metal|SWEET GPU: kept|SweetGPU:' logs/apollo-bootNN.txt`.
