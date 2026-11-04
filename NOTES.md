@@ -10,7 +10,18 @@ The user asked me (another agent) to stay out of the GPU, Metal and the glitchin
   - 0182 SweetBattery reads SID 2 (PM8150B).
   - 0183 kern_exec.c: inserts /usr/local/lib/libsweet-ui.dylib and/or ElleKit's TweakLoader into SpringBoard and /Applications + app-bundle executables (never backboardd or daemons).
 - **Everything is off unless an option is set.** Options come from a boot-arg or, since the boot line is full, the ADT: `mkadt.py --option NAME=N` (node /sweet-options; `apollo_option()` in apollo_pmic.c). Your boots without `--option` behave exactly as before.
-- **Boot 121 black screen was mine, and it says something about your stack.** apollo_rtc=1 removed IOKitInitializeTime's 30 s wait for an IORTC (nobody publishes one). Then launchd/backboardd started before `SWEET GPU: probe in 15 s` fired, and backboardd's SweetMetal2/Turnip got VK_ERROR_DEVICE_LOST: black. Fixed: the wait is only skipped with apollo_rtc_nowait=1 (keep it off). **The 30 s wait is what currently guarantees the GPU is up before backboardd;** if anything shortens early boot, the Metal plug-in needs to wait for the GPU itself. It would also make every boot ~30 s faster.
+- **CORRECTION (boot 123): boot 121's black screen was probably NOT my timing change.**
+  - My first reading: apollo_rtc=1 skipped IOKitInitializeTime's 30 s IORTC wait, so backboardd started before the GPU's 15 s probe and hit VK_ERROR_DEVICE_LOST. On that reading I made the skip opt-in (`apollo_rtc_nowait=1`, keep it off).
+  - **But boots 122 (worked) and 123 (stuck at the Apple logo, DeviceLost) start in the same order as 121.** `exec backboardd` at log line ~730, `SWEET GPU: Adreno 650 bring-up` at ~4400, `SweetGPU: registered` and the self-test fine.
+  - So Metal's DeviceLost comes and goes with the same boot order: 121 lost, 122 fine, 123 lost.
+  - **Boot 123's sequence** (log e96efb02-apollo-boot123.txt, lines 8901-9548):
+    1. `MTL2T: W VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT`.
+    2. PosterBoard creates 1125x2502 surfaces, AegirPoster crashes (as always).
+    3. `native-metal: surface import refused: no-copy buffer: DeviceLost` x42.
+    4. `MTL2T: W submit failed: 0xe00002c2 (VK_ERROR_DEVICE_LOST)`.
+  - **On the kernel side:** no SweetGPU watchdog/reset line; the core 0.1-0.3 % busy; Turnip's calls BoAlloc 110 / BoMap 133 / WaitFence 44, nothing long.
+  - **Guess:** the loss starts in an import/allocation path, not a GPU hang. Your area; I have not touched it.
+
 - **CI:** xnu.yml + xnu/patches/0020-stage-bearssl.sh fall back to the BearSSL copy staged in the last green run's xnu-buildtree artifact when bearssl.org is down (502 all day on 2026-11-04). Your copy on main was identical.
 - **Boot 122** (kernel 41832275728 = your 0172-0180 + 0181-0183, metal2 41827349433 + metal2-on.txt, options apollo_rtc/power/torch=1 sweetbattery=1 apollo_ui=1):
   - It boots and UI draws.
@@ -217,6 +228,15 @@ User preference: give paste-ready commands at once, do not wait on CI (`gh run w
 **Observed:** `SWEET MTL: IOAcceleratorES published (MetalPluginName SweetMetal2)`; backboardd loaded the plug-in (`MTL2[58 backboardd]`), then `native-metal: device refused: device: ShaderCache(ShaderCacheError { path: "/var/local/m2v-cache/backboardd", kind: PermissionDenied })` in 11 ms; `libvulkan_freedreno 0x0` (Turnip never loaded); `SpringBoard: not listed (/var/local/mtl2-clients): no Metal device` (as intended). With no device CoreAnimation drew on the CPU (no GL bridge either): SWEET FB 12.9/16.2/3.9 frames a second, 0 waited for the GPU, the CPU copy path. The plug-in's stderr lines reach the log (the 0171-era HotMetal2 change works).
 **Cause:** /private/var/local was created by the kernel (root, 0755) to write mtl2.log; backboardd runs as mobile, so mkdir /var/local/m2v-cache failed, and backboardd has no _CS_DARWIN_USER_CACHE_DIR. **Fix:** HotMetal2.mm falls back to /private/var/tmp/m2v-cache/<process> (1777 parent). Boot 114 = boot 113's command with the new metal2 run.
 
+### >>> BOOT 123 (2026-11-04, kernel 41837987204, metal2 41827349433 + metal2-on.txt, sweet-ui 41837027762 (island rect + flashlight), same options): STUCK AT THE APPLE LOGO -- Metal DeviceLost again (see the correction in the note for the Metal agent) <<<
+
+**Observed:**
+- **PMIC:** as in 122.
+- **Flashlight:** `|SpringBoard| sweet-ui: iOS's flashlight drives apollo.torch (now 0 mA)`: the hook went in. Not tried: no UI.
+- **Status bar:** not seen.
+- **Metal:** backboardd DeviceLost x42, then submit failed. Frames: 0, then 4 in 10 s.
+- **Retry:** the same boot image again (`fastboot boot shim/out/shim-boot.img`): 122 shows the loss is not every boot.
+
 ### >>> BOOT 122 (2026-11-04, kernel 41832275728, metal2 41827349433 + metal2-on.txt, same options as 121): BOOTS; 14 Pro status bar style but items in the top corners; user wants the iOS flashlight button; battery gauge not at 0x4800 <<<
 
 **Observed (log 3284ea29-apollo-boot122.txt + 4 photos):**
@@ -231,7 +251,7 @@ User preference: give paste-ready commands at once, do not wait on CI (`gh run w
 - **Battery:** SID 2 blocks 0x1000-0x1300 answer type 0x2, subtypes 0x80-0x83 (the smb5 charger: chgr, dcdc, batif, usb). 0x4800 answers type 0 = **no QG there**. **Guess:** PM8150B has an FG Gen4 fuel gauge (0x4000 BATT_SOC, 0x4100 BATT_INFO; downstream qpnp-fg-gen4) instead of sweet's QG. Its registers are still to be found; the charger blocks are readable now.
 - **Not mine (user):** glitching icons; `VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT` in backboardd.
 
-### >>> BOOT 121 (2026-11-04, kernel 41829738717 = Metal 0172-0180 + 0181-0183, metal2 41827349433 + metal2-on.txt, options apollo_rtc/power/torch=1 sweetbattery=1 apollo_ui=1): BLACK SCREEN -- caused by apollo_rtc's skipped 30 s wait -> 0181/0182 fixed <<<
+### >>> BOOT 121 (2026-11-04, kernel 41829738717 = Metal 0172-0180 + 0181-0183, metal2 41827349433 + metal2-on.txt, options apollo_rtc/power/torch=1 sweetbattery=1 apollo_ui=1): BLACK SCREEN -- first blamed on apollo_rtc's skipped 30 s wait (made opt-in), but 122/123 show the same boot order: probably Metal's intermittent DeviceLost <<<
 
 **Observed (log apollo-boot121.txt, user's greps):**
 - **Order of events:** `SWEET GPU: probe in 15 s` (line 141), `exec SpringBoard` (647), `exec backboardd` (729), and only then `SWEET GPU: Adreno 650 bring-up` (4403).
@@ -242,7 +262,7 @@ User preference: give paste-ready commands at once, do not wait on CI (`gh run w
   - `the PM8150's clock is channel 2, owned by system 1 (read only)`: apollo_rtc=2 could not keep time across reboots.
   - `the clock runs, 1141934 s (control 0x80)`: about 13 days since the RTC was last reset, not real time.
 - **Battery:** `SWEET BATTERY: SID 2: gauge type 0 present 0 ... NOT read`, then `static fallback`.
-**Cause (inferred from the order):** before 0181 the kernel waited 30 s in IOKitInitializeTime (no IORTC) before launchd, so the GPU's 15 s probe always came first. apollo_rtc=1 removed that wait, so backboardd's Metal opened Turnip before the GPU was brought up. Not 0179 or the LTO plug-in (both untested otherwise: boot 120 not booted on its own).
+**First reading (inferred from the order; contradicted by boot 122, which has the same order and worked):** before 0181 the kernel waited 30 s in IOKitInitializeTime (no IORTC) before launchd, so the GPU's 15 s probe always came first. apollo_rtc=1 removed that wait, so backboardd's Metal opened Turnip before the GPU was brought up. Not 0179 or the LTO plug-in (both untested otherwise: boot 120 not booted on its own).
 **Fix:**
 - **0181:** apollo_rtc=1 now only reads the clock. The wait is skipped only with the new option `apollo_rtc_nowait=1`, which should stay off until the GPU's users wait for the GPU.
 - **0182:** sweet_spmi.c says once per SID/peripheral why a read fails (no channel maps it / timed-out channel / arbiter status). SweetBattery logs type/subtype of SID 2's blocks 0x10-0x13 and 0x48 at start.
