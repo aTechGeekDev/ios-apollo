@@ -2,7 +2,7 @@
 
 ## Agent handoff / active work
 
-### >>> CURRENT BOOT COMMANDS (as of 2026-11-04; boot 115 = faster, not 60; boot 118 = GPU idle 25-65 %, icon noise; next: boot 119, Turnip ring-order waits + xnu 0176) <<<
+### >>> CURRENT BOOT COMMANDS (as of 2026-11-04; boot 115 = faster, not 60; boot 119 = Turnip ring-order waits + 0176 (testing); next: boot 120 = + xnu 0177-0179 + LTO plug-in) <<<
 
 Builds: kernel run 41216279299 (xnu through 0168, Xcode 16.0), userland run 41218791846, metal run 41655855519 (artifact sweet-metal).
 Run on the user's Kali PC from ~/ios-apollo on `main` (research/, shim/out, recovery/recovery.img and sweet-bt/ are local, not in git).
@@ -24,6 +24,27 @@ python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --art
     --file /usr/local/lib/libsweet-bt.dylib=sweet-bt/lib/libsweet-bt.dylib \
     --files-from tools/root-files/files.txt --files-from tools/root-files/bt-on.txt \
     --files-from tools/root-files/turnip-update.txt &&
+python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/apollo.adt shim/out/payload.bin \
+    --cmdline 'debug=0xc serial=3 cpumask=0xf1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 sweetfb_noconsole=1 sweetfb_height=2502 sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetgpulevel=6 sweetmtl=2 sweetwifi=12 apollo_audio=5 apollo_sound_gain=0 apollo_sound_below=80 apollo_mic=4 apollo_haptic=5 sweetbt=6 sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool sweetnull=backboardd,SpringBoard,bluetoothd,BlueTool,mediaserverd' &&
+shim/build.sh ../shim/out/payload.bin && fastboot boot shim/out/shim-boot.img
+```
+
+**iOS on Metal boot 120 (after 119: needs boot 119's Turnip on the root):** kernel xnu run 41827766480 (0172-0179, b54a81e), sweet-metal2 metal2 run 41827349433 (HotMetal2 with the LTO bridge; Turnip unchanged from 119); `--files-from tools/root-files/metal2-on.txt` (the plug-in; not turnip-update.txt again: plug-in + Turnip together pass the 48 MiB limit). Read back: `grep -a -E 'SWEET FB: [0-9]|SweetGPU: (the display|watchdog|10 s)|SWEET CPUFREQ|SWEET TOP|SWEET SURF: rows|MTL2T|native-metal|CRASH backboardd'`.
+
+```sh
+cd ~/ios-apollo && git pull && R=aTechGeekDev/ios-apollo &&
+gh run watch 41827766480 -R $R --exit-status && gh run watch 41827349433 -R $R --exit-status &&
+rm -rf xnu/out sweet-metal2 &&
+gh run download 41827766480 -R $R -n xnu-kernel -D xnu/out &&
+gh run download 41827349433 -R $R -n sweet-metal2 -D sweet-metal2 &&
+python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --artwork-subtype 2556 \
+    --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
+    --gmu-fw research/apollo-gpu/a650_gmu.bin --sqe-fw research/apollo-gpu/a650_sqe.fw \
+    --zap-mdt research/apollo-gpu/a650_zap.mdt --zap-seg research/apollo-gpu/a650_zap.b02 \
+    --wifi-fw research/apollo-wifi --bt-fw research/apollo-bt \
+    --file /usr/local/lib/libsweet-bt.dylib=sweet-bt/lib/libsweet-bt.dylib \
+    --files-from tools/root-files/files.txt --files-from tools/root-files/bt-on.txt \
+    --files-from tools/root-files/metal2-on.txt &&
 python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/apollo.adt shim/out/payload.bin \
     --cmdline 'debug=0xc serial=3 cpumask=0xf1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 sweetfb_noconsole=1 sweetfb_height=2502 sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetgpulevel=6 sweetmtl=2 sweetwifi=12 apollo_audio=5 apollo_sound_gain=0 apollo_sound_below=80 apollo_mic=4 apollo_haptic=5 sweetbt=6 sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool sweetnull=backboardd,SpringBoard,bluetoothd,BlueTool,mediaserverd' &&
 shim/build.sh ../shim/out/payload.bin && fastboot boot shim/out/shim-boot.img
@@ -106,6 +127,16 @@ grep -a -E 'probe:|sweet-fix: configd: metal|SWEET GPU: kept|SweetGPU:' logs/apo
 ```
 
 User preference: give paste-ready commands at once, do not wait on CI (`gh run watch RUN -R $R --exit-status &&` in front when a build is pending); `[skip ci]` on notes-only commits.
+
+### >>> 60 FPS ROUND (2026-11-04; user while testing boot 119: "optimize everything and do anything you can to reach a stable 60fps across the ios"): xnu 0177-0179 + LTO bridge (f1ac365, b54a81e); NOT YET BOOTED (boot 120) <<<
+
+- **xnu 0177 big cores first** (osfmk/kern/sched_prim.c + bsd/dev/sweet_cpufreq.c): this kernel is one SMP pset (mkadt cluster-type 0), and XNU 8796's choose_processor takes the lowest-numbered idle CPU (`lsb_first(idle_primary_map)`), keeps an idle last-CPU hint, and for realtime threads the lowest CPU not running RT work (idle or not) -- with cpumask=0xf1 that is logical CPU 0 = core 0, the Cortex-A55 (1.8 GHz, about half an A77). Now: threads at sched_pri >= 31 (sweet_fast_pri) and RT threads -> fastest idle big core (`bit_first` of the non-little map: prime first), an idle little-core hint is dropped while a big core idles; threads under 31 -> the little core first. sweet_little_cpus = CPUs whose MPIDR Aff1 core < 4, set by sweet_cpufreq_init and again when the governor starts (`SWEET CPUFREQ: N CPUs up, the Cortex-A55s at CPU mask 0x1: ... (xnu 0177)`). `sweetbigfirst=0`: XNU's order. Source checked against xnu-8796.141.3 (macOS 13.5 release.json; dxb applies no sched_prim patch). Mock-compiled helper with -Wmissing-variable-declarations.
+- **xnu 0178**: every swap() calls sweet_cpufreq_boost(sweetswapboost=100 ms): all domains at their thermal cap while frames come (the schedutil-like governor hovered under the top for the drawing core). `sweetswapboost=0` off. Thermal cap (75 C) unchanged.
+- **xnu 0179**: per-method counts/time of Turnip's kernel calls every 10 s (`SweetGPU: 10 s: Turnip's calls: BoAlloc N x T ms (most M), ...`, with the busy line); gpu_smmu_refresh no longer re-cleans every page table of the space on each map/unmap (every entry/table is cleaned where written; a dsb before TLBIASID instead).
+- **metal2 (f1ac365)**: build-m2v-bridge.sh `lto = "fat"`, `codegen-units = 1` (metal2vulkan + bridge inlined across crates).
+- Checked, fine: Turnip meson release + b_ndebug; Rust release opt 3.
+- Known GPU floor (boot 118): ~14 ms GPU per heavy CA frame (16 passes, 174 draws, 12.9 Mpx) at the A650's top 587 MHz -- 60 fps needs the GPU fed continuously (Turnip 0101). Blur-heavy scenes: Settings > Accessibility > Display & Text Size > Reduce Transparency cuts CA's passes (user option, not set by us).
+- Not done (ideas): DPU VIG-pipe scaler + display SMMU to scan CA's surface directly (no blit); Turnip LTO; frontend completion-time invalidate (0.7 ms/frame on another thread).
 
 ### >>> BOOT 118 (2026-11-04, kernel 41820556724 = 0172-0175, metal2 41822453135, mtl2-autotune.txt): boots, "still laggy", icons glitch (user's photos: App Store's account icon shown as a blue noise block, other times fine) -> Turnip 0101 + xnu 0176 (boot 119) <<<
 
