@@ -1,0 +1,9 @@
+# After the jailbreak: one boot (userland/jb/sweet-jbpost.sh, run once by libsweet-fix in configd through the run file;
+# needs the libsweet-fix with the run file: metal.yml's sweet-metal artifact or a later userland run).
+# - links /var/jb/Applications/Sileo.app -> /Applications/Sileo.app (Sileo updates then land in the registered copy);
+# - unpacks /private/var/sweet-jb/apps/*.tar.gz into /Applications: add `--files-from research/apps/apps.txt`
+#   (tools/app-pack.sh APP.ipa makes them), then boot once with tools/root-files/ls-rebuild.txt to see the apps.
+# Its lines ("sweet-jb post:") reach the kernel log through install.log at the next boot. The run file is used up;
+# it is the same one the Metal tests use (/private/var/sweet-metal/run): one of the two per boot.
+/private/var/sweet-jb/post.sh=userland/jb/sweet-jbpost.sh 0:0:0755
+/private/var/sweet-metal/run=tools/root-files/jb-post-run 0:0:0644

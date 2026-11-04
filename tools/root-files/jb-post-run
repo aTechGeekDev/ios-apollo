@@ -1,0 +1,3 @@
+# libsweet-fix (configd) reads this once and removes it: userland/jb/sweet-jbpost.sh, 60 s after configd starts
+delay 60
+/var/jb/usr/bin/bash /private/var/sweet-jb/post.sh
