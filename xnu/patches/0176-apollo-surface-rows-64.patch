@@ -1,0 +1,43 @@
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -44,6 +44,7 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#include <pexpert/pexpert.h>       /* (xnu 0176) PE_parse_boot_argn */
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -309,6 +310,32 @@
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}
++	/*
++	 * (xnu 0176) Rows the GPU can take. The limits this root gives say 64 bytes, but CoreAnimation asks for its small
++	 * one-plane surfaces with rows of its own (boot 118: SpringBoard's 'LA08' masks of 160, 224, 480, 736 bytes,
++	 * a 'BGRA' one of 4512): Turnip takes a linear image only with rows a multiple of 64 bytes, metal2vulkan's import
++	 * of such a surface was refused (VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT) and icons drawn through
++	 * them showed as noise. Such a surface gets rows of the next multiple of 64; its users read the rows it has
++	 * (IOSurfaceGetBytesPerRow). Not for planes (their offsets are the creator's), nor for the creator's own pages
++	 * (IOSurfaceAddress: its rows are the creator's). Boot-arg sweetsurfrow=0: rows as asked.
++	 */
++	static int row64 = -1;
++	if (row64 < 0) {
++		int on = 1;
++		PE_parse_boot_argn("sweetsurfrow", &on, sizeof(on));
++		row64 = on != 0;
++	}
++	if (row64 && (s->bytesPerRow & (SWEET_SURFACE_ROW_ALIGN - 1)) != 0 && props->getObject("IOSurfacePlaneInfo") == NULL &&
++	    props->getObject("IOSurfaceAddress") == NULL) {
++		static uint32_t said;
++		uint32_t asked = s->bytesPerRow;
++		s->bytesPerRow = (asked + SWEET_SURFACE_ROW_ALIGN - 1) & ~(SWEET_SURFACE_ROW_ALIGN - 1);
++		if (said < 16) {
++			said++;
++			IOLog("SWEET SURF: rows of %u bytes asked (%ux%u fmt 0x%x): %u given (xnu 0176)\n", asked, s->width,
++			    s->height, s->pixelFormat, s->bytesPerRow);
++		}
++	}
+ 	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
+ 
+ 	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
