@@ -1,0 +1,36 @@
+name: ui
+
+# libsweet-ui.dylib (userland/ui): UI changes the kernel inserts into SpringBoard and the apps (xnu 0175, option
+# apollo_ui=1): the iPhone 14 Pro's status bar layout. Its own small workflow: no Mesa, a few seconds of compiling.
+# Artifact: sweet-ui (lib/libsweet-ui.dylib, SHA256SUMS).
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, "claude/**"]
+    paths:
+      - "userland/ui/**"
+      - ".github/workflows/ui.yml"
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build libsweet-ui.dylib
+        run: |
+          set -eux
+          mkdir -p out/lib
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -isysroot "$SDK" \
+            -O2 -Wall -Wextra -Werror -fobjc-arc -dynamiclib -install_name /usr/local/lib/libsweet-ui.dylib \
+            -framework Foundation -framework UIKit -lobjc -o out/lib/libsweet-ui.dylib userland/ui/sweet_ui.m
+          codesign -s - -f out/lib/libsweet-ui.dylib
+          otool -L out/lib/libsweet-ui.dylib
+      - name: Checksums
+        run: |
+          cd out && find . -type f ! -name SHA256SUMS | sort | xargs shasum -a 256 > SHA256SUMS && cat SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sweet-ui
+          path: out/

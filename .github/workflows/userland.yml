@@ -16,6 +16,7 @@ on:
       - "!userland/bt-inject/**"
       - "!userland/metal/**"
       - "!userland/metal2/**"
+      - "!userland/ui/**"
       - ".github/workflows/userland.yml"
 
 jobs:
