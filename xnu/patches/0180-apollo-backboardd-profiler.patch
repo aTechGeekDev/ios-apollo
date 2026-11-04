@@ -1,0 +1,296 @@
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -3113,3 +3113,275 @@
+ 	}
+ }
+ #endif /* SWEET */
++
++#if defined(SWEET)
++/*
++ * (xnu 0180) A sampling profiler of one process, for the frame rate: where backboardd's threads spend the processor
++ * (CoreAnimation's display thread is 30-60 % of a core while iOS animates: in metal2vulkan, Turnip, QuartzCore or the
++ * kernel?). Every SWEET_PROF_US a kernel thread (utility priority: it keeps to the little core, 0177) sends a cross-call
++ * to each CPU that is running one of the process's threads; there, in the interrupt, the interrupted context
++ * (cpu_int_state) gives the thread's PC: user code, or the kernel's (unslid) when the thread was in a system call.
++ * PCs are counted by 128-byte bucket and by 1 MiB region, threads by id; every 10 s three lines and the counts reset:
++ *   SWEET PROF: 10 s: backboardd: U samples in user code, K in the kernel (L lost); threads: name n, ...
++ *   SWEET PROF: regions (1 MiB): 0x1d19 n, ...            (the image: HotMetal2 / libvulkan_freedreno bases from the
++ *                                                          plug-in's "images:" line, the shared cache's slide from CRASH)
++ *   SWEET PROF: buckets (128 B): 0x10c7cd180 n, ...        (two lines; atos / ipsw against the same builds name them)
++ * Boot-arg sweetprof=0: off. It starts with the CPU governor (15 s into the boot) and finds the process again every 2 s.
++ */
++#define SWEET_PROF_US           2000u
++#define SWEET_PROF_SLOTS        4096u
++#define SWEET_PROF_REGIONS      256u
++#define SWEET_PROF_THREADS      16u
++#define SWEET_PROF_BUCKETS      40u
++#define SWEET_PROF_NAME         "backboardd"
++
++struct sweet_prof_slot {
++	uint64_t key;                           /* 0: free; set once by compare-and-swap */
++	uint32_t count;
++};
++static struct sweet_prof_slot sweet_prof_pc[SWEET_PROF_SLOTS], sweet_prof_region[SWEET_PROF_REGIONS],
++    sweet_prof_tid[SWEET_PROF_THREADS];
++static uint32_t sweet_prof_user, sweet_prof_kernel, sweet_prof_lost;
++static task_t sweet_prof_task;                  /* referenced; TASK_NULL: not running */
++
++void sweet_prof_start(void);
++extern void thread_set_thread_name(thread_t th, const char *name);
++
++static void
++sweet_prof_count(struct sweet_prof_slot *table, uint32_t n, uint64_t key)
++{
++	uint32_t h = (uint32_t)((key * 0x9e3779b97f4a7c15ull) >> 40) % n;
++
++	for (uint32_t probe = 0; probe < 32; probe++, h = (h + 1) % n) {
++		uint64_t k = os_atomic_load(&table[h].key, relaxed);
++		if (k == 0) {
++			k = os_atomic_cmpxchg(&table[h].key, 0ull, key, relaxed) ? key : os_atomic_load(&table[h].key, relaxed);
++		}
++		if (k == key) {
++			os_atomic_inc(&table[h].count, relaxed);
++			return;
++		}
++	}
++	os_atomic_inc(&sweet_prof_lost, relaxed);
++}
++
++/* the cross-call, on the CPU that runs one of the process's threads (interrupts off) */
++static void
++sweet_prof_sample(__unused void *arg)
++{
++	thread_t thread = current_thread();
++	task_t task = sweet_prof_task;
++	void *ctx = getCpuDatap()->cpu_int_state;
++	uint64_t pc;
++
++	if (task == TASK_NULL || get_threadtask(thread) != task) {
++		return;
++	}
++	if (ctx == NULL) {
++		os_atomic_inc(&sweet_prof_lost, relaxed);
++		return;
++	}
++	arm_saved_state_t *ss = &((arm_context_t *)ctx)->ss;
++	if (!is_saved_state64(ss)) {
++		os_atomic_inc(&sweet_prof_lost, relaxed);
++		return;
++	}
++	pc = get_saved_state_pc(ss);
++	if (PSR64_IS_USER(get_saved_state_cpsr(ss))) {
++		os_atomic_inc(&sweet_prof_user, relaxed);
++	} else {
++		os_atomic_inc(&sweet_prof_kernel, relaxed);
++		pc = (uint64_t)VM_KERNEL_UNSLIDE(pc);
++	}
++	sweet_prof_count(sweet_prof_pc, SWEET_PROF_SLOTS, (pc & ~127ull) | 1);
++	sweet_prof_count(sweet_prof_region, SWEET_PROF_REGIONS, (pc >> 20) + 1);
++	sweet_prof_count(sweet_prof_tid, SWEET_PROF_THREADS, thread->thread_id + 1);
++}
++
++/* the process (again): referenced, the old one let go */
++static void
++sweet_prof_find(void)
++{
++	task_t task, found = TASK_NULL, old = TASK_NULL;
++
++	lck_mtx_lock(&tasks_threads_lock);
++	queue_iterate(&tasks, task, task_t, tasks) {
++		void *proc = task->active ? get_bsdtask_info(task) : NULL;
++		if (proc != NULL && strncmp(proc_name_address(proc), SWEET_PROF_NAME, 16) == 0) {
++			found = task;
++			break;
++		}
++	}
++	if (found != sweet_prof_task) {
++		if (found != TASK_NULL) {
++			task_reference(found);
++		}
++		old = sweet_prof_task;
++		sweet_prof_task = found;
++	}
++	lck_mtx_unlock(&tasks_threads_lock);
++	if (old != TASK_NULL) {
++		task_deallocate(old);
++	}
++}
++
++/* the `n` largest counts of `table` into `best` (keys), in order; how many */
++static unsigned
++sweet_prof_top(struct sweet_prof_slot *table, uint32_t size, uint64_t *best_key, uint32_t *best_count, unsigned n)
++{
++	unsigned have = 0;
++
++	for (uint32_t i = 0; i < size; i++) {
++		uint64_t key = os_atomic_load(&table[i].key, relaxed);
++		uint32_t count = os_atomic_load(&table[i].count, relaxed);
++		unsigned place = have;
++
++		if (key == 0 || count == 0) {
++			continue;
++		}
++		while (place > 0 && count > best_count[place - 1]) {
++			place--;
++		}
++		if (place >= n) {
++			continue;
++		}
++		unsigned last = have < n ? have : n - 1;
++		for (unsigned k = last; k > place; k--) {
++			best_key[k] = best_key[k - 1];
++			best_count[k] = best_count[k - 1];
++		}
++		best_key[place] = key;
++		best_count[place] = count;
++		have = have < n ? have + 1 : n;
++	}
++	return have;
++}
++
++static void
++sweet_prof_say(uint64_t window_abs)
++{
++	static char line[640];
++	uint64_t keys[SWEET_PROF_BUCKETS], ns = 0;
++	uint32_t counts[SWEET_PROF_BUCKETS];
++	unsigned n;
++	int at;
++	uint32_t user = os_atomic_load(&sweet_prof_user, relaxed), kernel = os_atomic_load(&sweet_prof_kernel, relaxed);
++
++	absolutetime_to_nanoseconds(window_abs, &ns);
++	if (user + kernel == 0) {
++		return;
++	}
++	at = snprintf(line, sizeof(line), "%llu s: %s: %u samples in user code, %u in the kernel (%u lost); threads:",
++	    ns / NSEC_PER_SEC, SWEET_PROF_NAME, user, kernel, os_atomic_load(&sweet_prof_lost, relaxed));
++	n = sweet_prof_top(sweet_prof_tid, SWEET_PROF_THREADS, keys, counts, 8);
++	task_t task = sweet_prof_task;
++	for (unsigned i = 0; i < n && at > 0 && (size_t)at < sizeof(line); i++) {
++		char name[MAXTHREADNAMESIZE];
++		thread_t thread;
++
++		name[0] = '\0';
++		if (task != TASK_NULL) {
++			task_lock(task);
++			queue_iterate(&task->threads, thread, thread_t, task_threads) {
++				if (thread->thread_id + 1 == keys[i]) {
++					thread_get_thread_name(thread, name);
++					break;
++				}
++			}
++			task_unlock(task);
++		}
++		name[MAXTHREADNAMESIZE - 1] = '\0';
++		if (name[0] != '\0') {
++			at += snprintf(line + at, sizeof(line) - (size_t)at, " %s %u", name, counts[i]);
++		} else {
++			at += snprintf(line + at, sizeof(line) - (size_t)at, " #%llu %u", keys[i] - 1, counts[i]);
++		}
++	}
++	printf("SWEET PROF: %s\n", line);
++
++	n = sweet_prof_top(sweet_prof_region, SWEET_PROF_REGIONS, keys, counts, 16);
++	at = snprintf(line, sizeof(line), "regions (1 MiB):");
++	for (unsigned i = 0; i < n && at > 0 && (size_t)at < sizeof(line); i++) {
++		at += snprintf(line + at, sizeof(line) - (size_t)at, " %#llx %u", keys[i] - 1, counts[i]);
++	}
++	printf("SWEET PROF: %s\n", line);
++
++	n = sweet_prof_top(sweet_prof_pc, SWEET_PROF_SLOTS, keys, counts, SWEET_PROF_BUCKETS);
++	for (unsigned half = 0; half < 2; half++) {
++		at = snprintf(line, sizeof(line), "buckets (128 B)%s:", half ? ", more" : "");
++		for (unsigned i = half * (SWEET_PROF_BUCKETS / 2); i < n && i < (half + 1) * (SWEET_PROF_BUCKETS / 2) &&
++		    at > 0 && (size_t)at < sizeof(line); i++) {
++			at += snprintf(line + at, sizeof(line) - (size_t)at, " %#llx %u", keys[i] & ~127ull, counts[i]);
++		}
++		printf("SWEET PROF: %s\n", line);
++	}
++
++	bzero(sweet_prof_pc, sizeof(sweet_prof_pc));
++	bzero(sweet_prof_region, sizeof(sweet_prof_region));
++	bzero(sweet_prof_tid, sizeof(sweet_prof_tid));
++	os_atomic_store(&sweet_prof_user, 0, relaxed);
++	os_atomic_store(&sweet_prof_kernel, 0, relaxed);
++	os_atomic_store(&sweet_prof_lost, 0, relaxed);
++}
++
++static void
++sweet_prof_main(__unused void *arg, __unused wait_result_t result)
++{
++	uint64_t window, refind, since = mach_absolute_time(), found_at = 0;
++
++	nanoseconds_to_absolutetime(10ull * NSEC_PER_SEC, &window);
++	nanoseconds_to_absolutetime(2ull * NSEC_PER_SEC, &refind);
++	printf("SWEET PROF: sampling %s every %u us (xnu 0180)\n", SWEET_PROF_NAME, SWEET_PROF_US);
++	for (;;) {
++		uint64_t now = mach_absolute_time();
++		task_t task;
++
++		if (found_at == 0 || now - found_at >= refind) {
++			sweet_prof_find();
++			found_at = now;
++		}
++		task = sweet_prof_task;
++		if (task != TASK_NULL) {
++			int self = cpu_number();
++			for (unsigned i = 0; i < topology_info.num_cpus && i < MAX_SCHED_CPUS; i++) {
++				processor_t processor = processor_array[i];
++				thread_t active;
++
++				if (processor == PROCESSOR_NULL || processor->cpu_id == self || processor->state != PROCESSOR_RUNNING) {
++					continue;
++				}
++				active = processor->active_thread;
++				if (active == THREAD_NULL || get_threadtask(active) != task) {
++					continue;
++				}
++				if (cpu_xcall(processor->cpu_id, sweet_prof_sample, (void *)1) != KERN_SUCCESS) {
++					os_atomic_inc(&sweet_prof_lost, relaxed);
++				}
++			}
++		}
++		if (now - since >= window) {
++			sweet_prof_say(now - since);
++			since = now;
++		}
++		delay_for_interval(SWEET_PROF_US, NSEC_PER_USEC);
++	}
++}
++
++void
++sweet_prof_start(void)
++{
++	static bool started;
++	uint32_t on = 1;
++	thread_t thread;
++
++	PE_parse_boot_argn("sweetprof", &on, sizeof(on));
++	if (started || on == 0) {
++		return;
++	}
++	started = true;
++	if (kernel_thread_start_priority(sweet_prof_main, NULL, BASEPRI_UTILITY, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet profiler");
++		thread_deallocate(thread);
++	}
++}
++#endif /* SWEET */
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -60,6 +60,7 @@
+ extern int sweet_rpmh_ddr_set(bool top);                                                /* sweet_rpmh.c */
+ extern void sweet_cpu_top(char *out, size_t size, uint64_t window_abs);                 /* machine_routines.c (0155) */
+ extern void sweet_cpu_tame(uint64_t window_abs);                                        /* machine_routines.c (0160) */
++extern void sweet_prof_start(void);                                                     /* machine_routines.c (0180) */
+ void sweet_cpufreq_boost(uint32_t ms);                                                  /* (0160) SweetHID.cpp's touches */
+ void sweet_cpufreq_init(void);
+ extern void thread_set_thread_name(thread_t thread, const char *name);          /* (0157) */
+@@ -283,6 +284,7 @@
+ 	stats_since = at_prev = tame_since = mach_absolute_time();
+ 	governing = true;
+ 	cpufreq_cpu_kinds(true);        /* (0177) every CPU is up by now */
++	sweet_prof_start();             /* (0180) machine_routines.c: backboardd's sampling profiler (sweetprof=0: off) */
+ 
+ 	for (;;) {
+ 		uint64_t now = mach_absolute_time(), span = now - at_prev;
