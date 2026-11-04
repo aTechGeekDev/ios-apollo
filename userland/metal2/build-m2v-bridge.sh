@@ -33,6 +33,10 @@ sha2 = { version = "0.10", features = ["asm"] }
 [profile.release]
 panic = "unwind"
 debug = 1
+# ios-apollo: one optimisation unit across metal2vulkan's crates and the bridge (backboardd's display thread spends
+# 30-60 % of a core in this code while CoreAnimation draws: inlining across the crate boundaries matters there)
+lto = "fat"
+codegen-units = 1
 EOF
 if [ "$target" = ios ]; then triple=aarch64-apple-ios; else triple=aarch64-apple-darwin; fi
 # CI touches work/metal2vulkan back to 2025-01-01 while restoring a newer work/m2v-bridge/target cache via restore-keys;
