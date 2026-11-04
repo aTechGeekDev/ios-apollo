@@ -228,6 +228,15 @@ User preference: give paste-ready commands at once, do not wait on CI (`gh run w
 **Observed:** `SWEET MTL: IOAcceleratorES published (MetalPluginName SweetMetal2)`; backboardd loaded the plug-in (`MTL2[58 backboardd]`), then `native-metal: device refused: device: ShaderCache(ShaderCacheError { path: "/var/local/m2v-cache/backboardd", kind: PermissionDenied })` in 11 ms; `libvulkan_freedreno 0x0` (Turnip never loaded); `SpringBoard: not listed (/var/local/mtl2-clients): no Metal device` (as intended). With no device CoreAnimation drew on the CPU (no GL bridge either): SWEET FB 12.9/16.2/3.9 frames a second, 0 waited for the GPU, the CPU copy path. The plug-in's stderr lines reach the log (the 0171-era HotMetal2 change works).
 **Cause:** /private/var/local was created by the kernel (root, 0755) to write mtl2.log; backboardd runs as mobile, so mkdir /var/local/m2v-cache failed, and backboardd has no _CS_DARWIN_USER_CACHE_DIR. **Fix:** HotMetal2.mm falls back to /private/var/tmp/m2v-cache/<process> (1777 parent). Boot 114 = boot 113's command with the new metal2 run.
 
+### >>> BOOTS 123b + 124 (2026-11-04): 123's image again -> stuck; 124 = GL bridge (no sweetmtl, libsweet-ca in sweetinject), same kernel 41837987204 + sweet-ui 41837027762 + options -> ALSO STUCK at the Apple logo (user; no log). User: wait for the Metal agent, then continue <<<
+
+**Suspect: my libsweet-ui 41837027762, not only Metal.** Boot 122 (sweet-ui 41829738713: status bar default only) reached the home screen. Every boot since has the new library, which in SpringBoard:
+- dlopens AVFCapture in its constructor;
+- swizzles AVFlashlight;
+- answers DynamicSplit's sensorAreaRect.
+
+All of them stuck, including 124 without Metal. **Test before blaming Metal:** the same boot without `--option apollo_ui=1`, or with sweet-ui from ui run 41829738713. If that boots, the fault is mine (first suspect: the AVFCapture dlopen inside an image initializer). Metal agent: 123's DeviceLost may still be real (122 had none), but the stuck logo is not proven to be yours.
+
 ### >>> BOOT 123 (2026-11-04, kernel 41837987204, metal2 41827349433 + metal2-on.txt, sweet-ui 41837027762 (island rect + flashlight), same options): STUCK AT THE APPLE LOGO -- Metal DeviceLost again (see the correction in the note for the Metal agent) <<<
 
 **Observed:**
