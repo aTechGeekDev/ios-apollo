@@ -2,20 +2,20 @@
 
 ## Agent handoff / active work
 
-### >>> CURRENT BOOT COMMANDS (as of 2026-11-04; boot 115 = faster, not 60; boot 117 = sysmem -> DeviceLost, black; next: boot 118, back to autotune) <<<
+### >>> CURRENT BOOT COMMANDS (as of 2026-11-04; boot 115 = faster, not 60; boot 118 = GPU idle 25-65 %, icon noise; next: boot 119, Turnip ring-order waits + xnu 0176) <<<
 
 Builds: kernel run 41216279299 (xnu through 0168, Xcode 16.0), userland run 41218791846, metal run 41655855519 (artifact sweet-metal).
 Run on the user's Kali PC from ~/ios-apollo on `main` (research/, shim/out, recovery/recovery.img and sweet-bt/ are local, not in git).
 `--artwork-subtype 2556` stays on every boot (Dynamic Island).
 
-**iOS on Metal boot (next, 118: boot 116's rendering + xnu 0175 timing):** kernel xnu run 41820556724 (0172-0175), sweet-metal2 metal2 run 41822453135 (Turnip's messages on stderr); `--files-from tools/root-files/metal2-on.txt --files-from tools/root-files/mtl2-autotune.txt` (puts /var/local/mtl2-tu-debug back to `nocb`, undoing boot 117's sysmem, which stays on the root otherwise); boot-arg `sweetmtl=2`; no GL bridge. Read back: `grep -a -E 'SWEET FB: [0-9]|SweetGPU: (the display|watchdog|10 s)|MTL2T|MTL2\[|TU_DEBUG|native-metal|CRASH backboardd'`.
+**iOS on Metal boot (next, 119: new Turnip + xnu 0176):** kernel xnu run 41824286340 (0172-0176, a33d6a8), sweet-metal2 metal2 run 41824286474 (Turnip with turnip/patches/0101 ring-order waits); `--files-from tools/root-files/turnip-update.txt` only (the plug-in and /var/local/mtl2-tu-debug = nocb are on the root since boot 118); boot-arg `sweetmtl=2`; no GL bridge. Read back: `grep -a -E 'SWEET FB: [0-9]|SweetGPU: (the display|watchdog|10 s)|SWEET SURF: rows|MTL2T|MTL2\[|native-metal|CRASH backboardd'`.
 
 ```sh
 cd ~/ios-apollo && git pull && R=aTechGeekDev/ios-apollo &&
-gh run watch 41822453135 -R $R --exit-status &&
+gh run watch 41824286340 -R $R --exit-status && gh run watch 41824286474 -R $R --exit-status &&
 rm -rf xnu/out sweet-metal2 &&
-gh run download 41820556724 -R $R -n xnu-kernel -D xnu/out &&
-gh run download 41822453135 -R $R -n sweet-metal2 -D sweet-metal2 &&
+gh run download 41824286340 -R $R -n xnu-kernel -D xnu/out &&
+gh run download 41824286474 -R $R -n sweet-metal2 -D sweet-metal2 &&
 python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --artwork-subtype 2556 \
     --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
     --gmu-fw research/apollo-gpu/a650_gmu.bin --sqe-fw research/apollo-gpu/a650_sqe.fw \
@@ -23,7 +23,7 @@ python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --art
     --wifi-fw research/apollo-wifi --bt-fw research/apollo-bt \
     --file /usr/local/lib/libsweet-bt.dylib=sweet-bt/lib/libsweet-bt.dylib \
     --files-from tools/root-files/files.txt --files-from tools/root-files/bt-on.txt \
-    --files-from tools/root-files/metal2-on.txt --files-from tools/root-files/mtl2-autotune.txt &&
+    --files-from tools/root-files/turnip-update.txt &&
 python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/apollo.adt shim/out/payload.bin \
     --cmdline 'debug=0xc serial=3 cpumask=0xf1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 sweetfb_noconsole=1 sweetfb_height=2502 sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetgpulevel=6 sweetmtl=2 sweetwifi=12 apollo_audio=5 apollo_sound_gain=0 apollo_sound_below=80 apollo_mic=4 apollo_haptic=5 sweetbt=6 sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool sweetnull=backboardd,SpringBoard,bluetoothd,BlueTool,mediaserverd' &&
 shim/build.sh ../shim/out/payload.bin && fastboot boot shim/out/shim-boot.img
@@ -106,6 +106,11 @@ grep -a -E 'probe:|sweet-fix: configd: metal|SWEET GPU: kept|SweetGPU:' logs/apo
 ```
 
 User preference: give paste-ready commands at once, do not wait on CI (`gh run watch RUN -R $R --exit-status &&` in front when a build is pending); `[skip ci]` on notes-only commits.
+
+### >>> BOOT 118 (2026-11-04, kernel 41820556724 = 0172-0175, metal2 41822453135, mtl2-autotune.txt): boots, "still laggy", icons glitch (user's photos: App Store's account icon shown as a blue noise block, other times fine) -> Turnip 0101 + xnu 0176 (boot 119) <<<
+
+**Observed (log cbc72a9e-apollo-boot118.txt):** `TU_DEBUG=nocb`; no DeviceLost (so boot 117's black screen was Turnip's sysmem mode, not 0175). **xnu 0175: `SweetGPU: 10 s: the core busy 33-75 %`** (longest submission 15-27 ms) while iOS gave 25-45 fps and MTL2T `G commit-to-complete mean 21.7 ms, max 235 ms`; K rows: 16-pass, 174-draw, 12.9 Mpx frames committed every ~20-25 ms with commit-to-callback climbing 42 -> 97 ms (a queue building up) while the GPU was not saturated. **Cause (read in UniXNU's turnip-darwin-kmd.patch, darwin_queue_submit):** "The kernel client has one ring and no GPU-side waits: wait on the CPU before submitting" -- every wait semaphore's fence waited for on the CPU before the next submission, and metal2vulkan chains its submissions with timeline semaphores: the GPU idles between submissions. **Fix: userland/metal2/turnip/patches/0101-sweet-ring-order-waits.patch** -- a sync already submitted (DARWIN_SYNC_FENCE) is skipped (ring order + 0175's WFI/flush at each submission's end), as msm's drm_sched treats same-ring dependencies; `TU_DARWIN_CPU_WAITS=1` restores.
+**Glitch:** telemetry W `VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT` + SWEET SURF creates with rows not a multiple of 64 (SpringBoard 'LA08' 160/224/480/736, 'BGRA' 4512) although the root's limits say 64: Turnip refuses linear images with such rows. Guess (strong): the template icon's LA08 mask read with the wrong rows = the noise block. **Fix: xnu 0176** rounds one-plane, non-client-memory surfaces' rows up to 64 (`SWEET SURF: rows of N bytes asked ... M given (xnu 0176)`, first 16 logged; `sweetsurfrow=0` off). Risk: a creator that writes with its own row length instead of IOSurfaceGetBytesPerRow would show sheared.
 
 ### >>> BOOT 117 (2026-11-04, kernel 41820556724 = 0172-0175, metal2 41811576010, mtl2-sysmem.txt): BLACK SCREEN -- Turnip in sysmem mode: DeviceLost after ~20 frames -> boot 118 back to autotune (mtl2-autotune.txt) <<<
 
