@@ -306,10 +306,18 @@ static bool listed(void)
 			dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
 				for (;;) {
 					sleep(10);
-					if (access("/var/local/mtl2-telemetry", F_OK) != 0)
-						continue;
 					static char text[8192];
 					native_bridge_metal_telemetry(text, sizeof(text));
+					/* ios-apollo: every 10 s on stderr too, a row a write (backboardd is in sweetnull: the
+					 * kernel's log keeps each write; where the frame time goes, read from the log pull) */
+					for (char *row = text, *end; *row; row = end + 1) {
+						end = strchr(row, '\n');
+						if (end == NULL)
+							break;
+						dprintf(2, "MTL2T: %.*s\n", (int)(end - row), row);
+					}
+					if (access("/var/local/mtl2-telemetry", F_OK) != 0)
+						continue;
 					int fd = open("/var/local/mtl2.log", O_WRONLY | O_APPEND);
 					if (fd >= 0) {
 						dprintf(fd, "MTL2[%d %s]: telemetry\n%s", getpid(), getprogname(), text);

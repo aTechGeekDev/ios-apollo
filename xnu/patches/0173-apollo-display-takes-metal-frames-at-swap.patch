@@ -1,0 +1,126 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -113,6 +113,8 @@
+  * Turnip work that drew it, and flipped to once that copy has passed: no copy by the processor, no wait for later
+  * frames' work. Any other frame is copied by the processor once the last Turnip submission there was at its swap has
+  * passed. Boot-arg sweetblit=0: always the processor's copy.
++ * (xnu 0173) Such a frame is taken up when it is swapped, not at the next vsync tick, and copied into the third frame
++ * while the last flip still waits for the panel's refresh (the flip itself waits for it, after the copy).
+  *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+@@ -274,6 +276,7 @@
+ 	bool          fScanReady;
+ 	uint32_t      fStatGPU;
+ 	void settleFlip(void);
++	bool settleWait(void);                  /* (xnu 0173) */
+ 	IOReturn scan(void *request);
+ 	uint32_t      fStatFlips, fStatFlipWaits;
+ 	/* (xnu 0172) the GPU's copy of Metal frames */
+@@ -764,6 +767,7 @@
+ 		 * to be (the last flip settled first: at most a refresh); else the scanned one, as before.
+ 		 */
+ 		int target = -1, gpuFrame = -1;
++		bool early = false;                     /* (xnu 0173) */
+ 		if (fFlipCount == 3 && coversDisplay(rec)) {
+ 			/* (xnu 0159) a frame the GPU has already scaled this swap's picture into: its only layer is that surface */
+ 			uint32_t mask = get32(rec, 0x104), layer0 = (mask & 1u) ? get32(rec, 0x54) : 0, newest = 0;
+@@ -779,20 +783,12 @@
+ 				}
+ 			}
+ 			IOLockUnlock(fLock);
+-			/* the last flip settled first (at most a refresh: 7 ms at 144 Hz) */
+-			uint64_t waited_us = 0;
+-			for (;;) {
+-				IOLockLock(fLock);
+-				settleFlip();
+-				bool settled = fFlipPending < 0;
+-				IOLockUnlock(fLock);
+-				if (settled || waited_us >= 50000) {
+-					break;
+-				}
+-				IODelay(200);
+-				waited_us += 200;
+-			}
+-			if (waited_us != 0) {
++			/*
++			 * the last flip settled first (at most a refresh: 7 ms at 144 Hz); (xnu 0173) a Metal frame is copied into
++			 * the third frame meanwhile, and the flip waits for it after the copy
++			 */
++			early = fBlitOn && swapFence != 0 && gpuFrame < 0;
++			if (!early && settleWait()) {
+ 				fStatFlipWaits++;
+ 			}
+ 			/* (xnu 0172) a frame an earlier copy gave up waiting for: free again once that copy has passed */
+@@ -805,8 +801,8 @@
+ 			if (gpuFrame < 0) {
+ 				/* the processor copies: into a frame nobody has (marked so while it does) */
+ 				IOLockLock(fLock);
+-				for (int f = 0; f < 3 && target < 0 && fFlipPending < 0; f++) {
+-					if (f != fFlipFront && fFlipOwner[f] == SWEET_SCAN_FREE) {
++				for (int f = 0; f < 3 && target < 0 && (early || fFlipPending < 0); f++) {
++					if (f != fFlipFront && f != fFlipPending && fFlipOwner[f] == SWEET_SCAN_FREE) {
+ 						target = f;
+ 						fFlipOwner[f] = SWEET_SCAN_CPU;
+ 					}
+@@ -828,7 +824,10 @@
+ 			if (target >= 0 && fBlitOn && swapFence != 0) {
+ 				blitFence = presentBlit(rec, target);
+ 			}
+-			if (blitFence != 0) {
++			if (early && target < 0) {
++				/* (xnu 0173) no frame free (the scanned, the flipped-to, one a copy still has): again shortly */
++				shown = false;
++			} else if (blitFence != 0) {
+ 				uint32_t waited_us = 0;
+ 				while (!(shown = sweet_gpu_fence_passed(blitFence)) && waited_us < 100000) {
+ 					IODelay(200);
+@@ -850,6 +849,9 @@
+ 			}
+ 		}
+ 		int flipTo = gpuFrame >= 0 ? gpuFrame : target;
++		if (early && flipTo >= 0 && shown && settleWait()) {
++			fStatFlipWaits++;       /* (xnu 0173) the copy was done before the last flip was taken */
++		}
+ 		if (flipTo >= 0) {
+ 			IOLockLock(fLock);
+ 			if (shown && fFlipPending < 0 && sweet_flip(fFlipPA[flipTo], fFlipStride)) {
+@@ -905,6 +907,26 @@
+ 	}
+ }
+ 
++/* (xnu 0173) without fLock: until the last flip has been taken (at most 50 ms); true if it had to wait */
++bool
++AppleCLCD::settleWait(void)
++{
++	uint64_t waited_us = 0;
++
++	for (;;) {
++		IOLockLock(fLock);
++		settleFlip();
++		bool settled = fFlipPending < 0;
++		IOLockUnlock(fLock);
++		if (settled || waited_us >= 50000) {
++			break;
++		}
++		IODelay(200);
++		waited_us += 200;
++	}
++	return waited_us != 0;
++}
++
+ /* (xnu 0159) with fLock held: the last flip taken by the hardware, the frame it went to is the shown one */
+ void
+ AppleCLCD::settleFlip(void)
+@@ -1143,6 +1165,11 @@
+ 	fPendingFence = fence;
+ 	fDirty = true;
+ 	fStatSwaps++;                   /* (xnu 0148) */
++	if (fBlitOn && fence != 0 && !fPowerOff) {
++		/* (xnu 0173) a Metal frame: taken up now, not at the next tick */
++		fPresentWanted = true;
++		IOLockWakeup(fLock, &fPresentWanted, true);
++	}
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);

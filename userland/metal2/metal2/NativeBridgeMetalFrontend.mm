@@ -424,7 +424,38 @@ NB_RESOURCE_SPI
 // owners keep the mapping live through this phase. Maintain each exact CPU
 // range once; no address identity or decision is carried into another phase
 // or command, and distinct/partially overlapping ranges retain their calls.
-static void flushSurfaces(NSMutableSet *surfaces) {
+// ios-apollo (boot 115): the commit-time pass cleaned every page of every surface a command buffer names, on the
+// committing thread (CoreAnimation's render thread: the display surface, the wallpaper, every window, each frame).
+// The CPU writes a surface only between IOSurfaceLock and IOSurfaceUnlock, and an unlock for writing bumps its seed:
+// a surface already cleaned at this seed holds no dirty lines of the CPU's, and is skipped -- for up to
+// kSeenForUs, then cleaned anyway (SweetGPU's own Mesa path also cleans at least once a frame: a writer that skips
+// the lock shows late, not never). /var/local/mtl2-env SWEET_MTL2_FLUSH_ALL=1: every surface every time, as before.
+// Each surface is held (CFRetain) while it is remembered, so the same pointer is the same surface; ones only this
+// table holds are let go.
+static constexpr uint64_t kSeenForUs=100000;
+struct Seen {uint32_t seed;uint64_t cleanedUs;};
+static std::mutex gSeenLock;
+static std::unordered_map<IOSurfaceRef,Seen> gSeenSeed;
+static uint64_t gSeenLooks;
+static std::atomic<uint64_t> gSurfaceSkips;
+static bool surfaceUnchanged(IOSurfaceRef surface) {
+ static const bool all=getenv("SWEET_MTL2_FLUSH_ALL") && !strcmp(getenv("SWEET_MTL2_FLUSH_ALL"),"1");
+ if(all)return false;
+ const uint32_t seed=IOSurfaceGetSeed(surface);
+ const uint64_t now=nowUs();
+ std::lock_guard<std::mutex> lock(gSeenLock);
+ if(++gSeenLooks%512==0) {
+  for(auto it=gSeenSeed.begin();it!=gSeenSeed.end();) {
+   if(CFGetRetainCount(it->first)<=1){CFRelease(it->first);it=gSeenSeed.erase(it);}else ++it;
+  }
+ }
+ auto it=gSeenSeed.find(surface);
+ if(it!=gSeenSeed.end() && it->second.seed==seed && now-it->second.cleanedUs<kSeenForUs){gSurfaceSkips++;return true;}
+ if(it==gSeenSeed.end()){CFRetain(surface);gSeenSeed.emplace(surface,Seen{seed,now});}else it->second=Seen{seed,now};
+ return false;
+}
+static Timed gTimeSurfaceInvalidate;
+static void flushSurfaces(NSMutableSet *surfaces,bool commitTime=false) {
  if(!surfaces.count)return;
  std::vector<std::pair<uintptr_t,size_t>> ranges;
  ranges.reserve(surfaces.count);
@@ -433,6 +464,7 @@ static void flushSurfaces(NSMutableSet *surfaces) {
   IOSurfaceRef surface=[item isKindOfClass:[NBTexture class]]?[(NBTexture *)item surface]:
                        ([item isKindOfClass:[NBBuffer class]]?[(NBBuffer *)item surfaceOwner]:nullptr);
   if(!surface)continue;
+  if(commitTime && surfaceUnchanged(surface))continue;   // ios-apollo
   void *rawBase=IOSurfaceGetBaseAddress(surface);
   const size_t allocation=IOSurfaceGetAllocSize(surface);
   if(!rawBase || !allocation)continue;
@@ -446,7 +478,7 @@ static void flushSurfaces(NSMutableSet *surfaces) {
  for(auto it=ranges.begin();it!=last;++it) {
   const uint64_t began=nowUs();
   sys_dcache_flush(reinterpret_cast<void *>(it->first),it->second);
-  gSurfaceFlushBytes+=it->second;gTimeSurfaceFlush.add(began);
+  gSurfaceFlushBytes+=it->second;(commitTime?gTimeSurfaceFlush:gTimeSurfaceInvalidate).add(began);
  }
 }
 static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface) {
@@ -1485,7 +1517,7 @@ static void scheduled(void *context);
  dispatch_group_enter(_schedulingHandlers);
  @synchronized(gInFlight){[gInFlight addObject:self];}
  if(!self.encodeFailure) {
-  flushSurfaces(_surfaces);
+  flushSurfaces(_surfaces,true);
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
   if(nmb_command_buffer_on_completed(_handle,completed,context) &&
@@ -2699,6 +2731,9 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceFlush.count.load(),
   (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),
   (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());
+ row("J surface skipped=%llu invalidate n=%llu us=%llu max=%llu",(unsigned long long)gSurfaceSkips.load(),  // ios-apollo
+  (unsigned long long)gTimeSurfaceInvalidate.count.load(),(unsigned long long)gTimeSurfaceInvalidate.total.load(),
+  (unsigned long long)gTimeSurfaceInvalidate.slowest.load());
  {
   uint64_t pbytes=0;size_t pcnt=0;
   {std::lock_guard<std::mutex> lock(gTexturePoolLock);pbytes=gTexturePoolBytes;pcnt=gTexturePool.size();}
