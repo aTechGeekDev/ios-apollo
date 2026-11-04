@@ -5,7 +5,7 @@
  #include <sys/time.h>
  
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
-+/* bsd/dev/apollo_pmic.c (xnu 0172): true if the PM8150's clock gives the calendar (apollo_rtc=1 or 2) */
++/* bsd/dev/apollo_pmic.c (xnu 0173): true if the PM8150's clock gives the calendar (apollo_rtc=1 or 2) */
 +extern "C" bool apollo_pmic_early_init(void);
 +#endif
 +
@@ -40,7 +40,7 @@
  }
  
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
-+/* bsd/dev/apollo_pmic.c (xnu 0172): the PM8150's clock (apollo_rtc=1 or 2); -1 when not in use */
++/* bsd/dev/apollo_pmic.c (xnu 0173): the PM8150's clock (apollo_rtc=1 or 2); -1 when not in use */
 +extern "C" int apollo_pmic_time_get(clock_sec_t *secs);
 +extern "C" void apollo_pmic_time_set(clock_sec_t secs);
 +#endif
@@ -84,7 +84,7 @@
 +++ b/bsd/dev/apollo_pmic.c
 @@ -0,0 +1,523 @@
 +/*
-+ * apollo (xnu 0172): the clock, power off / restart and the flashlight, through the Mi 10T's PMICs.
++ * apollo (xnu 0173): the clock, power off / restart and the flashlight, through the Mi 10T's PMICs.
 + *
 + * Every part is off unless its option is set. An option is a boot-arg or, because the boot line is full (607 characters at
 + * most), a 32-bit property of the ADT's /sweet-options node (tools/mkadt.py --option NAME=N); the boot-arg wins.
@@ -216,10 +216,10 @@
 +		printf("apollo pmic: the SPMI arbiter could not be mapped\n");
 +		return false;
 +	}
-+	uint32_t version = rd(arb_core);
++	uint32_t arb_version = rd(arb_core);
 +	arb_channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
-+	if (version < 0x50000000u || version >= 0x70000000u || arb_channels == 0 || arb_channels > 512) {
-+		printf("apollo pmic: SPMI arbiter version %#x with %u channels: not the one expected\n", version, arb_channels);
++	if (arb_version < 0x50000000u || arb_version >= 0x70000000u || arb_channels == 0 || arb_channels > 512) {
++		printf("apollo pmic: SPMI arbiter version %#x with %u channels: not the one expected\n", arb_version, arb_channels);
 +		return false;
 +	}
 +	arb_ready = true;

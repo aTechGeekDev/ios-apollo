@@ -1,0 +1,677 @@
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -63,5 +63,23 @@
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
++/*
++ * (xnu 0172) A scaled copy of one surface's pixels into another's by the GPU's 2D engine (SweetGPU.cpp), queued in the
++ * ring behind everything already submitted: 'BGRA' bytes in, 'BGRA' bytes out, linear, rows a multiple of 64 bytes.
++ * Rectangles in pixels; the source's first byte at src_offset of its memory. Returns the submission's fence (the copy
++ * is done once sweet_gpu_fence_passed() says so); 0: not queued (no GPU, a mapping refused, the ring full).
++ */
++struct sweet_blit {
++	SweetSurface *src;
++	uint64_t src_offset;
++	uint32_t src_row, src_w, src_h;         /* the source's rows and its size */
++	uint32_t sx, sy, sw, sh;                /* what of it */
++	SweetSurface *dst;                      /* the panel's frames: kept in the GPU's address space */
++	uint32_t dst_row;
++	uint32_t dx, dy, dw, dh;
++	bool filter;                            /* bilinear */
++};
++uint32_t sweet_gpu_blit(const struct sweet_blit *b);
++
+ #endif /* SWEET */
+ #endif /* _SWEET_SURFACE_H */
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -67,6 +67,8 @@
+ 
+ void SweetGPUStart(void);
+ bool sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size);
++uint32_t sweet_gpu_v2_last(void);                       /* (0172) */
++bool sweet_gpu_fence_passed(uint32_t fence);            /* (0172) */
+ void sweet_accelerator_start(IOService *provider);     /* (0170) SweetAccelerator.cpp */
+ }
+ 
+@@ -806,14 +808,12 @@
+ 	IOLockLock(gGPULock);
+ 	/*
+ 	 * (xnu 0171) With Metal on Turnip (sweetmtl=2) the window server's frames are drawn by Turnip into the display's
+-	 * surfaces: a surface is shown only once every Turnip submission so far has passed, and what this processor's cache
+-	 * holds of it goes then (the GPU wrote memory behind it). Coarse: all of Turnip's work, every frame.
++	 * surfaces: what this processor's cache holds of one goes before it is copied (the GPU wrote memory behind it).
++	 * (xnu 0172) The waiting is the display's now, for the last Turnip submission there was when the frame was swapped
++	 * (sweet_gpu_v2_last()): 0171 waited here for the last one there IS, which moved on with every frame backboardd
++	 * queued meanwhile (boot 114: thousands of "waited for the GPU" every 10 s, 12-40 frames a second reached the panel).
+ 	 */
+ 	if (gV2LastFence != 0) {
+-		if (!gGPUStopped && !sweet_gpu_done(gV2LastFence)) {
+-			IOLockUnlock(gGPULock);
+-			return false;
+-		}
+ 		drawn = true;
+ 	}
+ 	for (uint32_t k = 0; k < GPU_SURFACE_WRITES; k++) {
+@@ -837,6 +837,321 @@
+ 	return true;
+ }
+ 
++/* (xnu 0172) the last submission any Turnip client has made (0: none yet: no Metal on Turnip) */
++uint32_t
++sweet_gpu_v2_last(void)
++{
++	return gV2LastFence;
++}
++
++/* (xnu 0172) submission `fence` has passed (or the core stopped: nothing will pass, nothing is waited for) */
++bool
++sweet_gpu_fence_passed(uint32_t fence)
++{
++	bool passed;
++
++	if (gGPULock == NULL || fence == 0) {
++		return true;
++	}
++	IOLockLock(gGPULock);
++	passed = gGPUStopped || sweet_gpu_done(fence);
++	IOLockUnlock(gGPULock);
++	return passed;
++}
++
++/*
++ * (xnu 0172) The display's own GPU copy (sweet_gpu_blit(), SweetSurface.h), for Metal on Turnip: backboardd's frame
++ * (an IOSurface Turnip drew into) scaled by the 2D engine into a page-flip frame of the panel, in the ring behind the
++ * Turnip work that drew it, so nothing waits on the processor and nothing is copied by it (boot 114: the processor's
++ * copy took 4-7 ms a frame). The stream is Turnip's for vkCmdBlitImage of a B8G8R8A8 image (tu_clear_blit.cc
++ * r2d_setup / r2d_src / r2d_dst / r2d_run, Mesa 25), as IOS-26-Hot's xnu 0095 (flame) captured it on the A640, with
++ * the A650's values: RB_CCU_CNTL for sysmem 0x18000000 (3 CCUs, as step 22 of sweet_gpu.c), RB_DBG_ECO_CNTL needs no
++ * change around the blit (freedreno_devices.py: _blit = the value for the A650). Turnip writes all of its state again
++ * at the start of every command buffer (tu6_init_hw), so what the copy leaves set does not reach its next one.
++ *
++ * Surfaces are entered into the GPU's address space once and kept (BLIT_MAPS, the least recently used given back
++ * when its last copy has passed; one not used for BLIT_IDLE_MS given back too); the copy's command stream goes into
++ * one of BLIT_SLOTS places of a write-combining page.
++ */
++#define BLIT_MAPS               8
++#define BLIT_SLOTS              4
++#define BLIT_SLOT_BYTES         0x300u          /* a stream is 70 words */
++#define BLIT_STAMP_AT           0xe00u          /* where the events' timestamps go */
++#define BLIT_IDLE_MS            2000
++#define BLIT_RB_CCU_CNTL_SYSMEM 0x18000000u
++#define BLIT_8888_UNORM         0x10f03000u     /* RB_2D_BLIT_CNTL: FMT6_8_8_8_8_UNORM, mask 0xf, R2D_UNORM8 */
++#define BLIT_SRC_INFO           0x00500430u     /* SP_PS_2D_SRC_INFO: 8888, linear, WXYZ, UNK20, UNK22 */
++#define BLIT_DST_INFO           0x00000430u     /* RB_2D_DST_INFO: 8888, linear, WXYZ */
++#define BLIT_DST_FORMAT         0x0000f180u     /* SP_2D_DST_FORMAT: 8888, mask 0xf */
++
++struct blit_map {
++	SweetSurface *surface;                  /* held while mapped; NULL: a free entry */
++	uint64_t address, size;
++	uint32_t fence;                         /* the last copy that reads or writes it */
++	uint64_t used;                          /* mach_absolute_time() of that copy */
++	bool keep;                              /* a panel frame: never given back */
++};
++static struct blit_map gBlitMaps[BLIT_MAPS];
++static IOBufferMemoryDescriptor *gBlitMemory;
++static volatile uint32_t *gBlitWords;
++static uint64_t gBlitAddress;
++static uint32_t gBlitFence[BLIT_SLOTS], gBlitNext;
++static bool gBlitRefused;                       /* the stream's page could not be had: never again */
++
++static inline uint32_t
++blitParity(uint32_t v)
++{
++	return (0x9669u >> (0xfu & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^ (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1u;
++}
++
++static inline uint32_t
++blitPkt4(uint32_t reg, uint32_t count)
++{
++	return (4u << 28) | count | (blitParity(count) << 7) | (reg << 8) | (blitParity(reg) << 27);
++}
++
++static inline uint32_t
++blitPkt7(uint32_t op, uint32_t count)
++{
++	return (7u << 28) | count | (blitParity(count) << 15) | (op << 16) | (blitParity(op) << 23);
++}
++
++/* With gGPULock held: the page for the streams, once */
++static bool
++blitSetup(void)
++{
++	IOByteCount length = 0;
++	addr64_t phys;
++
++	if (gBlitWords != NULL) {
++		return true;
++	}
++	if (gBlitRefused) {
++		return false;
++	}
++	gBlitMemory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache, 4096, 4096);
++	phys = gBlitMemory != NULL ? gBlitMemory->getPhysicalSegment(0, &length, kIOMemoryMapperNone) : 0;
++	gBlitAddress = phys != 0 ? sweet_gpu_address(4096) : 0;
++	if (gBlitAddress == 0 || !sweet_gpu_map(gBlitAddress, phys, false)) {
++		if (gBlitAddress != 0) {
++			sweet_gpu_address_free(gBlitAddress, 4096);
++		}
++		OSSafeReleaseNULL(gBlitMemory);
++		gBlitRefused = true;
++		IOLog("SweetGPU: the display's GPU copy has no page for its commands: the processor copies\n");
++		return false;
++	}
++	sweet_gpu_mapped();
++	gBlitWords = (volatile uint32_t *)gBlitMemory->getBytesNoCopy();
++	for (uint32_t i = 0; i < 1024; i++) {
++		gBlitWords[i] = 0;
++	}
++	IOLog("SweetGPU: the display's GPU copy: commands at GPU address 0x%llx (xnu 0172)\n", gBlitAddress);
++	return true;
++}
++
++/*
++ * With gGPULock held: surface s's GPU address (entered and held the first time; *fresh then), 0: none could be had.
++ * Entries given back meanwhile are put in drop[] (released by the caller, after the lock).
++ */
++static uint64_t
++blitMap(SweetSurface *s, bool keep, bool *fresh, SweetSurface **drop, uint32_t *dropped)
++{
++	struct blit_map *entry = NULL, *oldest = NULL;
++	uint64_t now = mach_absolute_time(), idle, size;
++	bool mapped = true;
++
++	nanoseconds_to_absolutetime((uint64_t)BLIT_IDLE_MS * NSEC_PER_MSEC, &idle);
++	for (uint32_t i = 0; i < BLIT_MAPS; i++) {
++		struct blit_map *m = &gBlitMaps[i];
++
++		if (m->surface == s) {
++			return m->address;
++		}
++		if (m->surface != NULL && !m->keep && now - m->used >= idle && (gGPUStopped || sweet_gpu_done(m->fence))) {
++			sweet_gpu_unmap(m->address, m->size);
++			sweet_gpu_address_free(m->address, m->size);
++			drop[(*dropped)++] = m->surface;
++			m->surface = NULL;
++		}
++		if (m->surface == NULL) {
++			entry = entry != NULL ? entry : m;
++		} else if (!m->keep && (gGPUStopped || sweet_gpu_done(m->fence)) && (oldest == NULL || m->used < oldest->used)) {
++			oldest = m;
++		}
++	}
++	if (entry == NULL && oldest != NULL) {
++		sweet_gpu_unmap(oldest->address, oldest->size);
++		sweet_gpu_address_free(oldest->address, oldest->size);
++		drop[(*dropped)++] = oldest->surface;
++		oldest->surface = NULL;
++		entry = oldest;
++	}
++	if (entry == NULL || s->memory == NULL) {
++		return 0;
++	}
++	size = round_page_64(s->memory->getLength());
++	if (size == 0 || size > GPU_BUFFER_MAX || (entry->address = sweet_gpu_address(size)) == 0) {
++		return 0;
++	}
++	for (uint64_t offset = 0; offset < size && mapped; offset += 4096) {
++		IOByteCount length = 0;
++		addr64_t phys = s->memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
++
++		mapped = phys != 0 && sweet_gpu_map(entry->address + offset, phys, false);
++	}
++	sweet_gpu_mapped();
++	if (!mapped) {
++		sweet_gpu_unmap(entry->address, size);
++		sweet_gpu_address_free(entry->address, size);
++		IOLog("SweetGPU: the display's GPU copy cannot enter surface %u (%llu bytes)\n", s->id, size);
++		return 0;
++	}
++	s->retain();
++	entry->surface = s;
++	entry->size = size;
++	entry->fence = 0;
++	entry->used = now;
++	entry->keep = keep;
++	if (fresh != NULL) {
++		*fresh = true;
++	}
++	IOLog("SweetGPU: the display's GPU copy holds surface %u (%ux%u, rows of %u, %llu KiB) at 0x%llx%s\n", s->id,
++	    s->width, s->height, s->bytesPerRow, size >> 10, entry->address, keep ? ", a panel frame" : "");
++	return entry->address;
++}
++
++static void
++blitUsed(SweetSurface *s, uint32_t fence)
++{
++	for (uint32_t i = 0; i < BLIT_MAPS; i++) {
++		if (gBlitMaps[i].surface == s) {
++			gBlitMaps[i].fence = fence;
++			gBlitMaps[i].used = mach_absolute_time();
++		}
++	}
++}
++
++/* the stream (tu_clear_blit.cc's r2d path); returns its words */
++static uint32_t
++blitStream(volatile uint32_t *dw, const struct sweet_blit *b, uint64_t src, uint64_t dst, uint64_t stamp)
++{
++	uint32_t n = 0;
++
++#define EV(e)           do { dw[n++] = blitPkt7(0x46, 1); dw[n++] = (e); } while (0)
++#define EV_TS(e)        do { dw[n++] = blitPkt7(0x46, 4); dw[n++] = (e); dw[n++] = (uint32_t)stamp; \
++	                     dw[n++] = (uint32_t)(stamp >> 32); dw[n++] = 0; } while (0)
++#define REG(r, v)       do { dw[n++] = blitPkt4((r), 1); dw[n++] = (v); } while (0)
++#define WFI()           do { dw[n++] = blitPkt7(0x26, 0); } while (0)
++	/* tu_emit_cache_flush_ccu(SYSMEM): what the colour and depth caches hold out, both dropped, then the CCU's mode */
++	EV_TS(0x1d);                            /* PC_CCU_FLUSH_COLOR_TS */
++	EV_TS(0x1c);                            /* PC_CCU_FLUSH_DEPTH_TS */
++	EV(0x19);                               /* PC_CCU_INVALIDATE_COLOR */
++	EV(0x18);                               /* PC_CCU_INVALIDATE_DEPTH */
++	EV(0x31);                               /* CACHE_INVALIDATE: the texture cache reads Turnip's frame afresh */
++	WFI();
++	REG(0x8e07, BLIT_RB_CCU_CNTL_SYSMEM);   /* RB_CCU_CNTL */
++	dw[n++] = blitPkt7(0x65, 1);            /* CP_SET_MARKER: 2D blits follow (RM6_BLIT2DSCALE), as fd6 and step 22 */
++	dw[n++] = 12;
++	/* r2d_setup_common */
++	REG(0x8c01, 0);                         /* RB_2D_UNKNOWN_8C01 */
++	REG(0x8c00, BLIT_8888_UNORM);           /* RB_2D_BLIT_CNTL */
++	REG(0x8400, BLIT_8888_UNORM);           /* GRAS_2D_BLIT_CNTL */
++	REG(0xacc0, BLIT_DST_FORMAT);           /* SP_2D_DST_FORMAT */
++	/* the rectangles: inclusive; the source's in 24.8 */
++	dw[n++] = blitPkt4(0x8405, 2);          /* GRAS_2D_DST_TL, _BR */
++	dw[n++] = b->dx | (b->dy << 16);
++	dw[n++] = (b->dx + b->dw - 1) | ((b->dy + b->dh - 1) << 16);
++	dw[n++] = blitPkt4(0x8401, 4);          /* GRAS_2D_SRC_TL_X, _BR_X, _TL_Y, _BR_Y */
++	dw[n++] = b->sx << 8;
++	dw[n++] = (b->sx + b->sw - 1) << 8;
++	dw[n++] = b->sy << 8;
++	dw[n++] = (b->sy + b->sh - 1) << 8;
++	/* r2d_src */
++	dw[n++] = blitPkt4(0xb4c0, 5);          /* SP_PS_2D_SRC_INFO, _SIZE, the base, _PITCH */
++	dw[n++] = BLIT_SRC_INFO | (b->filter ? 0x10000u : 0);
++	dw[n++] = b->src_w | (b->src_h << 15);
++	dw[n++] = (uint32_t)src;
++	dw[n++] = (uint32_t)(src >> 32);
++	dw[n++] = b->src_row << 3;              /* PITCH: bits 9.., in 64 bytes */
++	dw[n++] = blitPkt4(0xb4ca, 3);          /* SP_PS_2D_SRC_FLAGS, _PITCH: none */
++	dw[n++] = 0;
++	dw[n++] = 0;
++	dw[n++] = 0;
++	/* r2d_dst */
++	dw[n++] = blitPkt4(0x8c17, 4);          /* RB_2D_DST_INFO, the base, _PITCH (64 bytes) */
++	dw[n++] = BLIT_DST_INFO;
++	dw[n++] = (uint32_t)dst;
++	dw[n++] = (uint32_t)(dst >> 32);
++	dw[n++] = b->dst_row >> 6;
++	dw[n++] = blitPkt4(0x8c20, 3);          /* RB_2D_DST_FLAGS, _PITCH: none */
++	dw[n++] = 0;
++	dw[n++] = 0;
++	dw[n++] = 0;
++	/* r2d_run */
++	dw[n++] = blitPkt7(0x2c, 1);            /* CP_BLIT */
++	dw[n++] = 3;                            /* BLIT_OP_SCALE */
++	/* out to memory for the panel (the submission's CACHE_FLUSH_TS and fence follow) */
++	EV_TS(0x1d);                            /* PC_CCU_FLUSH_COLOR_TS */
++	WFI();
++#undef EV
++#undef EV_TS
++#undef REG
++#undef WFI
++	return n;
++}
++
++uint32_t
++sweet_gpu_blit(const struct sweet_blit *b)
++{
++	SweetSurface *drop[2 * BLIT_MAPS];
++	uint32_t dropped = 0, fence = 0, slot, words;
++	uint64_t src = 0, dst = 0;
++	bool fresh = false;
++
++	if (gGPULock == NULL || b->src == NULL || b->dst == NULL || b->sw == 0 || b->sh == 0 || b->dw == 0 || b->dh == 0 ||
++	    (b->src_row & 63) || (b->dst_row & 63) || (b->src_offset & 63)) {
++		return 0;
++	}
++	IOLockLock(gGPULock);
++	slot = gBlitNext % BLIT_SLOTS;
++	if (gGPUStopped || !blitSetup() || (gBlitFence[slot] != 0 && !sweet_gpu_done(gBlitFence[slot]))) {
++		goto out;
++	}
++	dst = blitMap(b->dst, true, NULL, drop, &dropped);
++	src = dst != 0 ? blitMap(b->src, false, &fresh, drop, &dropped) : 0;
++	if (src == 0) {
++		goto out;
++	}
++	if (fresh) {
++		/* what this processor's cache may hold of it (e.g. its pages zeroed through the kernel's mapping) out, once */
++		uintptr_t kernel = b->src->kernelAddress();
++		if (kernel != 0) {
++			sweet_gpu_to_memory((void *)kernel, b->src->memory->getLength());
++		}
++	}
++	words = blitStream(gBlitWords + slot * (BLIT_SLOT_BYTES / 4), b, src + b->src_offset, dst,
++	    gBlitAddress + BLIT_STAMP_AT);
++	sweet_gpu_to_memory(NULL, 0);
++	{
++		uint64_t address = gBlitAddress + slot * BLIT_SLOT_BYTES;
++		fence = sweet_gpu_submit(&address, &words, 1);
++	}
++	if (fence != 0) {
++		gBlitFence[slot] = fence;
++		gBlitNext++;
++		blitUsed(b->src, fence);
++		blitUsed(b->dst, fence);
++	}
++out:
++	IOLockUnlock(gGPULock);
++	for (uint32_t i = 0; i < dropped; i++) {
++		drop[i]->release();
++	}
++	return fence;
++}
++
+ IOReturn
+ SweetGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
+ {
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -108,6 +108,12 @@
+  * a few register writes every 16 ms. Without the backlight (apollo_backlight=0,
+  * or a WLED that is not as expected) the panel is blanked at once, as in 0149.
+  *
++ * (xnu 0172) Metal on Turnip (sweetmtl=2): a frame whose only layer is backboardd's surface (Turnip drew it) is
++ * scaled into a free page-flip frame by the GPU's 2D engine (sweet_gpu_blit(), SweetGPU.cpp), queued behind the
++ * Turnip work that drew it, and flipped to once that copy has passed: no copy by the processor, no wait for later
++ * frames' work. Any other frame is copied by the processor once the last Turnip submission there was at its swap has
++ * passed. Boot-arg sweetblit=0: always the processor's copy.
++ *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
+@@ -117,6 +123,8 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" bool sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size);     /* SweetGPU.cpp */
++extern "C" uint32_t sweet_gpu_v2_last(void);                                    /* (xnu 0172) */
++extern "C" bool sweet_gpu_fence_passed(uint32_t fence);                         /* (xnu 0172) */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" bool apollo_backlight_fade(bool on, bool wait);      /* bsd/dev/sweet_backlight.c (xnu 0151) */
+ extern "C" void apollo_backlight_brightness(uint32_t value, uint32_t ms);       /* (xnu 0154) */
+@@ -268,6 +276,15 @@
+ 	void settleFlip(void);
+ 	IOReturn scan(void *request);
+ 	uint32_t      fStatFlips, fStatFlipWaits;
++	/* (xnu 0172) the GPU's copy of Metal frames */
++	bool          fBlitOn;                  /* boot-arg sweetblit, default 1 */
++	uint32_t      fPendingFence;            /* the last Turnip submission when fPending was swapped */
++	int           fBlitStuck;               /* a frame a copy still writes into after the wait gave up (-1: none) */
++	uint32_t      fBlitStuckFence;
++	uint32_t      fStatBlit, fStatBlitWait, fBlitRefusalsSaid;
++	bool          fBlitSaid;
++	uint64_t      fStatBlitAbs;
++	uint32_t presentBlit(const uint8_t *rec, int frame);
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -513,6 +530,11 @@
+ 		fFlipSurf[f] = sweet_surface_create_physical(fFlipPA[f], fWidth, fHeight, fFlipStride, SWEET_FB_FORMAT_BGRA);
+ 		fScanReady = fFlipSurf[f] != NULL;
+ 	}
++	/* (xnu 0172) */
++	int blitOn = 1;
++	PE_parse_boot_argn("sweetblit", &blitOn, sizeof(blitOn));
++	fBlitOn = fFlipCount == 3 && blitOn != 0 && fFlipSurf[2] != NULL;
++	fBlitStuck = -1;
+ 	if (fFlipCount == 3) {
+ 		IOLog("SWEET FB: GPU scaling %s (frames %u, %u, %u; rows of %u)\n", fScanReady ? "offered" :
+ 		    scanOn ? "NOT offered: no surfaces" : "not offered (sweetscan=0)", fFlipSurf[0] ? fFlipSurf[0]->id : 0,
+@@ -646,7 +668,17 @@
+ 			/* (xnu 0156) */
+ 			IOLog("SWEET FB: %u page flips, %u of them frames the GPU scaled (%u frames waited for the last flip to be taken)\n",
+ 			    fb->fStatFlips, fb->fStatGPU, fb->fStatFlipWaits);
++			if (fb->fBlitOn && (fb->fStatBlit != 0 || fb->fStatBlitWait != 0)) {
++				/* (xnu 0172) */
++				uint64_t blitNs = 0;
++				absolutetime_to_nanoseconds(fb->fStatBlit ? fb->fStatBlitAbs / fb->fStatBlit : 0, &blitNs);
++				IOLog("SWEET FB: %u frames copied by the GPU (0172), %llu.%llu ms from the swap's turn to the panel on "
++				    "average; %u copies waited past 100 ms\n", fb->fStatBlit, blitNs / NSEC_PER_MSEC,
++				    blitNs % NSEC_PER_MSEC / 100000, fb->fStatBlitWait);
++			}
+ 			fb->fStatFlips = fb->fStatFlipWaits = fb->fStatGPU = 0;
++			fb->fStatBlit = fb->fStatBlitWait = 0;
++			fb->fStatBlitAbs = 0;
+ 		}
+ 		fb->fStatSince = now;
+ 		fb->fStatSwaps = fb->fStatShown = fb->fStatBusy = fb->fStatTicks = fb->fStatSkipped = 0;
+@@ -723,6 +755,7 @@
+ 			continue;
+ 		}
+ 		memcpy(rec, fPending, SWEET_FB_SWAP_REC_SIZE);
++		uint32_t swapFence = fPendingFence;     /* (xnu 0172) */
+ 		fDirty = false;
+ 		IOLockUnlock(fLock);
+ 		uint64_t began = mach_absolute_time();
+@@ -762,6 +795,13 @@
+ 			if (waited_us != 0) {
+ 				fStatFlipWaits++;
+ 			}
++			/* (xnu 0172) a frame an earlier copy gave up waiting for: free again once that copy has passed */
++			if (fBlitStuck >= 0 && sweet_gpu_fence_passed(fBlitStuckFence)) {
++				IOLockLock(fLock);
++				fFlipOwner[fBlitStuck] = SWEET_SCAN_FREE;
++				IOLockUnlock(fLock);
++				fBlitStuck = -1;
++			}
+ 			if (gpuFrame < 0) {
+ 				/* the processor copies: into a frame nobody has (marked so while it does) */
+ 				IOLockLock(fLock);
+@@ -775,13 +815,39 @@
+ 			}
+ 		}
+ 		bool shown;
++		uint32_t blitFence = 0;
++		bool blitStuck = false;
+ 		if (gpuFrame >= 0) {
+ 			/* (0159) nothing to copy: once the GPU has finished drawing the frame, it is flipped to */
+ 			shown = sweet_gpu_surface_ready(fFlipSurf[gpuFrame]->id, NULL, 0);
+ 		} else {
+-			fDraw = target >= 0 ? fFlipVA[target] : fFlipCount ? fFlipVA[fFlipPending >= 0 ? fFlipPending : fFlipFront] : fPixels;
+-			fDrawRow = target >= 0 || (fFlipCount && fFlipPending >= 0) ? fFlipStride : fFlipCount ? fFrontStride : fRowBytes;
+-			shown = present(rec);
++			/*
++			 * (xnu 0172) Metal on Turnip: backboardd's frame copied into the free frame by the GPU, behind the work
++			 * that drew it; flipped to once the copy has passed (up to 100 ms: then the frame stays the copy's)
++			 */
++			if (target >= 0 && fBlitOn && swapFence != 0) {
++				blitFence = presentBlit(rec, target);
++			}
++			if (blitFence != 0) {
++				uint32_t waited_us = 0;
++				while (!(shown = sweet_gpu_fence_passed(blitFence)) && waited_us < 100000) {
++					IODelay(200);
++					waited_us += 200;
++				}
++				if (!shown) {
++					blitStuck = true;
++					fBlitStuck = target;
++					fBlitStuckFence = blitFence;
++					fStatBlitWait++;
++				}
++			} else if (swapFence != 0 && !sweet_gpu_fence_passed(swapFence)) {
++				/* (xnu 0172) the processor's copy: once what Turnip had been given at the swap has passed */
++				shown = false;
++			} else {
++				fDraw = target >= 0 ? fFlipVA[target] : fFlipCount ? fFlipVA[fFlipPending >= 0 ? fFlipPending : fFlipFront] : fPixels;
++				fDrawRow = target >= 0 || (fFlipCount && fFlipPending >= 0) ? fFlipStride : fFlipCount ? fFrontStride : fRowBytes;
++				shown = present(rec);
++			}
+ 		}
+ 		int flipTo = gpuFrame >= 0 ? gpuFrame : target;
+ 		if (flipTo >= 0) {
+@@ -798,8 +864,12 @@
+ 					}
+ 					fStatGPU++;
+ 				}
++				if (blitFence != 0) {
++					fStatBlit++;    /* (xnu 0172) */
++					fStatBlitAbs += mach_absolute_time() - began;
++				}
+ 				fFlipOwner[flipTo] = SWEET_SCAN_FREE;
+-			} else if (gpuFrame < 0) {
++			} else if (gpuFrame < 0 && !blitStuck) {
+ 				fFlipOwner[flipTo] = SWEET_SCAN_FREE;  /* (a queued frame stays queued: tried again) */
+ 			}
+ 			IOLockUnlock(fLock);
+@@ -827,6 +897,7 @@
+ 			fStatBusy++;
+ 			if (!fDirty) {
+ 				memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++				fPendingFence = swapFence;      /* (xnu 0172) */
+ 				fDirty = true;
+ 			}
+ 			fPresentWanted = true;
+@@ -1064,8 +1135,12 @@
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	/* (xnu 0172) Turnip's work for this frame was submitted before backboardd swapped it (Metal's scheduled handler) */
++	uint32_t fence = sweet_gpu_v2_last();
++
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
++	fPendingFence = fence;
+ 	fDirty = true;
+ 	fStatSwaps++;                   /* (xnu 0148) */
+ 	IOLockUnlock(fLock);
+@@ -1074,6 +1149,128 @@
+ 	}
+ }
+ 
++/*
++ * (xnu 0172) The swap's only layer, backboardd's whole display, scaled into frame `frame` by the GPU (see the top of
++ * this file); the lines above and below the picture black by the processor (writes only). Returns the copy's fence;
++ * 0: not this way (said for the first few), the processor copies.
++ */
++uint32_t
++AppleCLCD::presentBlit(const uint8_t *rec, int frame)
++{
++	uint32_t mask = get32(rec, 0x104), layer = SWEET_FB_LAYERS, fence = 0;
++	const char *why = NULL;
++	SweetSurface *s = NULL;
++
++	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
++		if ((mask & (1u << l)) && get32(rec, 0x54 + 4 * l) != 0) {
++			if (layer != SWEET_FB_LAYERS) {
++				why = "more than one layer";
++			}
++			layer = l;
++		}
++	}
++	if (layer == SWEET_FB_LAYERS) {
++		why = "no layer";
++	}
++	if (why == NULL) {
++		uint32_t id = get32(rec, 0x54 + 4 * layer);
++		const uint8_t *a = rec + 0x64 + 16 * layer, *b = rec + 0xc4 + 16 * layer;
++		int32_t sx = (int32_t)get32(a, 0), sy = (int32_t)get32(a, 4);
++		int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4), w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
++
++		s = sweet_surface_copy(id);
++		if (s != NULL && (w <= 0 || h <= 0)) {
++			w = (int32_t)s->width;
++			h = (int32_t)s->height;
++		}
++		uint64_t start = s != NULL ? s->offset : 0;
++		uint32_t row = s != NULL ? s->bytesPerRow : 0, bpe = s != NULL && s->bytesPerElement ? s->bytesPerElement : 4;
++		if (s != NULL && s->planeCount > 0) {
++			start = s->planes[0].offset;
++			row = s->planes[0].bytesPerRow;
++			bpe = s->planes[0].bytesPerElement;
++		}
++		if (s == NULL || s == fSurface || s->memory == NULL) {
++			why = "not a surface of a program's";
++		} else if (sx > 0 || sy > 0 || dx != 0 || dy != 0 || w != (int32_t)fLogicalW || h != (int32_t)fLogicalH ||
++		    s->width < fLogicalW || s->height < fLogicalH) {
++			why = "not exactly the display";
++		} else if (bpe != 4 || s->elementWidth != 1 || s->elementHeight != 1) {
++			why = "not 4 bytes a pixel";
++		} else if ((row & 63) != 0 || (start & 63) != 0) {
++			why = "rows not a multiple of 64 bytes";
++		} else if (start + (uint64_t)(fLogicalH - 1) * row + (uint64_t)fLogicalW * 4 > s->memory->getLength()) {
++			why = "smaller than its rows say";
++		} else if (!fFit && (fOffX < 0 || fOffY < 0)) {
++			why = "the panel is larger than the display";
++		} else {
++			struct sweet_blit bl = {};
++
++			bl.src = s;
++			bl.src_offset = start;
++			bl.src_row = row;
++			bl.src_w = s->width;
++			bl.src_h = s->height;
++			bl.dst = fFlipSurf[frame];
++			bl.dst_row = fFlipStride;
++			if (fFit) {
++				/* (0150/0152) 24/25: panel line py shows display line (py - band) * 25/24; columns 0..1079 the whole width */
++				int32_t y0 = ((int32_t)fFitTop - fFitBand) * SWEET_FB_FIT_DEN / SWEET_FB_FIT_NUM;
++				int32_t y1 = (((int32_t)fFitEnd - fFitBand) * SWEET_FB_FIT_DEN + SWEET_FB_FIT_NUM - 1) / SWEET_FB_FIT_NUM;
++				y0 = y0 < 0 ? 0 : y0;
++				y1 = y1 > (int32_t)fLogicalH ? (int32_t)fLogicalH : y1;
++				bl.sx = 0;
++				bl.sw = fLogicalW;
++				bl.sy = (uint32_t)y0;
++				bl.sh = y1 > y0 ? (uint32_t)(y1 - y0) : 0;
++				bl.dx = 0;
++				bl.dw = fWidth;
++				bl.dy = fFitTop;
++				bl.dh = fFitEnd - fFitTop;
++				bl.filter = true;
++				/* the bands, black */
++				for (uint32_t band = 0; band < 2; band++) {
++					uint32_t from = band == 0 ? 0 : fFitEnd, to = band == 0 ? fFitTop : fHeight;
++					for (uint32_t y = from; y < to; y++) {
++						volatile uint64_t *line = (volatile uint64_t *)(fFlipVA[frame] + (uint64_t)y * fFlipStride);
++						for (uint32_t x = 0; x < fWidth / 2; x++) {
++							line[x] = 0;
++						}
++					}
++				}
++			} else {
++				/* the panel's part of the display, as it is */
++				bl.sx = (uint32_t)fOffX;
++				bl.sy = (uint32_t)fOffY;
++				bl.sw = bl.dw = fWidth;
++				bl.sh = bl.dh = fHeight;
++				bl.filter = false;
++			}
++			fence = sweet_gpu_blit(&bl);
++			if (fence == 0) {
++				why = "the GPU did not take it";
++			} else if (!fBlitSaid) {
++				fBlitSaid = true;
++				IOLog("SWEET FB: the GPU copies backboardd's frames (0172): surface %u %ux%u fmt 0x%x rows %u (+%llu), "
++				    "display lines %u..%u -> panel lines %u..%u of frame %d\n", id, s->width, s->height, s->pixelFormat,
++				    row, start, bl.sy, bl.sy + bl.sh - 1, bl.dy, bl.dy + bl.dh - 1, frame);
++			}
++		}
++		if (why != NULL && fBlitRefusalsSaid < 4 && s != NULL) {
++			IOLog("SWEET FB: (0172) surface %u %ux%u fmt 0x%x rows %u planes %u at %d,%d %dx%d: the processor copies: %s\n",
++			    id, s->width, s->height, s->pixelFormat, row, s->planeCount, dx, dy, w, h, why);
++		}
++	}
++	if (why != NULL && fBlitRefusalsSaid < 4) {
++		if (s == NULL) {
++			IOLog("SWEET FB: (0172) the processor copies: %s\n", why);
++		}
++		fBlitRefusalsSaid++;
++	}
++	OSSafeReleaseNULL(s);
++	return fence;
++}
++
+ /* false: not shown, a surface of the frame is still being drawn by the GPU (SweetGPU.cpp) */
+ bool
+ AppleCLCD::present(const uint8_t *rec)

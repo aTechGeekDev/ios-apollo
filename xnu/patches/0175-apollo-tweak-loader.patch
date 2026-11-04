@@ -5,7 +5,7 @@
  #define SWEET_INJECT_BUILTIN    "/usr/local/lib/libsweet-fix.dylib:ScreenshotServicesService,fileproviderd,Files,LocalStorageFileProvider,usermanagerd,configd"
  
 +/*
-+ * (xnu 0174) apollo_tweaks=1 (a boot-arg or mkadt.py --option apollo_tweaks=1; apollo_option(), bsd/dev/apollo_pmic.c):
++ * (xnu 0175) apollo_tweaks=1 (a boot-arg or mkadt.py --option apollo_tweaks=1; apollo_option(), bsd/dev/apollo_pmic.c):
 + * SpringBoard and the apps (/Applications, the installed apps' bundles) that no group above names get the rootless
 + * jailbreak's tweak loader, which ElleKit installs (Sileo: the ElleKit package). Only when that file is there: dyld
 + * ends a program whose inserted library is missing. Daemons get nothing: a broken tweak can only take apps and the

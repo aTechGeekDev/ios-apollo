@@ -8,14 +8,14 @@ Builds: kernel run 41216279299 (xnu through 0168, Xcode 16.0), userland run 4121
 Run on the user's Kali PC from ~/ios-apollo on `main` (research/, shim/out, recovery/recovery.img and sweet-bt/ are local, not in git).
 `--artwork-subtype 2556` stays on every boot (Dynamic Island).
 
-**iOS on Metal boot (next, 113):** kernel xnu run 41804503730 (0171), sweet-metal2 metal2 run 41804503640 (plug-in with stderr log + Turnip fallback); `--files-from tools/root-files/metal2-on.txt`; boot-arg `sweetmtl=2`; no GL bridge; Turnip and libsweet-fix are on the root since boot 112. Read back: `grep -a -E 'SWEET MTL|MTL2\[|native-metal|CRASH backboardd|SWEET GPU: kept|SWEET FB'`.
+**iOS on Metal boot (next, 114: boot 113 + the cache fix):** kernel xnu run 41804503730 (0171), sweet-metal2 metal2 run 41806600419 (plug-in with stderr log + Turnip fallback); `--files-from tools/root-files/metal2-on.txt`; boot-arg `sweetmtl=2`; no GL bridge; Turnip and libsweet-fix are on the root since boot 112. Read back: `grep -a -E 'SWEET MTL|MTL2\[|native-metal|CRASH backboardd|SWEET GPU: kept|SWEET FB'`.
 
 ```sh
 git pull && R=aTechGeekDev/ios-apollo &&
-gh run watch 41804503730 -R $R --exit-status && gh run watch 41804503640 -R $R --exit-status &&
+gh run watch 41804503730 -R $R --exit-status && gh run watch 41806600419 -R $R --exit-status &&
 rm -rf xnu/out sweet-metal2 &&
 gh run download 41804503730 -R $R -n xnu-kernel -D xnu/out &&
-gh run download 41804503640 -R $R -n sweet-metal2 -D sweet-metal2 &&
+gh run download 41806600419 -R $R -n sweet-metal2 -D sweet-metal2 &&
 python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --artwork-subtype 2556 \
     --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
     --gmu-fw research/apollo-gpu/a650_gmu.bin --sqe-fw research/apollo-gpu/a650_sqe.fw \
@@ -107,17 +107,22 @@ grep -a -E 'probe:|sweet-fix: configd: metal|SWEET GPU: kept|SweetGPU:' logs/apo
 
 User preference: give paste-ready commands at once, do not wait on CI (`gh run watch RUN -R $R --exit-status &&` in front when a build is pending); `[skip ci]` on notes-only commits.
 
-### >>> PARALLEL WORK (2026-11-04, Claude, branch claude/wonderful-allen-3gaupe, NOT on main): xnu 0172-0174 + jailbreak tools; kernel run 41807365368; NOT BOOTED <<<
+### >>> BOOT 113 (2026-11-04, kernel 41804503730 = 0171, sweetmtl=2, metal2-on.txt, no GL bridge): Metal device REFUSED (shader cache permission) -> CPU rendering, "glitchy and slow" (user) -> plug-in cache fallback <<<
 
-**Why a branch:** the user is porting Metal on main (0169-0171, libsweet-fix run file, Turnip). Asked "what can you work on without disrupting my work", then "start with all of them". Nothing here touches the GPU, display, Turnip, Metal or libsweet-fix. Patch numbers 0172-0174 are provisional: if main gets its own 0172+, renumber these after it (validate-repo wants 0001-N contiguous).
+**Observed:** `SWEET MTL: IOAcceleratorES published (MetalPluginName SweetMetal2)`; backboardd loaded the plug-in (`MTL2[58 backboardd]`), then `native-metal: device refused: device: ShaderCache(ShaderCacheError { path: "/var/local/m2v-cache/backboardd", kind: PermissionDenied })` in 11 ms; `libvulkan_freedreno 0x0` (Turnip never loaded); `SpringBoard: not listed (/var/local/mtl2-clients): no Metal device` (as intended). With no device CoreAnimation drew on the CPU (no GL bridge either): SWEET FB 12.9/16.2/3.9 frames a second, 0 waited for the GPU, the CPU copy path. The plug-in's stderr lines reach the log (the 0171-era HotMetal2 change works).
+**Cause:** /private/var/local was created by the kernel (root, 0755) to write mtl2.log; backboardd runs as mobile, so mkdir /var/local/m2v-cache failed, and backboardd has no _CS_DARWIN_USER_CACHE_DIR. **Fix:** HotMetal2.mm falls back to /private/var/tmp/m2v-cache/<process> (1777 parent). Boot 114 = boot 113's command with the new metal2 run.
+
+### >>> PARALLEL WORK (2026-11-04, Claude, branch claude/wonderful-allen-3gaupe, NOT on main): xnu 0173-0175 + jailbreak tools; kernel run 41807365368; NOT BOOTED <<<
+
+**Why a branch:** the user is porting Metal on main (0169-0172, libsweet-fix run file, Turnip). Asked "what can you work on without disrupting my work", then "start with all of them". Nothing here touches the GPU, display, Turnip, Metal or libsweet-fix. Patch numbers 0173-0175 are provisional: if main gets its own 0173+, renumber these after it (validate-repo wants 0001-N contiguous).
 **Every new part is off unless its option is set**, and options can now come from the ADT instead of the full boot line: `mkadt.py --option NAME=N` -> /sweet-options; the kernel's `apollo_option()` (bsd/dev/apollo_pmic.c) reads a boot-arg first, then that node.
-- **xnu 0172** `bsd/dev/apollo_pmic.c` (own SPMI access as sweet_backlight.c: observer reads, channel-page writes, own lock):
+- **xnu 0173** `bsd/dev/apollo_pmic.c` (own SPMI access as sweet_backlight.c: observer reads, channel-page writes, own lock):
   - `apollo_rtc=1`: the calendar comes from the PM8150 RTC (SID 0, 0x6000; Linux rtc-pm8xxx pm8941 regs: read 0x6048, ctrl 0x6046 bit 7, write 0x6040). IOKitInitializeTime then skips its 30 s `waitForService(IORTC)`. **Inferred from source, not measured:** nothing in this tree publishes IORTC and SWEET does not define BCM2837, so every boot so far waited 30 s there. Time set by iOS is kept as an offset in memory.
   - `apollo_rtc=2`: the same, and time set by iOS is written into the RTC (Linux's set sequence), only if the arbiter gives this system the clock's channel (logged `owned by system N`).
   - `apollo_power=1`: PE_halt_restart -> PSCI SYSTEM_OFF (0x84000008) / SYSTEM_RESET (0x84000009) via smc, as mainline Linux on SM8250. `apollo_power=2` also restarts on panic.
   - `apollo_torch=1`: `sysctl -w apollo.torch=MA` (5-150 mA per channel, 0 off; root) drives the PM8150L flash LED (SID 5, 0xd300, type 0x18 subtype 4 checked first; Linux leds-qcom-flash.c 3CH torch sequence: itarget 0x43+c, ires 0x47 = 5 mA steps, timer 0, strobe 0x49+c = 0x01, module_en 0x46, chan_en 0x4c). `apollo_torch_mask` (default 3) = channels; off if status1 shows over-temperature. `sysctl apollo.rtc_raw` reads the RTC. iOS's own flashlight button is NOT wired (camera stack).
-- **xnu 0173** SweetBattery (from sweet, PM6150 = SID 0, so on apollo it always fell back to "100%, AC") reads SID 2 = PM8150B, same QG/smb5 registers, 5000 mAh, 4.4 V top of the voltage curve; `sweetbattery=1` (ADT ok), `sweetbattery_sid` (default 2). Logs raw gauge/charger values every 5 min (`SWEET BATTERY: SID 2: gauge type ...`). **Unknown:** whether the QG's last-ADC registers update without Android's QG driver; the log will show it.
-- **xnu 0174** `apollo_tweaks=1`: kern_exec inserts `/var/jb/usr/lib/TweakLoader.dylib` into SpringBoard, /Applications/* and the installed apps' bundles that no sweetinject group names, only if that file exists (dyld kills a program whose inserted library is missing). The path is the rootless convention ElleKit uses. **Not verified here:** ElleKit's package could not be downloaded from this container (403). The user installs ElleKit from Sileo first.
+- **xnu 0174** SweetBattery (from sweet, PM6150 = SID 0, so on apollo it always fell back to "100%, AC") reads SID 2 = PM8150B, same QG/smb5 registers, 5000 mAh, 4.4 V top of the voltage curve; `sweetbattery=1` (ADT ok), `sweetbattery_sid` (default 2). Logs raw gauge/charger values every 5 min (`SWEET BATTERY: SID 2: gauge type ...`). **Unknown:** whether the QG's last-ADC registers update without Android's QG driver; the log will show it.
+- **xnu 0175** `apollo_tweaks=1`: kern_exec inserts `/var/jb/usr/lib/TweakLoader.dylib` into SpringBoard, /Applications/* and the installed apps' bundles that no sweetinject group names, only if that file exists (dyld kills a program whose inserted library is missing). The path is the rootless convention ElleKit uses. **Not verified here:** ElleKit's package could not be downloaded from this container (403). The user installs ElleKit from Sileo first.
 - **Jailbreak tools:**
   - `tools/root-files/jb-post.txt`: one boot, through libsweet-fix's run file, so it needs the run-file libsweet-fix. It runs `userland/jb/sweet-jbpost.sh` with /var/jb/usr/bin/bash. That links `/var/jb/Applications/Sileo.app -> /Applications/Sileo.app` (dpkg updates then land in the registered copy) and unpacks `/private/var/sweet-jb/apps/*.tar.gz` into /Applications. Its log lines go into install.log, which libsweet-fix copies into the kernel log at the next boot.
   - `tools/app-pack.sh APP.ipa` (PC) -> research/apps/NAME.tar.gz + research/apps/apps.txt (`--files-from`, 48 MiB a boot). Then one boot with ls-rebuild.txt registers the apps.

@@ -5,7 +5,7 @@
  	/* Restrict access to the battery blocks; keys retain their own lanes. */
  	unsigned peripheral = addr >> 8;
 -	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
-+	/* apollo (xnu 0173): SID 2 too, the Mi 10T's PM8150B (charger + fuel gauge; sweet's PM6150 is SID 0) */
++	/* apollo (xnu 0174): SID 2 too, the Mi 10T's PM8150B (charger + fuel gauge; sweet's PM6150 is SID 0) */
 +	if (!sp_ready || !out || (sid != 0 && sid != 2) || addr > 0xffffu ||
  	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
  	    peripheral != 0x13 && peripheral != 0x48)) {
@@ -17,7 +17,7 @@
   * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
   * See report.md for binary evidence, register provenance and integration.
 + *
-+ * apollo (xnu 0173): the Mi 10T's charger and fuel gauge are the PM8150B's, SPMI slave 2 (sweet's PM6150 is slave 0),
++ * apollo (xnu 0174): the Mi 10T's charger and fuel gauge are the PM8150B's, SPMI slave 2 (sweet's PM6150 is slave 0),
 + * with the same smb5 charger / QG register blocks (Linux's pm8150b.dtsi; downstream qg-reg.h, smb5-reg.h); its
 + * battery is 5000 mAh. sweetbattery is also read from the ADT (mkadt.py --option sweetbattery=1, apollo_option() in
 + * bsd/dev/apollo_pmic.c: the boot line is full); sweetbattery_sid (default 2) picks the slave. Every 10th poll
@@ -30,7 +30,7 @@
  /* bsd/dev/sweet_spmi.c */
  extern "C" int sweet_spmi_init(void);
  extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
-+/* bsd/dev/apollo_pmic.c (xnu 0172): a boot-arg, else the ADT's /sweet-options */
++/* bsd/dev/apollo_pmic.c (xnu 0173): a boot-arg, else the ADT's /sweet-options */
 +extern "C" int apollo_option(const char *name, int fallback);
 +/* the PMIC slave of the charger and the gauge (apollo: PM8150B = 2) and the battery's design capacity */
 +static unsigned sweet_battery_sid = 2;

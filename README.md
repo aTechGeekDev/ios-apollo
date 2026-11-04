@@ -68,9 +68,9 @@ The detailed engineering log, with every boot's results, is [`NOTES.md`](NOTES.m
 | Feature | Why it matters | Status | Effort |
 | --- | --- | --- | --- |
 | Boot without a computer | Every boot is a temporary fastboot boot from a PC. The shim has to be flashed to the boot partition, with a way back to Android. | ❌ Not started | Medium |
-| Correct date and time | Written, not yet tested (xnu 0172, option apollo_rtc): the calendar starts from the PM8150's real-time clock, and time set by iOS is written back to it. Today each boot starts in 1970 until the network sets the time. | 🚧 In progress | Small |
-| Power off | Written, not yet tested (xnu 0172, option apollo_power): iOS's shutdown asks the firmware to power off (PSCI). Today the kernel only halts and the phone stays on until the power button is held. | 🚧 In progress | Small |
-| Restart from iOS | Written, not yet tested (xnu 0172, option apollo_power): restarts, and with apollo_power=2 kernel panics, reset the phone through the firmware. | 🚧 In progress | Small |
+| Correct date and time | Written, not yet tested (xnu 0173, option apollo_rtc): the calendar starts from the PM8150's real-time clock, and time set by iOS is written back to it. Today each boot starts in 1970 until the network sets the time. | 🚧 In progress | Small |
+| Power off | Written, not yet tested (xnu 0173, option apollo_power): iOS's shutdown asks the firmware to power off (PSCI). Today the kernel only halts and the phone stays on until the power button is held. | 🚧 In progress | Small |
+| Restart from iOS | Written, not yet tested (xnu 0173, option apollo_power): restarts, and with apollo_power=2 kernel panics, reset the phone through the firmware. | 🚧 In progress | Small |
 | No sudden resets | Boots 88 and 89 reset during normal use; the cause is not found yet. tools/reset-reason.sh reads the PMIC's power-off reason from recovery after the next one. | 🚧 In progress | Medium |
 | No crash-looping system parts | Wallpapers and speech voices that need Metal crash and restart in a loop, costing CPU and battery. | 🟡 Partly works | Small |
 | Faster boot | About a minute from fastboot to the lock screen. The kernel waits 30 s for a clock driver that this port never published; with the PMIC clock (apollo_rtc) that wait goes away. | 🚧 In progress | Medium |
@@ -79,8 +79,8 @@ The detailed engineering log, with every boot's results, is [`NOTES.md`](NOTES.m
 
 | Feature | Why it matters | Status | Effort |
 | --- | --- | --- | --- |
-| Battery level | Written, not yet tested (xnu 0173, option sweetbattery): the battery service now reads the Mi 10T's PM8150B (it read the PMIC of the phone this port started from). The percentage is estimated from the voltage, not Qualcomm's fuel-gauge algorithm. | 🚧 In progress | Medium |
-| Charging status | Written, not yet tested (xnu 0173): charger connected, charging and full come from the PM8150B's charger. | 🚧 In progress | Medium |
+| Battery level | Written, not yet tested (xnu 0174, option sweetbattery): the battery service now reads the Mi 10T's PM8150B (it read the PMIC of the phone this port started from). The percentage is estimated from the voltage, not Qualcomm's fuel-gauge algorithm. | 🚧 In progress | Medium |
+| Charging status | Written, not yet tested (xnu 0174): charger connected, charging and full come from the PM8150B's charger. | 🚧 In progress | Medium |
 | Charger control | Charging current and temperature limits come from the bootloader's defaults, not from iOS. | ❌ Not started | Medium |
 | Sleep and standby | The CPU never suspends: a locked phone drains the battery almost as fast as one in use. | ❌ Not started | Large |
 | Screen-off power saving | Locking turns the backlight off, but the panel, display engine and GPU stay powered. | 🟡 Partly works | Medium |
@@ -127,7 +127,7 @@ The detailed engineering log, with every boot's results, is [`NOTES.md`](NOTES.m
 | --- | --- | --- | --- |
 | Rear cameras | Image sensors and Qualcomm's camera pipeline (Spectra ISP). | ❌ Not started | Very large |
 | Front camera | Same pipeline as the rear cameras. | ❌ Not started | Very large |
-| Flashlight | The kernel can light the PM8150L's flash LED in torch mode (xnu 0172, option apollo_torch, sysctl apollo.torch; not yet tested). iOS's own flashlight button goes through the camera stack, which is not there yet. | 🟡 Partly works | Medium |
+| Flashlight | The kernel can light the PM8150L's flash LED in torch mode (xnu 0173, option apollo_torch, sysctl apollo.torch; not yet tested). iOS's own flashlight button goes through the camera stack, which is not there yet. | 🟡 Partly works | Medium |
 | Hardware video decoding | Videos are decoded by the CPU: hotter, slower, and some formats stutter. | ❌ Not started | Large |
 | Earpiece | The earpiece amplifier is brought up, but call audio is not routed to it. | 🟡 Partly works | Small |
 
@@ -145,7 +145,7 @@ The detailed engineering log, with every boot's results, is [`NOTES.md`](NOTES.m
 | --- | --- | --- | --- |
 | Install your own apps | Decrypted or self-built apps go into /Applications from the PC (tools/app-pack.sh, jb-post.txt), registered at the next boot. TrollStore needs a CoreTrust bug that iOS 16.7.16 does not have. | 🚧 In progress | Medium |
 | Jailbreak and Sileo | Procursus is in /var/jb and Sileo is on the home screen and works. Left: Sileo updates land in the registered copy (jb-post.txt links it). | 🟡 Partly works | Medium |
-| Tweaks | The kernel inserts ElleKit's tweak loader into SpringBoard and apps (xnu 0174, option apollo_tweaks; not yet tested). Install ElleKit from Sileo first. | 🚧 In progress | Medium |
+| Tweaks | The kernel inserts ElleKit's tweak loader into SpringBoard and apps (xnu 0175, option apollo_tweaks; not yet tested). Install ElleKit from Sileo first. | 🚧 In progress | Medium |
 | App Store apps | App Store apps are encrypted (FairPlay); this port cannot decrypt them. | ❌ Not started | Very large |
 | Apple ID and iCloud | Signing in needs a genuine device identity. | ❌ Not started | Very large |
 | Push notifications | Apple's push service needs device certificates. | ❌ Not started | Very large |
