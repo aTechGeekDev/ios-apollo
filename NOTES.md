@@ -25,13 +25,13 @@ Builds: kernel run 41216279299 (xnu through 0168, Xcode 16.0), userland run 4121
 Run on the user's Kali PC from ~/ios-apollo on `main` (research/, shim/out, recovery/recovery.img and sweet-bt/ are local, not in git).
 `--artwork-subtype 2556` stays on every boot (Dynamic Island).
 
-**Everything boot (2026-11-04, user: "the boot command w everything"):** boot 120 (Metal, xnu 0172-0180) + the PMIC/battery/status-bar work (xnu 0181-0183), all from main 08ee2b9: kernel xnu run 41837027398 (main c8693f9: torch writable by SpringBoard; 41832275728 = boot 122), sweet-metal2 41827349433, sweet-ui ui run 41837027762 (island rect + flashlight). Options through the ADT (`--option`, the boot line is full): apollo_rtc=1 apollo_power=1 apollo_torch=1 sweetbattery=1 apollo_ui=1. Needs boot 119's Turnip on the root (metal2-on.txt only carries the plug-in). Read back: `grep -a -E 'apollo pmic:|SWEET BATTERY|SWEET FB: [0-9]|SweetGPU: (the display|watchdog|10 s)|SWEET PROF|MTL2T|native-metal|CRASH (backboardd|SpringBoard)'`; photo of the status bar.
+**Everything boot (2026-11-04, user: "the boot command w everything"):** boot 120 (Metal, xnu 0172-0180) + the PMIC/battery/status-bar work (xnu 0181-0183), all from main 08ee2b9: kernel xnu run 41837987204 (main 58a6b38: torch writable by SpringBoard; 41837027398 died on bearssl.org; 41832275728 = boot 122), sweet-metal2 41827349433, sweet-ui ui run 41837027762 (island rect + flashlight). Options through the ADT (`--option`, the boot line is full): apollo_rtc=1 apollo_power=1 apollo_torch=1 sweetbattery=1 apollo_ui=1. Needs boot 119's Turnip on the root (metal2-on.txt only carries the plug-in). Read back: `grep -a -E 'apollo pmic:|SWEET BATTERY|SWEET FB: [0-9]|SweetGPU: (the display|watchdog|10 s)|SWEET PROF|MTL2T|native-metal|CRASH (backboardd|SpringBoard)'`; photo of the status bar.
 
 ```sh
 cd ~/ios-apollo && git pull && R=aTechGeekDev/ios-apollo &&
-gh run watch 41837027398 -R $R --exit-status &&
+gh run watch 41837987204 -R $R --exit-status &&
 rm -rf xnu/out sweet-metal2 sweet-ui &&
-gh run download 41837027398 -R $R -n xnu-kernel -D xnu/out &&
+gh run download 41837987204 -R $R -n xnu-kernel -D xnu/out &&
 gh run download 41827349433 -R $R -n sweet-metal2 -D sweet-metal2 &&
 gh run download 41837027762 -R $R -n sweet-ui -D sweet-ui &&
 python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --artwork-subtype 2556 \
