@@ -125,6 +125,19 @@ sweet_fl_off(id self, SEL _cmd)
 	(void)sweet_torch_set(self, 0.0f);
 }
 
+/*
+ * Boots 123/124 stuck at the Apple logo, SpringBoard alive but no frames (124 even without Metal), right after
+ * +hasFlashlight began to say YES: SpringBoard then makes an AVFlashlight, whose -init (_setupFlashlight) connects to
+ * mediaserverd's FigFlashlight -- there is no camera behind it here, so that wait does not end (guess: the likeliest of
+ * this library's changes since boot 122). AVFlashlight never talks to the server now: the torch is ours.
+ */
+static void
+sweet_fl_nothing(id self, SEL _cmd)
+{
+	(void)self;
+	(void)_cmd;
+}
+
 static void
 sweet_replace(Class cls, SEL sel, IMP imp, BOOL meta)
 {
@@ -157,6 +170,9 @@ sweet_flashlight_start(void)
 		NSLog(@"sweet-ui: no AVFlashlight: iOS's flashlight left as it is");
 		return;
 	}
+	sweet_replace(fl, NSSelectorFromString(@"_setupFlashlight"), (IMP)sweet_fl_nothing, NO);
+	sweet_replace(fl, NSSelectorFromString(@"_reconnectToServer"), (IMP)sweet_fl_nothing, NO);
+	sweet_replace(fl, NSSelectorFromString(@"_teardownFlashlight"), (IMP)sweet_fl_nothing, NO);
 	sweet_replace(fl, @selector(hasFlashlight), (IMP)sweet_fl_has, YES);
 	sweet_replace(fl, NSSelectorFromString(@"isAvailable"), (IMP)sweet_fl_available, NO);
 	sweet_replace(fl, NSSelectorFromString(@"isOverheated"), (IMP)sweet_fl_overheated, NO);
