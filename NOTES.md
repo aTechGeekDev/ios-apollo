@@ -8,6 +8,30 @@ Builds: kernel run 41216279299 (xnu through 0168, Xcode 16.0), userland run 4121
 Run on the user's Kali PC from ~/ios-apollo on `main` (research/, shim/out, recovery/recovery.img and sweet-bt/ are local, not in git).
 `--artwork-subtype 2556` stays on every boot (Dynamic Island).
 
+**Everything boot (2026-11-04, user: "the boot command w everything"):** boot 120 (Metal, xnu 0172-0180) + the PMIC/battery/status-bar work (xnu 0181-0183), all from main 08ee2b9: kernel xnu run 41829738717, sweet-metal2 41827349433, sweet-ui ui run 41829738713. Options through the ADT (`--option`, the boot line is full): apollo_rtc=1 apollo_power=1 apollo_torch=1 sweetbattery=1 apollo_ui=1. Needs boot 119's Turnip on the root (metal2-on.txt only carries the plug-in). Read back: `grep -a -E 'apollo pmic:|SWEET BATTERY|SWEET FB: [0-9]|SweetGPU: (the display|watchdog|10 s)|SWEET PROF|MTL2T|native-metal|CRASH (backboardd|SpringBoard)'`; photo of the status bar.
+
+```sh
+cd ~/ios-apollo && git pull && R=aTechGeekDev/ios-apollo &&
+gh run watch 41829738717 -R $R --exit-status &&
+rm -rf xnu/out sweet-metal2 sweet-ui &&
+gh run download 41829738717 -R $R -n xnu-kernel -D xnu/out &&
+gh run download 41827349433 -R $R -n sweet-metal2 -D sweet-metal2 &&
+gh run download 41829738713 -R $R -n sweet-ui -D sweet-ui &&
+python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --artwork-subtype 2556 \
+    --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
+    --gmu-fw research/apollo-gpu/a650_gmu.bin --sqe-fw research/apollo-gpu/a650_sqe.fw \
+    --zap-mdt research/apollo-gpu/a650_zap.mdt --zap-seg research/apollo-gpu/a650_zap.b02 \
+    --wifi-fw research/apollo-wifi --bt-fw research/apollo-bt \
+    --file /usr/local/lib/libsweet-bt.dylib=sweet-bt/lib/libsweet-bt.dylib \
+    --file /usr/local/lib/libsweet-ui.dylib=sweet-ui/lib/libsweet-ui.dylib \
+    --files-from tools/root-files/files.txt --files-from tools/root-files/bt-on.txt \
+    --files-from tools/root-files/metal2-on.txt \
+    --option apollo_rtc=1 --option apollo_power=1 --option apollo_torch=1 --option sweetbattery=1 --option apollo_ui=1 &&
+python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/apollo.adt shim/out/payload.bin \
+    --cmdline 'debug=0xc serial=3 cpumask=0xf1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 sweetfb_noconsole=1 sweetfb_height=2502 sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetgpulevel=6 sweetmtl=2 sweetwifi=12 apollo_audio=5 apollo_sound_gain=0 apollo_sound_below=80 apollo_mic=4 apollo_haptic=5 sweetbt=6 sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool sweetnull=backboardd,SpringBoard,bluetoothd,BlueTool,mediaserverd' &&
+shim/build.sh ../shim/out/payload.bin && fastboot boot shim/out/shim-boot.img
+```
+
 **iOS on Metal boot (next, 119: new Turnip + xnu 0176):** kernel xnu run 41824286340 (0172-0176, a33d6a8), sweet-metal2 metal2 run 41824286474 (Turnip with turnip/patches/0101 ring-order waits); `--files-from tools/root-files/turnip-update.txt` only (the plug-in and /var/local/mtl2-tu-debug = nocb are on the root since boot 118); boot-arg `sweetmtl=2`; no GL bridge. Read back: `grep -a -E 'SWEET FB: [0-9]|SweetGPU: (the display|watchdog|10 s)|SWEET SURF: rows|MTL2T|MTL2\[|native-metal|CRASH backboardd'`.
 
 ```sh
