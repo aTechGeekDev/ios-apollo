@@ -218,6 +218,16 @@ static bool listed(void)
 				mkdir(cache, 0700);
 			}
 		}
+		/* sweet (ios-apollo): boot 113, backboardd (user mobile) could create neither: the kernel had made /var/local
+		 * root's 0755 when it wrote mtl2.log there, and backboardd has no per-user cache directory; the bridge refused
+		 * the device ("ShaderCache ... Permission denied") and CoreAnimation drew on the CPU. /private/var/tmp is
+		 * writable by everyone (1777). */
+		if (access(cache, W_OK) != 0) {
+			mkdir("/private/var/tmp/m2v-cache", 0777);
+			chmod("/private/var/tmp/m2v-cache", 0777);
+			snprintf(cache, sizeof(cache), "/private/var/tmp/m2v-cache/%s", getprogname());
+			mkdir(cache, 0700);
+		}
 		/* plain rows everywhere: no Apple framebuffer compression, no 10-bit deep framebuffer */
 		setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
 		CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
