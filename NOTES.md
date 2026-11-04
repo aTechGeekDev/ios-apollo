@@ -2,6 +2,23 @@
 
 ## Agent handoff / active work
 
+### >>> NOTE FOR THE METAL/GPU AGENT (2026-11-04, from the Claude session that did the PMIC/battery/status-bar work; the user asked for this note) <<<
+
+The user asked me (another agent) to stay out of the GPU, Metal and the glitching icons; I did. What I changed that you will meet:
+- **main has my xnu 0181-0183 after your 0180** (renumbered twice to follow you; no file of yours touched):
+  - 0181 bsd/dev/apollo_pmic.c (RTC clock, PSCI power off/restart, PM8150L torch; also hooks IOStartIOKit.cpp IOKitInitializeTime and IOPlatformExpert.cpp PEGet/SetUTCTimeOfDay).
+  - 0182 SweetBattery reads SID 2 (PM8150B).
+  - 0183 kern_exec.c: inserts /usr/local/lib/libsweet-ui.dylib and/or ElleKit's TweakLoader into SpringBoard and /Applications + app-bundle executables (never backboardd or daemons).
+- **Everything is off unless an option is set.** Options come from a boot-arg or, since the boot line is full, the ADT: `mkadt.py --option NAME=N` (node /sweet-options; `apollo_option()` in apollo_pmic.c). Your boots without `--option` behave exactly as before.
+- **Boot 121 black screen was mine, and it says something about your stack.** apollo_rtc=1 removed IOKitInitializeTime's 30 s wait for an IORTC (nobody publishes one). Then launchd/backboardd started before `SWEET GPU: probe in 15 s` fired, and backboardd's SweetMetal2/Turnip got VK_ERROR_DEVICE_LOST: black. Fixed: the wait is only skipped with apollo_rtc_nowait=1 (keep it off). **The 30 s wait is what currently guarantees the GPU is up before backboardd;** if anything shortens early boot, the Metal plug-in needs to wait for the GPU itself. It would also make every boot ~30 s faster.
+- **CI:** xnu.yml + xnu/patches/0020-stage-bearssl.sh fall back to the BearSSL copy staged in the last green run's xnu-buildtree artifact when bearssl.org is down (502 all day on 2026-11-04). Your copy on main was identical.
+- **Boot 122** (kernel 41832275728 = your 0172-0180 + 0181-0183, metal2 41827349433 + metal2-on.txt, options apollo_rtc/power/torch=1 sweetbattery=1 apollo_ui=1):
+  - It boots and UI draws.
+  - backboardd logs `MTL2T: W VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT` every few hundred lines. Your area; not looked into.
+  - The user's photos show glitching icons (Control Center toggles, an AssistiveTouch-style button). Per the user, not mine to look at.
+  - If you suspect libsweet-ui (SpringBoard/apps only, swizzles one NSUserDefaults key), drop `--option apollo_ui=1`.
+- **NOTES:** I added an "Everything boot" entry at the top of CURRENT BOOT COMMANDS and the sections BOOT 121, STATUS BAR LIKE THE 14 PRO, PARALLEL WORK below.
+
 ### >>> CURRENT BOOT COMMANDS (as of 2026-11-04; boot 115 = faster, not 60; boot 119 = Turnip ring-order waits + 0176 (testing); next: boot 120 = + xnu 0177-0179 + LTO plug-in) <<<
 
 Builds: kernel run 41216279299 (xnu through 0168, Xcode 16.0), userland run 41218791846, metal run 41655855519 (artifact sweet-metal).
@@ -199,6 +216,20 @@ User preference: give paste-ready commands at once, do not wait on CI (`gh run w
 
 **Observed:** `SWEET MTL: IOAcceleratorES published (MetalPluginName SweetMetal2)`; backboardd loaded the plug-in (`MTL2[58 backboardd]`), then `native-metal: device refused: device: ShaderCache(ShaderCacheError { path: "/var/local/m2v-cache/backboardd", kind: PermissionDenied })` in 11 ms; `libvulkan_freedreno 0x0` (Turnip never loaded); `SpringBoard: not listed (/var/local/mtl2-clients): no Metal device` (as intended). With no device CoreAnimation drew on the CPU (no GL bridge either): SWEET FB 12.9/16.2/3.9 frames a second, 0 waited for the GPU, the CPU copy path. The plug-in's stderr lines reach the log (the 0171-era HotMetal2 change works).
 **Cause:** /private/var/local was created by the kernel (root, 0755) to write mtl2.log; backboardd runs as mobile, so mkdir /var/local/m2v-cache failed, and backboardd has no _CS_DARWIN_USER_CACHE_DIR. **Fix:** HotMetal2.mm falls back to /private/var/tmp/m2v-cache/<process> (1777 parent). Boot 114 = boot 113's command with the new metal2 run.
+
+### >>> BOOT 122 (2026-11-04, kernel 41832275728, metal2 41827349433 + metal2-on.txt, same options as 121): BOOTS; 14 Pro status bar style but items in the top corners; user wants the iOS flashlight button; battery gauge not at 0x4800 <<<
+
+**Observed (log 3284ea29-apollo-boot122.txt + 4 photos):**
+- **Clock:** `apollo pmic: clock set to 1793797248 (was 1143035); offset 1792654213 kept in memory only` (timed set it from the network).
+- **Power:** PSCI installed (not tried).
+- **Status bar** (photo, App Library):
+  - DynamicSplit is in use (battery with the number inside, the 14 Pro style).
+  - But the clock sits in the top-left corner, under the punch hole, and Wi-Fi/battery in the top-right corner. Neither is vertically centred on the island, nor centred in the space beside it.
+  - User: "the status bar icons should be aligned with the middle of the dynamic island".
+  - **Guess:** `[UIScreen _exclusionArea].rect` (DynamicSplit's sensorAreaRect) is empty on this screen, so the layout has no island to centre on. ios-re run on main reads where it comes from.
+- **Flashlight:** user: "i cant test the flashlight using a shell i want it to appear in ios" -> make iOS's own button (Control Center, lock screen: AVFlashlight) drive apollo.torch.
+- **Battery:** SID 2 blocks 0x1000-0x1300 answer type 0x2, subtypes 0x80-0x83 (the smb5 charger: chgr, dcdc, batif, usb). 0x4800 answers type 0 = **no QG there**. **Guess:** PM8150B has an FG Gen4 fuel gauge (0x4000 BATT_SOC, 0x4100 BATT_INFO; downstream qpnp-fg-gen4) instead of sweet's QG. Its registers are still to be found; the charger blocks are readable now.
+- **Not mine (user):** glitching icons; `VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT` in backboardd.
 
 ### >>> BOOT 121 (2026-11-04, kernel 41829738717 = Metal 0172-0180 + 0181-0183, metal2 41827349433 + metal2-on.txt, options apollo_rtc/power/torch=1 sweetbattery=1 apollo_ui=1): BLACK SCREEN -- caused by apollo_rtc's skipped 30 s wait -> 0181/0182 fixed <<<
 
