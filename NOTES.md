@@ -2,20 +2,20 @@
 
 ## Agent handoff / active work
 
-### >>> CURRENT BOOT COMMANDS (as of 2026-11-04; boot 115 = faster, not 60; boot 116 = no hangs, stutters + glitches; next: boot 117, xnu 0175 GPU busy + Turnip sysmem) <<<
+### >>> CURRENT BOOT COMMANDS (as of 2026-11-04; boot 115 = faster, not 60; boot 117 = sysmem -> DeviceLost, black; next: boot 118, back to autotune) <<<
 
 Builds: kernel run 41216279299 (xnu through 0168, Xcode 16.0), userland run 41218791846, metal run 41655855519 (artifact sweet-metal).
 Run on the user's Kali PC from ~/ios-apollo on `main` (research/, shim/out, recovery/recovery.img and sweet-bt/ are local, not in git).
 `--artwork-subtype 2556` stays on every boot (Dynamic Island).
 
-**iOS on Metal boot (next, 117: xnu 0175 + Turnip sysmem):** kernel xnu run 41820556724 (0172-0175, 1ba8f12), sweet-metal2 metal2 run 41811576010 (same as boot 116); `--files-from tools/root-files/metal2-on.txt --files-from tools/root-files/mtl2-sysmem.txt` (/var/local/mtl2-tu-debug = sysmem; stays on the root, `mtl2-autotune.txt` undoes it); boot-arg `sweetmtl=2`; no GL bridge. Read back: `grep -a -E 'SWEET FB: [0-9]|SweetGPU: (the display|watchdog|10 s)|MTL2T|TU_DEBUG|native-metal|CRASH backboardd|SWEET TOP'`.
+**iOS on Metal boot (next, 118: boot 116's rendering + xnu 0175 timing):** kernel xnu run 41820556724 (0172-0175), sweet-metal2 metal2 run 41822453135 (Turnip's messages on stderr); `--files-from tools/root-files/metal2-on.txt --files-from tools/root-files/mtl2-autotune.txt` (puts /var/local/mtl2-tu-debug back to `nocb`, undoing boot 117's sysmem, which stays on the root otherwise); boot-arg `sweetmtl=2`; no GL bridge. Read back: `grep -a -E 'SWEET FB: [0-9]|SweetGPU: (the display|watchdog|10 s)|MTL2T|MTL2\[|TU_DEBUG|native-metal|CRASH backboardd'`.
 
 ```sh
 cd ~/ios-apollo && git pull && R=aTechGeekDev/ios-apollo &&
-gh run watch 41820556724 -R $R --exit-status &&
+gh run watch 41822453135 -R $R --exit-status &&
 rm -rf xnu/out sweet-metal2 &&
 gh run download 41820556724 -R $R -n xnu-kernel -D xnu/out &&
-gh run download 41811576010 -R $R -n sweet-metal2 -D sweet-metal2 &&
+gh run download 41822453135 -R $R -n sweet-metal2 -D sweet-metal2 &&
 python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --artwork-subtype 2556 \
     --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
     --gmu-fw research/apollo-gpu/a650_gmu.bin --sqe-fw research/apollo-gpu/a650_sqe.fw \
@@ -23,7 +23,7 @@ python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --art
     --wifi-fw research/apollo-wifi --bt-fw research/apollo-bt \
     --file /usr/local/lib/libsweet-bt.dylib=sweet-bt/lib/libsweet-bt.dylib \
     --files-from tools/root-files/files.txt --files-from tools/root-files/bt-on.txt \
-    --files-from tools/root-files/metal2-on.txt --files-from tools/root-files/mtl2-sysmem.txt &&
+    --files-from tools/root-files/metal2-on.txt --files-from tools/root-files/mtl2-autotune.txt &&
 python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/apollo.adt shim/out/payload.bin \
     --cmdline 'debug=0xc serial=3 cpumask=0xf1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 sweetfb_noconsole=1 sweetfb_height=2502 sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetgpulevel=6 sweetmtl=2 sweetwifi=12 apollo_audio=5 apollo_sound_gain=0 apollo_sound_below=80 apollo_mic=4 apollo_haptic=5 sweetbt=6 sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool sweetnull=backboardd,SpringBoard,bluetoothd,BlueTool,mediaserverd' &&
 shim/build.sh ../shim/out/payload.bin && fastboot boot shim/out/shim-boot.img
@@ -106,6 +106,10 @@ grep -a -E 'probe:|sweet-fix: configd: metal|SWEET GPU: kept|SweetGPU:' logs/apo
 ```
 
 User preference: give paste-ready commands at once, do not wait on CI (`gh run watch RUN -R $R --exit-status &&` in front when a build is pending); `[skip ci]` on notes-only commits.
+
+### >>> BOOT 117 (2026-11-04, kernel 41820556724 = 0172-0175, metal2 41811576010, mtl2-sysmem.txt): BLACK SCREEN -- Turnip in sysmem mode: DeviceLost after ~20 frames -> boot 118 back to autotune (mtl2-autotune.txt) <<<
+
+**Observed (log c7074d28-apollo-boot117.txt):** `MTL2[57 backboardd]: TU_DEBUG=sysmem`, device in 619 ms; 0172's copy started (surface 5); 20 commits (K1-K20: 1 pass, 2-19 draws, ctc 4-5 ms, one 67 ms) then `native-metal: commandBuffer refused: command buffer: DeviceLost` 66 times; no watchdog, no recovery, no GPU fault, no kernel error, Submit/GetStatus never failed in the log -> Turnip itself declared the device lost. Its reason went to MESA_LOG_FILE /var/local/turnip-backboardd.log, unwritable for backboardd (mobile; /var/local is root 0755) -> **metal2 run 41822453135 (1182f90): no MESA_LOG_FILE, Turnip's messages on stderr.** xnu 0175 works: `SweetGPU: 10 s: the core busy 0.1 % (172 submissions, the longest 2.2 ms; 6 not timed)`. **Unknown:** why sysmem loses the device (Turnip sysmem path on the darwin kmd, or something of ours: RB_CCU / the ring's WFI+stamps of 0175 are guesses to rule out -- boot 118 with autotune + 0175 tells whether 0175 alone is fine).
 
 ### >>> BOOT 116 (2026-11-04, kernel 41818608414 = 0172-0174, metal2 41811576010): NO HANG (Settings opened fine); "navigating the ui there are stuters and glitches" (user; log cdc2a22a-apollo-boot116.txt) -> xnu 0175 + Turnip sysmem test (boot 117) <<<
 
