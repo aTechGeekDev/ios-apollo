@@ -1,0 +1,49 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -115,6 +115,9 @@
+  * passed. Boot-arg sweetblit=0: always the processor's copy.
+  * (xnu 0173) Such a frame is taken up when it is swapped, not at the next vsync tick, and copied into the third frame
+  * while the last flip still waits for the panel's refresh (the flip itself waits for it, after the copy).
++ * (xnu 0178) Every swap holds the CPU clocks at their (thermal) cap for sweetswapboost ms (default 100; 0: off), as a
++ * touch does (0160): while iOS animates, the governor does not first lower the clock of the core that draws the frames
++ * (its busy share alone made it hover under the top), and a pause of a tenth of a second lets it go down again.
+  *
+  * The panel memory itself is published as an IOSurface and returned as the
+  * default framebuffer surface. The kernel text console keeps drawing over
+@@ -126,6 +129,7 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" bool sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size);     /* SweetGPU.cpp */
+ extern "C" uint32_t sweet_gpu_v2_last(void);                                    /* (xnu 0172) */
++extern "C" void sweet_cpufreq_boost(uint32_t ms);                               /* (xnu 0178) bsd/dev/sweet_cpufreq.c */
+ extern "C" bool sweet_gpu_fence_passed(uint32_t fence);                         /* (xnu 0172) */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" bool apollo_backlight_fade(bool on, bool wait);      /* bsd/dev/sweet_backlight.c (xnu 0151) */
+@@ -288,6 +292,7 @@
+ 	bool          fBlitSaid;
+ 	uint64_t      fStatBlitAbs;
+ 	uint32_t presentBlit(const uint8_t *rec, int frame);
++	uint32_t      fSwapBoostMs;             /* (xnu 0178) boot-arg sweetswapboost, default 100 */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -533,6 +538,9 @@
+ 		fFlipSurf[f] = sweet_surface_create_physical(fFlipPA[f], fWidth, fHeight, fFlipStride, SWEET_FB_FORMAT_BGRA);
+ 		fScanReady = fFlipSurf[f] != NULL;
+ 	}
++	/* (xnu 0178) */
++	fSwapBoostMs = 100;
++	PE_parse_boot_argn("sweetswapboost", &fSwapBoostMs, sizeof(fSwapBoostMs));
+ 	/* (xnu 0172) */
+ 	int blitOn = 1;
+ 	PE_parse_boot_argn("sweetblit", &blitOn, sizeof(blitOn));
+@@ -1160,6 +1168,10 @@
+ 	/* (xnu 0172) Turnip's work for this frame was submitted before backboardd swapped it (Metal's scheduled handler) */
+ 	uint32_t fence = sweet_gpu_v2_last();
+ 
++	if (fSwapBoostMs != 0) {
++		sweet_cpufreq_boost(fSwapBoostMs);      /* (xnu 0178) */
++	}
++
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fPendingFence = fence;

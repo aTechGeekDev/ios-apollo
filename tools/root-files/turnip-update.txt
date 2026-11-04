@@ -1,0 +1,3 @@
+# A new Turnip (artifact sweet-metal2, lib/libvulkan_freedreno.dylib) onto the root, where the SweetMetal2 plug-in loads
+# it from (metal2-on.txt leaves the bundle's own copy out). Alone: the plug-in (HotMetal2) on the root is kept as it is.
+/usr/local/lib/libvulkan_freedreno.dylib=sweet-metal2/lib/libvulkan_freedreno.dylib 0:0:0755

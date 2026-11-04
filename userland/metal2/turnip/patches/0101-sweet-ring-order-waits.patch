@@ -1,0 +1,22 @@
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -863,8 +863,18 @@
+    struct tu_device *dev = queue->device;
+ 
+    /* The kernel client has one ring and no GPU-side waits: wait on the CPU before submitting. */
++   /* sweet (ios-apollo boot 118): ...for what is not on the ring yet. SweetGPU has one in-order ring for every queue
++    * and every client, and ends each submission with a wait for idle and a cache flush (xnu 0175 / sweet_gpu_submit):
++    * a sync that is already a submission (DARWIN_SYNC_FENCE) is met by the ring's order, as msm's scheduler meets a
++    * dependency on its own ring once that is scheduled. Waiting for its fence on the CPU left the GPU idle between
++    * every two of metal2vulkan's chained submissions (boot 118: the core busy 33-75 % while CoreAnimation's commits
++    * queued up to 97 ms). (The runtime calls this once every wait is pending: VK_SYNC_FEATURE_WAIT_PENDING.)
++    * TU_DARWIN_CPU_WAITS=1: every wait on the CPU, as before. */
++   static const bool cpu_waits = debug_get_bool_option("TU_DARWIN_CPU_WAITS", false);
+    for (uint32_t i = 0; i < wait_count; i++) {
+       struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
++      if (!cpu_waits && s->state != DARWIN_SYNC_UNSIGNALED)
++         continue;
+       VkResult result = darwin_sync_wait(dev, s, UINT64_MAX);
+       if (result != VK_SUCCESS)
+          return vk_device_set_lost(&dev->vk, "wait before submit failed");

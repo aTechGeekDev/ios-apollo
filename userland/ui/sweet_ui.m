@@ -1,5 +1,5 @@
 /*
- * libsweet-ui.dylib: UI changes for SpringBoard and the apps, inserted by the kernel (xnu 0175, option apollo_ui=1).
+ * libsweet-ui.dylib: UI changes for SpringBoard and the apps, inserted by the kernel (xnu 0183, option apollo_ui=1).
  *
  * The status bar of the iPhone 14 Pro. UIKit picks a status bar "visual provider" for the phone's own screen in
  * __UIStatusBarGetVisualProviderClassForScreen (UIKitCore 20H392, 0x1891aaa80; ios-re runs 41811694262, 41813238843).

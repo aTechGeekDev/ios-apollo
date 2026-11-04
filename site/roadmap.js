@@ -6,16 +6,16 @@
 window.ROADMAP = [
   { area: "Boot and system", items: [
     ["Boot without a computer", "Every boot is a temporary fastboot boot from a PC. The shim has to be flashed to the boot partition, with a way back to Android.", "todo", "M"],
-    ["Correct date and time", "Written, not yet tested (xnu 0173, option apollo_rtc): the calendar starts from the PM8150's real-time clock, and time set by iOS is written back to it. Today each boot starts in 1970 until the network sets the time.", "wip", "S"],
-    ["Power off", "Written, not yet tested (xnu 0173, option apollo_power): iOS's shutdown asks the firmware to power off (PSCI). Today the kernel only halts and the phone stays on until the power button is held.", "wip", "S"],
-    ["Restart from iOS", "Written, not yet tested (xnu 0173, option apollo_power): restarts, and with apollo_power=2 kernel panics, reset the phone through the firmware.", "wip", "S"],
+    ["Correct date and time", "Written, not yet tested (xnu 0181, option apollo_rtc): the calendar starts from the PM8150's real-time clock, and time set by iOS is written back to it. Today each boot starts in 1970 until the network sets the time.", "wip", "S"],
+    ["Power off", "Written, not yet tested (xnu 0181, option apollo_power): iOS's shutdown asks the firmware to power off (PSCI). Today the kernel only halts and the phone stays on until the power button is held.", "wip", "S"],
+    ["Restart from iOS", "Written, not yet tested (xnu 0181, option apollo_power): restarts, and with apollo_power=2 kernel panics, reset the phone through the firmware.", "wip", "S"],
     ["No sudden resets", "Boots 88 and 89 reset during normal use; the cause is not found yet. tools/reset-reason.sh reads the PMIC's power-off reason from recovery after the next one.", "wip", "M"],
     ["No crash-looping system parts", "Wallpapers and speech voices that need Metal crash and restart in a loop, costing CPU and battery.", "partial", "S"],
     ["Faster boot", "About a minute from fastboot to the lock screen. The kernel waits 30 s for a clock driver that this port never published; with the PMIC clock (apollo_rtc) that wait goes away.", "wip", "M"]
   ]},
   { area: "Power and battery", items: [
-    ["Battery level", "Written, not yet tested (xnu 0174, option sweetbattery): the battery service now reads the Mi 10T's PM8150B (it read the PMIC of the phone this port started from). The percentage is estimated from the voltage, not Qualcomm's fuel-gauge algorithm.", "wip", "M"],
-    ["Charging status", "Written, not yet tested (xnu 0174): charger connected, charging and full come from the PM8150B's charger.", "wip", "M"],
+    ["Battery level", "Written, not yet tested (xnu 0182, option sweetbattery): the battery service now reads the Mi 10T's PM8150B (it read the PMIC of the phone this port started from). The percentage is estimated from the voltage, not Qualcomm's fuel-gauge algorithm.", "wip", "M"],
+    ["Charging status", "Written, not yet tested (xnu 0182): charger connected, charging and full come from the PM8150B's charger.", "wip", "M"],
     ["Charger control", "Charging current and temperature limits come from the bootloader's defaults, not from iOS.", "todo", "M"],
     ["Sleep and standby", "The CPU never suspends: a locked phone drains the battery almost as fast as one in use.", "todo", "L"],
     ["Screen-off power saving", "Locking turns the backlight off, but the panel, display engine and GPU stay powered.", "partial", "M"],
@@ -50,7 +50,7 @@ window.ROADMAP = [
   { area: "Camera and media", items: [
     ["Rear cameras", "Image sensors and Qualcomm's camera pipeline (Spectra ISP).", "todo", "XL"],
     ["Front camera", "Same pipeline as the rear cameras.", "todo", "XL"],
-    ["Flashlight", "The kernel can light the PM8150L's flash LED in torch mode (xnu 0173, option apollo_torch, sysctl apollo.torch; not yet tested). iOS's own flashlight button goes through the camera stack, which is not there yet.", "partial", "M"],
+    ["Flashlight", "The kernel can light the PM8150L's flash LED in torch mode (xnu 0181, option apollo_torch, sysctl apollo.torch; not yet tested). iOS's own flashlight button goes through the camera stack, which is not there yet.", "partial", "M"],
     ["Hardware video decoding", "Videos are decoded by the CPU: hotter, slower, and some formats stutter.", "todo", "L"],
     ["Earpiece", "The earpiece amplifier is brought up, but call audio is not routed to it.", "partial", "S"]
   ]},
@@ -62,7 +62,7 @@ window.ROADMAP = [
   { area: "Apps and Apple services", items: [
     ["Install your own apps", "Decrypted or self-built apps go into /Applications from the PC (tools/app-pack.sh, jb-post.txt), registered at the next boot. TrollStore needs a CoreTrust bug that iOS 16.7.16 does not have.", "wip", "M"],
     ["Jailbreak and Sileo", "Procursus is in /var/jb and Sileo is on the home screen and works. Left: Sileo updates land in the registered copy (jb-post.txt links it).", "partial", "M"],
-    ["Tweaks", "The kernel inserts ElleKit's tweak loader into SpringBoard and apps (xnu 0175, option apollo_tweaks; not yet tested). Install ElleKit from Sileo first.", "wip", "M"],
+    ["Tweaks", "The kernel inserts ElleKit's tweak loader into SpringBoard and apps (xnu 0183, option apollo_tweaks; not yet tested). Install ElleKit from Sileo first.", "wip", "M"],
     ["App Store apps", "App Store apps are encrypted (FairPlay); this port cannot decrypt them.", "todo", "XL"],
     ["Apple ID and iCloud", "Signing in needs a genuine device identity.", "todo", "XL"],
     ["Push notifications", "Apple's push service needs device certificates.", "todo", "XL"],

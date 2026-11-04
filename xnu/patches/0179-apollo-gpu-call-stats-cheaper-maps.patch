@@ -1,0 +1,135 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -858,13 +858,18 @@
+ 	ring[(*at)++] = val;
+ }
+ 
+-/* After pages are added to a live context: its tables out to memory, its TLB forgotten. */
++/*
++ * After pages are added to a live context: its TLB forgotten. (xnu 0179) Every table entry is written to memory where it
++ * is written (gpu_map, gpu_unmap, gpu_next_table, gpu_new_table): the pass that pushed every table of the space out of
++ * this processor's cache again, here, on every map and unmap -- a 4 KiB clean per table, hundreds of tables once Turnip's
++ * clients have their buffers -- is gone; a barrier makes sure those writes are done before the SMMU is told.
++ */
+ static void
+ gpu_smmu_refresh(vm_offset_t smmu, uint32_t pg, uint32_t npg, uint32_t context, struct gpu_space *sp)
+ {
+ 	uint32_t cb = (npg + context) * pg;
+-	for (unsigned i = 0; i < sp->count; ++i)
+-		gpu_to_memory((vm_offset_t)sp->table[i], 4096);
++	(void)sp;
++	__asm__ volatile("dsb sy" ::: "memory");
+ 	gpu_wr(smmu, cb + SMMU_CB_TLBIASID, context);
+ 	gpu_wr(smmu, cb + SMMU_CB_TLBSYNC, 1);
+ 	for (unsigned i = 0; i < 100 && (gpu_rd(smmu, cb + SMMU_CB_TLBSTATUS) & 1u); ++i)
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -243,6 +243,7 @@
+  */
+ #define GPU_STAMP_SLOTS         96u             /* = KEPT_STAMPS of sweet_gpu.c */
+ extern "C" bool sweet_gpu_stamps(uint32_t fence, uint64_t *start, uint64_t *end);
++extern "C" size_t sweet_accelerator_stats(char *out, size_t size);     /* (xnu 0179) SweetAccelerator.cpp */
+ static uint32_t gStampNext;
+ static uint64_t gStampEnd, gStampBusy, gStampLongest, gStampSubmissions, gStampLost;
+ 
+@@ -305,6 +306,11 @@
+ 			    "timed)\n", gStampBusy / 1920000, gStampBusy / 192000 % 10, gStampSubmissions, gStampLongest / 19200,
+ 			    gStampLongest / 1920 % 10, gStampLost);
+ 			gStampBusy = gStampLongest = gStampSubmissions = gStampLost = 0;
++			/* (xnu 0179) and what Turnip's clients asked of the kernel */
++			static char calls[480];
++			if (sweet_accelerator_stats(calls, sizeof(calls)) != 0) {
++				IOLog("SweetGPU: 10 s: Turnip's calls: %s\n", calls);
++			}
+ 		}
+ 		if (gGPUStopped || last == 0) {
+ 			watched = 0;
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -30,6 +30,9 @@
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <pexpert/pexpert.h>
++#include <kern/clock.h>                 /* (xnu 0179) */
++#include <mach/mach_time.h>
++#include <libkern/OSAtomic.h>
+ #include "SweetGPUABI.h"
+ 
+ extern "C" {
+@@ -352,6 +355,50 @@
+ 	return kIOReturnSuccess;
+ }
+ 
++/*
++ * (xnu 0179) What Turnip's clients ask of the kernel and how long it takes there: per method the calls, the time inside
++ * the kernel and the longest one (mach time), said every 10 s by SweetGPU.cpp's watchdog thread (sweet_accelerator_stats)
++ * and then reset. A buffer made, mapped or given back on CoreAnimation's thread is time out of a frame; WaitFence is
++ * time a client's thread waited for the GPU.
++ */
++#define V2_STAT_METHODS         17
++static volatile SInt64 gV2Calls[V2_STAT_METHODS], gV2Abs[V2_STAT_METHODS], gV2Most[V2_STAT_METHODS];
++static const char *const gV2Names[V2_STAT_METHODS] = {
++	"?", "Query", "BoAlloc", "BoMap", "BoFree", "Submit", "WaitFence", "Timestamp", "Status", "SetMeta", "GetMeta",
++	"Queue", "CloseQueue", "CpuMap", "CpuUnmap", "DeviceInfo", "BoImport",
++};
++
++extern "C" size_t sweet_accelerator_stats(char *out, size_t size);
++
++/* the line's text (methods called in the window), the counts reset; 0: none was called */
++size_t
++sweet_accelerator_stats(char *out, size_t size)
++{
++	size_t at = 0;
++
++	out[0] = 0;
++	for (uint32_t m = 1; m < V2_STAT_METHODS; m++) {
++		SInt64 calls = gV2Calls[m], abs = gV2Abs[m], most = gV2Most[m];
++		uint64_t ns = 0, most_ns = 0;
++
++		if (calls == 0) {
++			continue;
++		}
++		OSAddAtomic64(-calls, &gV2Calls[m]);
++		OSAddAtomic64(-abs, &gV2Abs[m]);
++		gV2Most[m] = 0;
++		absolutetime_to_nanoseconds((uint64_t)abs, &ns);
++		absolutetime_to_nanoseconds((uint64_t)most, &most_ns);
++		if (at < size) {
++			int n = snprintf(out + at, size - at, "%s%s %lld x %llu.%llu ms (most %llu.%llu)", at ? ", " : "", gV2Names[m],
++			    calls, ns / NSEC_PER_MSEC, ns % NSEC_PER_MSEC / 100000, most_ns / NSEC_PER_MSEC,
++			    most_ns % NSEC_PER_MSEC / 100000);
++			at = n > 0 ? at + (size_t)n : at;
++		}
++	}
++	return at < size ? at : size - 1;
++}
++
+ IOReturn
+ SweetAcceleratorUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
+@@ -362,12 +409,25 @@
+ 	uint32_t osz = o != NULL ? args->structureOutputSize : 0;
+ 	IOReturn r;
+ 
++	uint64_t began = mach_absolute_time();
++	uint32_t method = selector;
++
+ 	if (isz >= 8 && w[0] == SWEET_V2_TUNNEL) {
+ 		/* {'NTNL', 0xffffffff}: Turnip's probe for a selector that is let through */
++		method = w[1] == 0xffffffffu ? 0 : w[1];
+ 		r = w[1] == 0xffffffffu ? kIOReturnSuccess : call(w[1], w + 2, isz - 8, o, &osz);
+ 	} else {
+ 		r = call(selector, isz ? args->structureInput : NULL, isz, o, &osz);
+ 	}
++	if (method < V2_STAT_METHODS) {
++		/* (xnu 0179) */
++		SInt64 took = (SInt64)(mach_absolute_time() - began);
++		OSAddAtomic64(1, &gV2Calls[method]);
++		OSAddAtomic64(took, &gV2Abs[method]);
++		if (took > gV2Most[method]) {
++			gV2Most[method] = took;
++		}
++	}
+ 	if (o != NULL) {
+ 		args->structureOutputSize = r == kIOReturnSuccess ? osz : 0;
+ 	}

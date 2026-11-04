@@ -339,7 +339,7 @@ def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_
        ([node('sweet-wifi', [ph()] + list(wifi))] if wifi else []) +
        ([node('sweet-bt', [ph()] + list(bt))] if bt else []) +
        # --option NAME=N: /sweet-options, 32-bit values the kernel reads like boot-args when the boot line has no room
-       # (apollo_option() in xnu 0173's bsd/dev/apollo_pmic.c; a boot-arg of the same name wins)
+       # (apollo_option() in xnu 0181's bsd/dev/apollo_pmic.c; a boot-arg of the same name wins)
        ([node('sweet-options', [ph()] + [(name, u32(value)) for name, value in options])] if options else []) +
        ([node('sweet-files', [ph()] + [(f'list{i}', path.encode() + b'\0') for i, path in enumerate(lists)]
                               + [(f'delete{i}', path.encode() + b'\0') for i, path in enumerate(deletes)]

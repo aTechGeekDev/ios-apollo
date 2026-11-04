@@ -1,0 +1,160 @@
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -2046,6 +2046,44 @@
+ int sched_allow_rt_steal = 1;
+ int sched_backup_cpu_timeout_count = 5; /* The maximum number of 10us delays to wait before using a backup cpu */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * (xnu 0177) apollo's cores are not alike, and this kernel treats them as if they were (one SMP processor set): its
++ * cores 0-3 are Cortex-A55s at 1.8 GHz, 4-6 Cortex-A77s at 2.4 GHz and 7 a Cortex-A77 at 2.84 GHz (boot-arg cpumask=0xf1:
++ * logical CPU 0 is core 0, an A55, then the A77s in order). XNU's choices all go to the lowest-numbered CPU first: an
++ * idle CPU for a thread that wakes (lsb_first), and for a realtime one the lowest CPU not already running realtime
++ * work, idle or not. So CoreAnimation's threads (backboardd's display thread at 30-60 % of a core, its realtime render
++ * server) and an app's main thread kept landing on the A55, where a frame takes about twice as long: stutters.
++ * Here a thread at sweet_fast_pri (BASEPRI_DEFAULT, 31) or above, or a realtime one, takes the fastest idle core first
++ * (the highest-numbered big one, the prime core first), and leaves a hint to an idle little core while a big core is
++ * idle; a thread under it (utility, background) takes the little core first, then the slowest big one. Little cores:
++ * sweet_little_cpus, set by bsd/dev/sweet_cpufreq.c from each CPU's MPIDR (0: none known yet: every CPU counts as big).
++ * Boot-arg sweetbigfirst=0 (read there): XNU's own order.
++ */
++extern uint64_t sweet_little_cpus;             /* (also bsd/dev/sweet_cpufreq.c) */
++extern int sweet_fast_pri;
++uint64_t sweet_little_cpus;
++int sweet_fast_pri = BASEPRI_DEFAULT;
++
++static inline bool
++sweet_big_first(int pri)
++{
++	return pri >= sweet_fast_pri;
++}
++
++/* the CPU of `map` a thread of priority `pri` should take first (-1: none) */
++static inline int
++sweet_pick_cpu(cpumap_t map, int pri)
++{
++	cpumap_t big = map & ~sweet_little_cpus, little = map & sweet_little_cpus;
++
++	if (sweet_big_first(pri)) {
++		return big != 0 ? bit_first(big) : lsb_first(map);
++	}
++	return little != 0 ? lsb_first(little) : lsb_first(map);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ int sched_rt_n_backup_processors = SCHED_DEFAULT_BACKUP_PROCESSORS;
+ 
+ int
+@@ -5083,6 +5121,15 @@
+ 				 * idle processor. The platform layer had an opportunity to provide
+ 				 * the "least cost idle" processor above.
+ 				 */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++				/* (xnu 0177) not an idle little core for a thread that wants speed while a big core idles too */
++				if (sweet_big_first(thread->sched_pri) && bit_test(sweet_little_cpus, processor->cpu_id) &&
++				    (pset->cpu_state_map[PROCESSOR_IDLE] & pset->primary_map & pset->recommended_bitmask &
++				    ~sweet_little_cpus) != 0) {
++					processor = PROCESSOR_NULL;
++					break;
++				}
++#endif
+ 				if ((thread->sched_pri < BASEPRI_RTQUEUES) || processor_is_fast_track_candidate_for_realtime_thread(pset, processor)) {
+ 					return processor;
+ 				}
+@@ -5246,7 +5293,11 @@
+ 		/* there shouldn't be a pending AST if the processor is idle */
+ 		assert((idle_primary_map & pset->pending_AST_URGENT_cpu_mask) == 0);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		int cpuid = sweet_pick_cpu(idle_primary_map, thread->sched_pri);    /* (xnu 0177) */
++#else
+ 		int cpuid = lsb_first(idle_primary_map);
++#endif
+ 		if (cpuid >= 0) {
+ 			processor = processor_array[cpuid];
+ 			return processor;
+@@ -8308,7 +8359,14 @@
+ 		primary_map = bit_ror64(primary_map, 1);
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* (xnu 0177) an idle big core first (the fastest), then any big one, then the little ones */
++	cpumap_t sweet_idle_big = primary_map & pset->cpu_state_map[PROCESSOR_IDLE] & ~sweet_little_cpus;
++	int rotid = sweet_big_first(BASEPRI_RTQUEUES) && sweet_idle_big != 0 ? bit_first(sweet_idle_big) :
++	    sweet_pick_cpu(primary_map, BASEPRI_RTQUEUES);
++#else
+ 	int rotid = lsb_first(primary_map);
++#endif
+ 	if (rotid >= 0) {
+ 		int cpuid = avoid_cpu0 ? ((rotid + 1) & 63) : rotid;
+ 
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -43,6 +43,9 @@
+  * at full speed instead of after the governor has seen the load (as Android's input boost).
+  * Boot-arg sweetcpugov=0: the old way, every domain at its top (or the sweetcpufreq cap) for good.
+  * The governor starts 15 s into the boot (the boot itself at the top).
++ * (xnu 0177) It also tells the scheduler (osfmk/kern/sched_prim.c) which CPUs are the Cortex-A55s, from their MPIDR:
++ * threads at priority 31 and up, and realtime ones, then start on the fastest idle big core, not on core 0 (boot-arg
++ * sweetbigfirst=0: XNU's own order).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -124,6 +127,41 @@
+ }
+ static vm_offset_t tsens0;
+ 
++/* (xnu 0177) the little cores for the scheduler; said when `say` */
++extern uint64_t sweet_little_cpus;              /* osfmk/kern/sched_prim.c */
++extern int sweet_fast_pri;
++
++static void
++cpufreq_cpu_kinds(bool say)
++{
++	unsigned bigfirst = 1, cpus = 0;
++	uint64_t little = 0;
++
++	(void)PE_parse_boot_argn("sweetbigfirst", &bigfirst, sizeof(bigfirst));
++	for (unsigned cpu = 0; cpu < GOV_CPUS; cpu++) {
++		uint32_t mpidr;
++		uint64_t idle;
++
++		if (!sweet_cpu_sample(cpu, &mpidr, &idle)) {
++			continue;
++		}
++		cpus++;
++		if (((mpidr >> 8) & 0xffu) < 4) {
++			little |= 1ull << cpu;
++		}
++	}
++	if (bigfirst == 0) {
++		sweet_fast_pri = 128;   /* above MAXPRI: no thread starts on the big cores first */
++	} else if (little != 0 && cpus > (unsigned)__builtin_popcountll(little)) {
++		sweet_little_cpus = little;
++	}
++	if (say) {
++		printf("SWEET CPUFREQ: %u CPUs up, the Cortex-A55s at CPU mask %#llx: %s (xnu 0177)\n", cpus,
++		    (unsigned long long)little, bigfirst == 0 ? "XNU's own CPU order (sweetbigfirst=0)" :
++		    "threads at priority 31 and up, and realtime ones, start on the fastest idle big core");
++	}
++}
++
+ static uint32_t
+ cpufreq_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -244,6 +282,7 @@
+ 	    GOV_PERIOD_MS, limit, limit ? "" : " (none)");
+ 	stats_since = at_prev = tame_since = mach_absolute_time();
+ 	governing = true;
++	cpufreq_cpu_kinds(true);        /* (0177) every CPU is up by now */
+ 
+ 	for (;;) {
+ 		uint64_t now = mach_absolute_time(), span = now - at_prev;
+@@ -387,6 +426,7 @@
+ 	(void)PE_parse_boot_argn("sweetcpugov", &governor, sizeof(governor));
+ 	uint64_t before = cpufreq_bench();
+ 
++	cpufreq_cpu_kinds(true);        /* (0177) and again when the governor starts */
+ 	for (unsigned d = 0; d < CPUFREQ_DOMAINS; ++d) {
+ 		vm_offset_t base = ml_io_map(CPUFREQ_DOMAIN_PA(d), 0x1000);
+ 		if (!base) {
