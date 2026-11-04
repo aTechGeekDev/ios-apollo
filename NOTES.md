@@ -2,19 +2,19 @@
 
 ## Agent handoff / active work
 
-### >>> CURRENT BOOT COMMANDS (as of 2026-11-04; boot 115 = faster, not 60; next: boot 116, xnu 0173 + metal2 seed-skip) <<<
+### >>> CURRENT BOOT COMMANDS (as of 2026-11-04; boot 115 = faster, not 60; next: boot 116, xnu 0173 + 0174 + metal2 seed-skip) <<<
 
 Builds: kernel run 41216279299 (xnu through 0168, Xcode 16.0), userland run 41218791846, metal run 41655855519 (artifact sweet-metal).
 Run on the user's Kali PC from ~/ios-apollo on `main` (research/, shim/out, recovery/recovery.img and sweet-bt/ are local, not in git).
 `--artwork-subtype 2556` stays on every boot (Dynamic Island).
 
-**iOS on Metal boot (next, 116: xnu 0173 + metal2 seed-skip):** kernel xnu run 41811575828 (0172+0173, cd9e236), sweet-metal2 metal2 run 41811576010 (commit-time cache pass skips unchanged surfaces; telemetry `MTL2T:` rows on stderr every 10 s); `--files-from tools/root-files/metal2-on.txt`; boot-arg `sweetmtl=2`; no GL bridge. `sweetblit=0` (not on the line) would turn 0172's GPU copy off. Read back: `grep -a -E 'SWEET MTL|MTL2\[|MTL2T|native-metal|CRASH backboardd|SWEET GPU: kept|SWEET FB|SweetGPU: the display'`.
+**iOS on Metal boot (next, 116: xnu 0173 + metal2 seed-skip):** kernel xnu run 41812424400 (0172+0173+0174 watchdog, f209025), sweet-metal2 metal2 run 41811576010 (commit-time cache pass skips unchanged surfaces; telemetry `MTL2T:` rows on stderr every 10 s); `--files-from tools/root-files/metal2-on.txt`; boot-arg `sweetmtl=2`; no GL bridge. `sweetblit=0` (not on the line) would turn 0172's GPU copy off. Read back: `grep -a -E 'SWEET MTL|MTL2\[|MTL2T|native-metal|CRASH backboardd|SWEET GPU: kept|SWEET FB|SweetGPU: the display'`.
 
 ```sh
 cd ~/ios-apollo && git pull && R=aTechGeekDev/ios-apollo &&
-gh run watch 41811575828 -R $R --exit-status && gh run watch 41811576010 -R $R --exit-status &&
+gh run watch 41812424400 -R $R --exit-status && gh run watch 41811576010 -R $R --exit-status &&
 rm -rf xnu/out sweet-metal2 &&
-gh run download 41811575828 -R $R -n xnu-kernel -D xnu/out &&
+gh run download 41812424400 -R $R -n xnu-kernel -D xnu/out &&
 gh run download 41811576010 -R $R -n sweet-metal2 -D sweet-metal2 &&
 python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --artwork-subtype 2556 \
     --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
@@ -107,12 +107,13 @@ grep -a -E 'probe:|sweet-fix: configd: metal|SWEET GPU: kept|SweetGPU:' logs/apo
 
 User preference: give paste-ready commands at once, do not wait on CI (`gh run watch RUN -R $R --exit-status &&` in front when a build is pending); `[skip ci]` on notes-only commits.
 
-### >>> BOOT 115 (2026-11-04, kernel 41809392184 = 0172, metal2 41806600419): "noticeably faster, but not enough, i need a stable 60fps across everything" (user; no log sent yet) -> xnu 0173 + metal2 run 41811576010 (cd9e236); NOT YET BOOTED (boot 116) <<<
+### >>> BOOT 115 (2026-11-04, kernel 41809392184 = 0172, metal2 41806600419): "noticeably faster, but not enough, i need a stable 60fps across everything"; "the system hanged in settings" (user; log d379186b-apollo-boot115.txt) -> xnu 0173 + metal2 run 41811576010 (cd9e236); NOT YET BOOTED (boot 116) <<<
 
-**Observed:** only the user's sentence above; the SWEET FB / 0172 lines of boot 115 not seen yet (asked for).
+**Observed (log):** 0172 works: `the GPU copies backboardd's frames (0172): surface 5 1125x2502 fmt 0x42475241 rows 4608 (+0), display lines 1..2501 -> panel lines 0..2399`; every frame that reached the panel was the GPU's copy; no GPU fault, no recovery. **iOS itself is the limit:** iOS gave 19-40 frames a second while animating, the panel got 18-35; "the copy" (swap -> fence passed, i.e. queued behind Turnip's own work) 5-21 ms on average, up to ~110 ms; 20-60 frames per 10 s waited for the last flip. SWEET TOP: `backboardd/com.apple.coreanimation.display.primary` 30-45 %, render-server 3-5 %, SpringBoard 7-16 %; CPUs at 1.5-2.2 GHz (not maxed). **Settings hang:** after Preferences opened (SWEET TOP shows Preferences, NTKFaceSnapshotService crash-looped before: sig 11/6, also Bridge running) iOS gave 0 frames for minutes; no CRASH backboardd, no "no answer", no recovery. The user's sample (SMP sample 4, last in the log): backboardd t3 (a QuartzCore thread, 0x1d19../0x1d1b.. frames) inside a syscall at pc 0x20bcb4ea4 with a 13-frame stack, the other threads idle (mach_msg / HotMetal2 telemetry sleep / metal2vulkan workers in cv waits). Not symbolicated here (no shared cache in the container): `tools/sweet-symbolicate.sh logs/apollo-boot115.txt` on the PC names it. Guess: a Metal wait (command buffer / scheduled) that never finished, or a lost GPU hang (Turnip waits in short steps, so 0163's ">= 1 s wait" never fired) -> **xnu 0174 watchdog** (below).
+**xnu 0174 (f209025, xnu run 41812424400, includes 0173):** a kernel thread looks every 500 ms; a submission not done 5 s after it was first watched -> `SweetGPU: watchdog: submission N not done after 5 s ... the core is reset`, sweet_gpu_report, sweet_gpu_recover (0163). `sweetgpudog=0` off.
 **Found by reading (not measured):** the metal2 frontend (NativeBridgeMetalFrontend.mm flushSurfaces) cleaned+invalidated *every page of every IOSurface* a command buffer names at commit, on the committing thread (CoreAnimation's render thread: display surface, wallpaper, every window ~11 MB each, every frame), and again the written ones at completion. Guess: tens of ms of `dc civac` per frame on the render thread = the main cap on iOS's own frame rate. **Change (metal2 run 41811576010):** commit-time pass skips a surface whose IOSurface seed is unchanged since it was last cleaned there (CPU writes bump the seed on unlock; xnu 0046 implements the seed in the state page), re-cleaned at least every 100 ms anyway; `SWEET_MTL2_FLUSH_ALL=1` in /var/local/mtl2-env restores the old pass. Completion-time invalidate unchanged (timed separately). Telemetry (`MTL2T:` rows: `J surface cache` = commit pass, `J surface skipped=.. invalidate ..` = new) every 10 s on stderr. **If app contents show stale/old pixels:** the seed is not bumped by some writer -> SWEET_MTL2_FLUSH_ALL=1 to confirm.
 **xnu 0173 (display):** a Metal frame is taken up at swap (present thread woken in swap()) instead of the next 60 Hz tick, and copied into the third flip frame while the last flip still waits for the panel (settleWait() after the copy, before the flip). No free frame -> retried 0.5 ms later.
-**Patch numbers:** main now has 0172 + 0173; branch `claude/wonderful-allen-3gaupe`'s 0172-0174 become 0174-0176 when merged (no file overlap).
+**Patch numbers:** main now has 0172 (display GPU copy) + 0173 (frames at swap) + 0174 (GPU watchdog). Branch `claude/wonderful-allen-3gaupe` merged main at 0172 and renumbered its PMIC/battery/tweak patches to 0173-0175 (its xnu run 41809620492): they must move to 0175-0177 before it merges into main again (no file overlap with 0173/0174).
 
 ### >>> xnu 0172 (2026-11-04, commit 6d83269, xnu run 41809392184 started; user after boot 114: "the acceleration works but its slow some things glitches"): the display's GPU copy of Metal frames; NOT YET BOOTED (boot 115) <<<
 
