@@ -82,7 +82,7 @@
  bsd/dev/sweet_keys.c			standard
 --- /dev/null
 +++ b/bsd/dev/apollo_pmic.c
-@@ -0,0 +1,530 @@
+@@ -0,0 +1,532 @@
 +/*
 + * apollo (xnu 0181): the clock, power off / restart and the flashlight, through the Mi 10T's PMICs.
 + *
@@ -100,7 +100,8 @@
 + *   apollo_power=1  power off and restart from iOS go to the firmware: PSCI SYSTEM_OFF / SYSTEM_RESET (as mainline Linux
 + *                   does on SM8250); before, the kernel only halted and the phone stayed on until the power key was held.
 + *   apollo_power=2  the same, and a panic restarts the phone (kPEPanicRestartCPU -> SYSTEM_RESET).
-+ *   apollo_torch=1  the sysctl apollo.torch (mA per channel, 0 = off, 25 to 150) lights the PM8150L's flash LED module
++ *   apollo_torch=1  the sysctl apollo.torch (mA per channel, 0 = off, 5 to 150; writable by any user: SpringBoard's
++ *                   flashlight button sets it through libsweet-ui) lights the PM8150L's flash LED module
 + *                   (SID 5, 0xd300, "qcom,pm8150l-flash-led": three channels, Linux's leds-qcom-flash.c MVFLASH_3CH
 + *                   registers) in torch mode; apollo_torch_mask (default 3) = the channels the LED is on.
 + *
@@ -570,7 +571,8 @@
 +}
 +
 +SYSCTL_NODE(, OID_AUTO, apollo, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "apollo (Mi 10T) hardware");
-+SYSCTL_PROC(_apollo, OID_AUTO, torch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_apollo_torch, "I",
++/* CTLFLAG_ANYBODY: iOS's flashlight button lives in SpringBoard (user mobile): libsweet-ui writes this from there */
++SYSCTL_PROC(_apollo, OID_AUTO, torch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0, sysctl_apollo_torch, "I",
 +    "flashlight: mA per channel, 0 = off (apollo_torch=1)");
 +SYSCTL_PROC(_apollo, OID_AUTO, rtc_raw, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_apollo_rtc, "Q",
 +    "the PM8150 clock's seconds, -1 if unreadable");
