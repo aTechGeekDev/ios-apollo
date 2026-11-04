@@ -7,8 +7,26 @@ bearssl_sha=7bea48e5e850ab4cafbe68d3765cdaba13a86d6f
 bearssl_tmp=$(mktemp -d)
 trap 'rm -rf "$bearssl_tmp"' EXIT
 git init -q "$bearssl_tmp"
-git -C "$bearssl_tmp" fetch -q --depth 1 \
-    https://www.bearssl.org/git/BearSSL "$bearssl_sha"
+# bearssl.org is the only home of BearSSL's git; it answered 502 for hours on 2026-11-04 (xnu runs 41812424400,
+# 41815379193). A few tries, then the copy this script staged in an earlier green run, if xnu.yml found one
+# (SWEET_BEARSSL_STAGED: libkern/crypto/sweet_bearssl out of that run's xnu-buildtree; same sha, nothing else changes).
+fetched=0
+for wait in 0 20 60; do
+    sleep "$wait"
+    if git -C "$bearssl_tmp" fetch -q --depth 1 https://www.bearssl.org/git/BearSSL "$bearssl_sha"; then
+        fetched=1
+        break
+    fi
+done
+if [[ $fetched == 0 ]]; then
+    staged=${SWEET_BEARSSL_STAGED:-}
+    [[ -n "$staged" && -f "$staged/src/inner.h" && -f "$staged/LICENSE.txt" ]] ||
+        { echo "bearssl.org unreachable and no staged copy (SWEET_BEARSSL_STAGED)" >&2; exit 1; }
+    [[ ! -e libkern/crypto/sweet_bearssl ]] || { echo "refusing to overwrite libkern/crypto/sweet_bearssl" >&2; exit 1; }
+    cp -R "$staged" libkern/crypto/sweet_bearssl
+    echo "Staged BearSSL ($bearssl_sha) for SWEET from an earlier run's copy: bearssl.org unreachable"
+    exit 0
+fi
 git -C "$bearssl_tmp" checkout -q FETCH_HEAD
 [[ "$(git -C "$bearssl_tmp" rev-parse HEAD)" == "$bearssl_sha" ]]
 python3 - "$bearssl_tmp" <<'PY'

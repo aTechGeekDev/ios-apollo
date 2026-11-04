@@ -49,6 +49,10 @@ jobs:
 
   build:
     needs: validate
+    # actions: read for the BearSSL fallback (an earlier run's xnu-buildtree artifact)
+    permissions:
+      contents: read
+      actions: read
     # macOS 14 images (the last with Xcode 15) are retired on 2026-11-02. On macos-15 the oldest
     # Xcode is 16.0, whose iig emits IORPC.kernelContent: xnu 0167 backports that field.
     runs-on: macos-15
@@ -128,6 +132,27 @@ jobs:
           tools/mk-ath11k.sh linux freebsd khdr ath11k-build
           cat ath11k-build/out/kernel-calls.txt | tr '\n' ' '; echo
           echo "SWEET_OBJECTS=$PWD/ath11k-build/out/ath11k.o" >> "$GITHUB_ENV"
+
+      # BearSSL's git lives only on bearssl.org (xnu/patches/0020-stage-bearssl.sh). When that host is down
+      # (502 for hours on 2026-11-04), take the copy 0020 staged in the last green run (its xnu-buildtree
+      # artifact, kept 7 days): same pinned commit, the same files.
+      - name: BearSSL fallback when bearssl.org is down
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git ls-remote https://www.bearssl.org/git/BearSSL >/dev/null 2>&1; then
+            echo "bearssl.org answers"; exit 0
+          fi
+          echo "bearssl.org does not answer: looking for a staged copy in earlier green runs"
+          for id in $(gh run list -R "$GITHUB_REPOSITORY" -w xnu.yml -s success -L 10 --json databaseId -q '.[].databaseId'); do
+            rm -rf "bt-$id" && mkdir -p "bt-$id"
+            if gh run download "$id" -R "$GITHUB_REPOSITORY" -n xnu-buildtree -D "bt-$id" &&
+               tar xzf "bt-$id/buildtree.tgz" -C "bt-$id" xnu/libkern/crypto/sweet_bearssl; then
+              echo "SWEET_BEARSSL_STAGED=$PWD/bt-$id/xnu/libkern/crypto/sweet_bearssl" >> "$GITHUB_ENV"
+              echo "using run $id's copy"; exit 0
+            fi
+          done
+          echo "no staged copy found: 0020 will try bearssl.org once more and fail if it is still down"
 
       - name: Build
         working-directory: dxb
