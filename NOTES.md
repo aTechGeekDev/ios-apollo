@@ -8,13 +8,13 @@ Builds: kernel run 41216279299 (xnu through 0168, Xcode 16.0), userland run 4121
 Run on the user's Kali PC from ~/ios-apollo on `main` (research/, shim/out, recovery/recovery.img and sweet-bt/ are local, not in git).
 `--artwork-subtype 2556` stays on every boot (Dynamic Island).
 
-**iOS on Metal boot (next, 116: xnu 0173 + metal2 seed-skip):** kernel xnu run 41812424400 (0172+0173+0174 watchdog, f209025), sweet-metal2 metal2 run 41811576010 (commit-time cache pass skips unchanged surfaces; telemetry `MTL2T:` rows on stderr every 10 s); `--files-from tools/root-files/metal2-on.txt`; boot-arg `sweetmtl=2`; no GL bridge. `sweetblit=0` (not on the line) would turn 0172's GPU copy off. Read back: `grep -a -E 'SWEET MTL|MTL2\[|MTL2T|native-metal|CRASH backboardd|SWEET GPU: kept|SWEET FB|SweetGPU: the display'`.
+**iOS on Metal boot (next, 116: xnu 0173 + metal2 seed-skip):** kernel xnu run 41818608414 (0172+0173+0174 watchdog + the BearSSL CI fallback, c32b53c; run 41812424400 failed: bearssl.org 502, not a compile error), sweet-metal2 metal2 run 41811576010 (commit-time cache pass skips unchanged surfaces; telemetry `MTL2T:` rows on stderr every 10 s); `--files-from tools/root-files/metal2-on.txt`; boot-arg `sweetmtl=2`; no GL bridge. `sweetblit=0` (not on the line) would turn 0172's GPU copy off. Read back: `grep -a -E 'SWEET MTL|MTL2\[|MTL2T|native-metal|CRASH backboardd|SWEET GPU: kept|SWEET FB|SweetGPU: the display'`.
 
 ```sh
 cd ~/ios-apollo && git pull && R=aTechGeekDev/ios-apollo &&
-gh run watch 41812424400 -R $R --exit-status && gh run watch 41811576010 -R $R --exit-status &&
+gh run watch 41818608414 -R $R --exit-status && gh run watch 41811576010 -R $R --exit-status &&
 rm -rf xnu/out sweet-metal2 &&
-gh run download 41812424400 -R $R -n xnu-kernel -D xnu/out &&
+gh run download 41818608414 -R $R -n xnu-kernel -D xnu/out &&
 gh run download 41811576010 -R $R -n sweet-metal2 -D sweet-metal2 &&
 python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --artwork-subtype 2556 \
     --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
