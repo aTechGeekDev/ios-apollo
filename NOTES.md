@@ -112,6 +112,21 @@ User preference: give paste-ready commands at once, do not wait on CI (`gh run w
 **Observed:** `SWEET MTL: IOAcceleratorES published (MetalPluginName SweetMetal2)`; backboardd loaded the plug-in (`MTL2[58 backboardd]`), then `native-metal: device refused: device: ShaderCache(ShaderCacheError { path: "/var/local/m2v-cache/backboardd", kind: PermissionDenied })` in 11 ms; `libvulkan_freedreno 0x0` (Turnip never loaded); `SpringBoard: not listed (/var/local/mtl2-clients): no Metal device` (as intended). With no device CoreAnimation drew on the CPU (no GL bridge either): SWEET FB 12.9/16.2/3.9 frames a second, 0 waited for the GPU, the CPU copy path. The plug-in's stderr lines reach the log (the 0171-era HotMetal2 change works).
 **Cause:** /private/var/local was created by the kernel (root, 0755) to write mtl2.log; backboardd runs as mobile, so mkdir /var/local/m2v-cache failed, and backboardd has no _CS_DARWIN_USER_CACHE_DIR. **Fix:** HotMetal2.mm falls back to /private/var/tmp/m2v-cache/<process> (1777 parent). Boot 114 = boot 113's command with the new metal2 run.
 
+### >>> STATUS BAR LIKE THE 14 PRO (2026-11-04, branch claude/wonderful-allen-3gaupe; user: clock under the punch hole, wants the 14 Pro placement): libsweet-ui (ui run 41815263582 GREEN) + xnu 0175 apollo_ui (kernel run 41815379193); NOT BOOTED <<<
+
+**Found (ios-re 41811694262, 41813238843 + one short run; UIKitCore 20H392):**
+- **Selection.** `__UIStatusBarGetVisualProviderClassForScreen` (0x1891aaa80), for the embedded screen only:
+  1. It reads the UIKit default `UIStatusBarVisualProviderClassName` through `__UIKitUserDefaults()` (a dispatch_once NSUserDefaults; its suite name was not read). If that names a class conforming to `_UIStatusBarVisualProvider`, it uses it (cached).
+  2. Otherwise it asks `_UIStatusBarVisualProvider_iOS`'s subclasses by width, scale, idiom and corner radius. Without a match it logs rdar://45025538 and uses `_Fallback`.
+- **Why the X layout.** At 375 pt (xnu 0152) it gets `Split1125`, the iPhone X's layout: the clock sits in the top-left corner, under the Mi 10T's punch hole.
+- **The 14 Pro layout.** `_UIStatusBarVisualProvider_DynamicSplit` lays items around `[screen _exclusionArea].rect` (sensorAreaRect: the island; present since --artwork-subtype 2556).
+  - Its `+visualProviderSubclassForScreen:` returns `DynamicSplitMedium` (15 pt fonts) below a width threshold, `self` above. The constant was not read.
+**Change:**
+- `userland/ui/sweet_ui.m` (libsweet-ui.dylib, workflow ui.yml) swizzles `-[NSUserDefaults objectForKey:]`. For that one key, when unset, it answers `_UIStatusBarVisualProvider_DynamicSplitMedium`, or `$SWEET_UI_STATUS_BAR` if set; a real default still wins. It does nothing if the class is missing.
+- xnu 0175 inserts it into SpringBoard and apps with option `apollo_ui=1` (and the tweak loader too with `apollo_tweaks=1`: `DYLD_INSERT_LIBRARIES=A:B`).
+**Unknowns:** _exclusionArea at 375x834 (if nil, the items center as if the island had no width); whether the left group clears the punch hole (Mi 10T: top-left).
+**Test:** kernel artifact from 41815379193 (when green); `gh run download 41815263582 -R $R -n sweet-ui -D sweet-ui`; mkadt += `--file /usr/local/lib/libsweet-ui.dylib=sweet-ui/lib/libsweet-ui.dylib --option apollo_ui=1`. Back: drop the option (the file can stay).
+
 ### >>> PARALLEL WORK (2026-11-04, Claude, branch claude/wonderful-allen-3gaupe, NOT on main): xnu 0173-0175 + jailbreak tools; kernel run 41809620492 GREEN (main + 0173-0175, all applied; 41807365368 was green with the old numbers); NOT BOOTED <<<
 
 **Why a branch:** the user is porting Metal on main (0169-0172, libsweet-fix run file, Turnip). Asked "what can you work on without disrupting my work", then "start with all of them". Nothing here touches the GPU, display, Turnip, Metal or libsweet-fix. Patch numbers 0173-0175 are provisional: if main gets its own 0173+, renumber these after it (validate-repo wants 0001-N contiguous).
