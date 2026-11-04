@@ -1,0 +1,11 @@
+# iOS's own drawing through Metal on Turnip (userland/metal2; kernel xnu 0170 + 0171 with boot-arg sweetmtl=2, which
+# names this plug-in to Metal.framework): SweetMetal2.bundle into /System/Library/Extensions. Metal gives a device to
+# backboardd (CoreAnimation, the window server) and to the programs listed in /var/local/mtl2-clients ("*" = all; the
+# file is not written here, so backboardd alone). The bundle's own copy of Turnip is left out (the boot image's files
+# are limited to 48 MiB): the plug-in then loads /usr/local/lib/libvulkan_freedreno.dylib, which tools/root-files/
+# vktest.txt put on the root. Boot without the GL bridge (no libsweet-ca injection). The files stay on the root:
+# without sweetmtl=2 nothing loads them. Downloads: sweet-metal2 (metal2.yml).
+/System/Library/Extensions/SweetMetal2.bundle/HotMetal2=sweet-metal2/SweetMetal2.bundle/HotMetal2 0:0:0755
+/System/Library/Extensions/SweetMetal2.bundle/Info.plist=sweet-metal2/SweetMetal2.bundle/Info.plist 0:0:0644
+/System/Library/Extensions/SweetMetal2.bundle/_CodeSignature/CodeResources=sweet-metal2/SweetMetal2.bundle/_CodeSignature/CodeResources 0:0:0644
+/private/var/local/mtl2.log=tools/root-files/mtl2-log-start 0:0:0666

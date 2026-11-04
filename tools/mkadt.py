@@ -95,7 +95,9 @@ FILE_PREFIXES = ('/usr/local/', '/Library/Wallpaper/', '/private/var/', '/System
                  # app extensions that cannot work without Metal (tools/root-files/aegir-off.txt)
                  '/System/Library/ExtensionKit/',
                  # Sileo moved among the system apps (tools/root-files/sileo-system.txt)
-                 '/Applications/')
+                 '/Applications/',
+                 # the Metal plug-in Metal.framework loads (tools/root-files/metal2-on.txt; xnu 0170 sweetmtl=2)
+                 '/System/Library/Extensions/')
 D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
 
 

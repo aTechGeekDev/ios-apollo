@@ -1,0 +1,41 @@
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -273,6 +273,9 @@
+  */
+ #define GPU_V2_WINDOWS          64              /* window i: (i + 1) * 4 GiB, 4 GiB long, one per client */
+ static uint64_t gV2Windows;
++/* (xnu 0171) the last submission of any Turnip client: the display waits for it before it shows a surface (Turnip
++ * draws into IOSurfaces it imported by their pages, not by id, so its writes are not in gSurfaceWrites) */
++static uint32_t gV2LastFence;
+ 
+ extern "C" {
+ int sweet_gpu_v2_window(uint64_t *base, uint64_t *size);
+@@ -361,6 +364,9 @@
+ 		gGPUStopped = fence == 0;
+ 		*busy = !gGPUStopped;
+ 	}
++	if (fence != 0) {
++		gV2LastFence = fence;   /* (0171) */
++	}
+ 	IOLockUnlock(gGPULock);
+ 	return fence;
+ }
+@@ -798,6 +804,18 @@
+ 		return true;
+ 	}
+ 	IOLockLock(gGPULock);
++	/*
++	 * (xnu 0171) With Metal on Turnip (sweetmtl=2) the window server's frames are drawn by Turnip into the display's
++	 * surfaces: a surface is shown only once every Turnip submission so far has passed, and what this processor's cache
++	 * holds of it goes then (the GPU wrote memory behind it). Coarse: all of Turnip's work, every frame.
++	 */
++	if (gV2LastFence != 0) {
++		if (!gGPUStopped && !sweet_gpu_done(gV2LastFence)) {
++			IOLockUnlock(gGPULock);
++			return false;
++		}
++		drawn = true;
++	}
+ 	for (uint32_t k = 0; k < GPU_SURFACE_WRITES; k++) {
+ 		if (gSurfaceWrites[k].id == id) {
+ 			fence = gSurfaceWrites[k].fence;

@@ -45,6 +45,9 @@ extern "C" void sm2_logs(const char *s)
 		write(console, buf, (size_t)n);
 	if (file >= 0)
 		write(file, buf, (size_t)n);
+	/* sweet (ios-apollo): and stderr, which the kernel copies into its log for the programs in boot-arg sweetnull
+	 * (backboardd is there): the console reaches that log only early in the boot */
+	write(2, buf, (size_t)n);
 }
 
 static void sm2_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -198,6 +201,10 @@ static bool listed(void)
 		}
 		NSString *bundle = [[NSBundle bundleForClass:[HotMTL2Device class]] bundlePath];
 		NSString *turnip = [bundle stringByAppendingPathComponent:@"libvulkan_freedreno.dylib"];
+		/* sweet (ios-apollo): the bundle may come without its own Turnip (the boot image's 48 MiB of files):
+		 * then the one the Vulkan test put on the root (tools/root-files/vktest.txt) */
+		if (access(turnip.UTF8String, R_OK) != 0)
+			turnip = @"/usr/local/lib/libvulkan_freedreno.dylib";
 		char cache[256];
 		mkdir("/var/local/m2v-cache", 0777);
 		chmod("/var/local/m2v-cache", 0777);
