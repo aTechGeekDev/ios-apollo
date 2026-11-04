@@ -1,0 +1,115 @@
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -698,6 +698,49 @@
+    return VK_SUCCESS;
+ }
+ 
++/*
++ * sweet (ios-apollo): until the sync is a submission or signaled -- what VK_SYNC_WAIT_PENDING means. The runtime
++ * (vk_queue.c) uses that wait to tell whether a submission's dependencies have reached the kernel yet: a zero-timeout
++ * one decides whether the queue needs its submit thread, and the thread waits with it before it calls the driver.
++ * UniXNU's sync answered every pending wait at once, so a wait on a sync not yet submitted could reach
++ * darwin_queue_submit, which then waited for it with submit_mutex -- already held by its caller (tu queue_submit):
++ * the submitting thread locked itself for good (boots 121/123: backboardd's Metal device lost now and then; 115: the
++ * display thread stuck in a system call). Never with submit_mutex held.
++ */
++static VkResult
++darwin_sync_until_submitted(struct tu_device *device, struct vk_darwin_sync *s, uint64_t abs_timeout_ns)
++{
++   if (s->state != DARWIN_SYNC_UNSIGNALED)
++      return VK_SUCCESS;
++   if (abs_timeout_ns == 0)
++      return VK_TIMEOUT;
++
++   pthread_mutex_lock(&device->submit_mutex);
++   /* os_time_get_nano() is monotonic but Darwin condition variables wait on the realtime clock. */
++   struct timespec abstime;
++   {
++      uint64_t now = os_time_get_nano();
++      uint64_t relative = abs_timeout_ns > now ? abs_timeout_ns - now : 0;
++      clock_gettime(CLOCK_REALTIME, &abstime);
++      uint64_t nsec = (uint64_t)abstime.tv_nsec + relative % 1000000000ull;
++      abstime.tv_sec += relative / 1000000000ull + nsec / 1000000000ull;
++      abstime.tv_nsec = nsec % 1000000000ull;
++   }
++   while (s->state == DARWIN_SYNC_UNSIGNALED) {
++      int ret;
++      if (abs_timeout_ns == UINT64_MAX)
++         ret = pthread_cond_wait(&device->timeline_cond, &device->submit_mutex);
++      else
++         ret = pthread_cond_timedwait(&device->timeline_cond, &device->submit_mutex, &abstime);
++      if (ret != 0) {
++         pthread_mutex_unlock(&device->submit_mutex);
++         return VK_TIMEOUT;
++      }
++   }
++   pthread_mutex_unlock(&device->submit_mutex);
++   return VK_SUCCESS;
++}
++
+ static VkResult
+ darwin_sync_wait(struct tu_device *device, struct vk_darwin_sync *s, uint64_t abs_timeout_ns)
+ {
+@@ -750,7 +793,7 @@
+    struct vk_darwin_sync *s = container_of(sync, struct vk_darwin_sync, vk);
+ 
+    if (wait_flags & VK_SYNC_WAIT_PENDING)
+-      return VK_SUCCESS;
++      return darwin_sync_until_submitted(device, s, abs_timeout_ns);   /* sweet: was VK_SUCCESS at once */
+ 
+    return darwin_sync_wait(device, s, abs_timeout_ns);
+ }
+@@ -762,8 +805,30 @@
+ {
+    struct tu_device *device = container_of(_device, struct tu_device, vk);
+ 
+-   if (wait_flags & VK_SYNC_WAIT_PENDING)
+-      return VK_SUCCESS;
++   if (wait_flags & VK_SYNC_WAIT_PENDING) {
++      /* sweet: was VK_SUCCESS at once; any: the first submitted one, else every one */
++      for (;;) {
++         bool all = true, any = false;
++         for (uint32_t i = 0; i < wait_count; i++) {
++            bool submitted = container_of(waits[i].sync, struct vk_darwin_sync, vk)->state != DARWIN_SYNC_UNSIGNALED;
++            all = all && submitted;
++            any = any || submitted;
++         }
++         if (all || (any && (wait_flags & VK_SYNC_WAIT_ANY)))
++            return VK_SUCCESS;
++         if (abs_timeout_ns == 0)
++            return VK_TIMEOUT;
++         for (uint32_t i = 0; i < wait_count; i++) {
++            struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
++            if (s->state == DARWIN_SYNC_UNSIGNALED) {
++               VkResult result = darwin_sync_until_submitted(device, s, abs_timeout_ns);
++               if (result != VK_SUCCESS)
++                  return result;
++               break;
++            }
++         }
++      }
++   }
+ 
+    if (wait_flags & VK_SYNC_WAIT_ANY) {
+       /* Poll every sync in turn until one is done or the deadline passes. */
+@@ -873,7 +938,18 @@
+    static const bool cpu_waits = debug_get_bool_option("TU_DARWIN_CPU_WAITS", false);
+    for (uint32_t i = 0; i < wait_count; i++) {
+       struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
+-      if (!cpu_waits && s->state != DARWIN_SYNC_UNSIGNALED)
++      if (s->state == DARWIN_SYNC_UNSIGNALED) {
++         /* sweet (0102): not submitted yet. darwin_sync_wait would wait for it under submit_mutex, which the caller
++          * holds: a thread locked for good. The runtime's pending wait (above) should keep this from happening; if it
++          * does, the ring's order is the best there is. Said once. */
++         static bool said;
++         if (!said) {
++            said = true;
++            mesa_logw("darwin: a submission waits on a sync not submitted yet: not waited for (submit_mutex held)");
++         }
++         continue;
++      }
++      if (!cpu_waits)
+          continue;
+       VkResult result = darwin_sync_wait(dev, s, UINT64_MAX);
+       if (result != VK_SUCCESS)
