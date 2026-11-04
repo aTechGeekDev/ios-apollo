@@ -200,6 +200,23 @@ User preference: give paste-ready commands at once, do not wait on CI (`gh run w
 **Observed:** `SWEET MTL: IOAcceleratorES published (MetalPluginName SweetMetal2)`; backboardd loaded the plug-in (`MTL2[58 backboardd]`), then `native-metal: device refused: device: ShaderCache(ShaderCacheError { path: "/var/local/m2v-cache/backboardd", kind: PermissionDenied })` in 11 ms; `libvulkan_freedreno 0x0` (Turnip never loaded); `SpringBoard: not listed (/var/local/mtl2-clients): no Metal device` (as intended). With no device CoreAnimation drew on the CPU (no GL bridge either): SWEET FB 12.9/16.2/3.9 frames a second, 0 waited for the GPU, the CPU copy path. The plug-in's stderr lines reach the log (the 0171-era HotMetal2 change works).
 **Cause:** /private/var/local was created by the kernel (root, 0755) to write mtl2.log; backboardd runs as mobile, so mkdir /var/local/m2v-cache failed, and backboardd has no _CS_DARWIN_USER_CACHE_DIR. **Fix:** HotMetal2.mm falls back to /private/var/tmp/m2v-cache/<process> (1777 parent). Boot 114 = boot 113's command with the new metal2 run.
 
+### >>> BOOT 121 (2026-11-04, kernel 41829738717 = Metal 0172-0180 + 0181-0183, metal2 41827349433 + metal2-on.txt, options apollo_rtc/power/torch=1 sweetbattery=1 apollo_ui=1): BLACK SCREEN -- caused by apollo_rtc's skipped 30 s wait -> 0181/0182 fixed <<<
+
+**Observed (log apollo-boot121.txt, user's greps):**
+- **Order of events:** `SWEET GPU: probe in 15 s` (line 141), `exec SpringBoard` (647), `exec backboardd` (729), and only then `SWEET GPU: Adreno 650 bring-up` (4403).
+- **backboardd:** `MTL2T: W GPU faulted or hung (VK_ERROR_DEVICE_LOST)`. After that every command buffer is `refused: DeviceLost`; `commit-to-complete max=5303ms`.
+- **The rest:** iOS ran (SpringBoard, widgets, 28 frames/s reaching the panel), but black.
+- **PMIC:**
+  - `apollo pmic: power off and restart through PSCI`.
+  - `the PM8150's clock is channel 2, owned by system 1 (read only)`: apollo_rtc=2 could not keep time across reboots.
+  - `the clock runs, 1141934 s (control 0x80)`: about 13 days since the RTC was last reset, not real time.
+- **Battery:** `SWEET BATTERY: SID 2: gauge type 0 present 0 ... NOT read`, then `static fallback`.
+**Cause (inferred from the order):** before 0181 the kernel waited 30 s in IOKitInitializeTime (no IORTC) before launchd, so the GPU's 15 s probe always came first. apollo_rtc=1 removed that wait, so backboardd's Metal opened Turnip before the GPU was brought up. Not 0179 or the LTO plug-in (both untested otherwise: boot 120 not booted on its own).
+**Fix:**
+- **0181:** apollo_rtc=1 now only reads the clock. The wait is skipped only with the new option `apollo_rtc_nowait=1`, which should stay off until the GPU's users wait for the GPU.
+- **0182:** sweet_spmi.c says once per SID/peripheral why a read fails (no channel maps it / timed-out channel / arbiter status). SweetBattery logs type/subtype of SID 2's blocks 0x10-0x13 and 0x48 at start.
+**Next for the clock:** the RTC is not ours to write and counts from an arbitrary start (Android kept an offset in /data, gone). Keeping time across boots needs our own stored offset (a file written when iOS sets the time). Not done yet.
+
 ### >>> STATUS BAR LIKE THE 14 PRO (2026-11-04, merged into main; user: clock under the punch hole, wants the 14 Pro placement): libsweet-ui (ui run 41815263582 GREEN) + xnu 0183 apollo_ui (kernel run 41816315859 GREEN; 41815379193 died on bearssl.org 502); NOT BOOTED <<<
 
 **Found (ios-re 41811694262, 41813238843 + one short run; UIKitCore 20H392):**

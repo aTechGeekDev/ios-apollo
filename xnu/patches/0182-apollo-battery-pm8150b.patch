@@ -1,6 +1,24 @@
 --- a/bsd/dev/sweet_spmi.c
 +++ b/bsd/dev/sweet_spmi.c
-@@ -88,7 +88,8 @@
+@@ -25,6 +25,17 @@
+ static bool sp_attempted, sp_ready;
+ /* A timed-out command may complete late: never reuse that lane this boot. */
+ static bool sp_poisoned[512];
++/* apollo (xnu 0182): why a read failed, said once per SID/peripheral (boot 121 read only zeros from SID 2) */
++static uint8_t sp_said[4096 / 8];
++
++static void
++sp_say_once(unsigned ppid, const char *what, uint32_t value)
++{
++	if (!(sp_said[ppid >> 3] & (1u << (ppid & 7)))) {
++		sp_said[ppid >> 3] |= (uint8_t)(1u << (ppid & 7));
++		printf("SWEET BATTERY: SID %u peripheral 0x%02x: %s %#x\n", ppid >> 8, ppid & 0xffu, what, value);
++	}
++}
+ 
+ static uint32_t
+ sp_rd(vm_offset_t base, unsigned off)
+@@ -88,7 +99,8 @@
  {
  	/* Restrict access to the battery blocks; keys retain their own lanes. */
  	unsigned peripheral = addr >> 8;
@@ -10,6 +28,23 @@
  	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
  	    peripheral != 0x13 && peripheral != 0x48)) {
  		return -1;
+@@ -96,6 +108,8 @@
+ 	IOLockLock(sp_lock);
+ 	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
+ 	if (apid == SP_NO_APID || sp_poisoned[apid]) {
++		sp_say_once((sid << 8) | peripheral, apid == SP_NO_APID ? "no SPMI channel maps it, ppid" : "its channel timed out, APID",
++		    apid == SP_NO_APID ? ((sid << 8) | peripheral) : apid);
+ 		IOLockUnlock(sp_lock);
+ 		return -1;
+ 	}
+@@ -108,6 +122,7 @@
+ 		uint32_t status = sp_rd(sp_obs, off + 0x08u);
+ 		if (status & 1u) {
+ 			if (status & 0x0eu) {
++				sp_say_once((sid << 8) | peripheral, "the arbiter answered status", status);
+ 				IOLockUnlock(sp_lock);
+ 				return -1;
+ 			}
 --- a/iokit/Kernel/arm/SweetBattery.cpp
 +++ b/iokit/Kernel/arm/SweetBattery.cpp
 @@ -3,6 +3,13 @@
@@ -165,7 +200,7 @@
  	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
  	    rawCurrent != 0x8000;
  	if (currentValid) {
-@@ -262,8 +285,8 @@
+@@ -262,9 +285,20 @@
  	if (!IOPMPowerSource::start(provider)) {
  		return false;
  	}
@@ -174,5 +209,17 @@
 +	int real = apollo_option("sweetbattery", 0);
 +	sweet_battery_sid = (unsigned)apollo_option("sweetbattery_sid", 2);
  	fReal = real == 1 && sweet_spmi_init() == 0;
++	if (fReal) {
++		/* apollo (xnu 0182): what answers at the charger's and the gauge's blocks (boot 121: all zeros, "NOT read") */
++		static const unsigned blocks[] = {0x10, 0x11, 0x12, 0x13, 0x48};
++		for (unsigned i = 0; i < sizeof(blocks) / sizeof(blocks[0]); ++i) {
++			uint8_t type = 0, subtype = 0;
++			bool ok = !sweet_spmi_read(sweet_battery_sid, blocks[i] << 8 | 0x04, &type) &&
++			    !sweet_spmi_read(sweet_battery_sid, blocks[i] << 8 | 0x05, &subtype);
++			IOLog("SWEET BATTERY: SID %u block 0x%02x00: %s type %#x subtype %#x\n", sweet_battery_sid, blocks[i],
++			    ok ? "read," : "NOT read,", type, subtype);
++		}
++	}
  	/* Publish a complete source BEFORE registerService wakes powerd. */
  	poll();
+ 	if (fReal) {

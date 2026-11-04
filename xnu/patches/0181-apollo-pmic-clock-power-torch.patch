@@ -5,7 +5,7 @@
  #include <sys/time.h>
  
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
-+/* bsd/dev/apollo_pmic.c (xnu 0181): true if the PM8150's clock gives the calendar (apollo_rtc=1 or 2) */
++/* bsd/dev/apollo_pmic.c (xnu 0181): true only with the PM8150's clock in use AND apollo_rtc_nowait=1 */
 +extern "C" bool apollo_pmic_early_init(void);
 +#endif
 +
@@ -19,7 +19,7 @@
  	t.tv_nsec = 0;
  
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
-+	/* apollo: nothing in this tree publishes an IORTC; with the PMIC's clock in use, skip the 30 s wait for one */
++	/* apollo: nothing in this tree publishes an IORTC; apollo_rtc_nowait=1 skips the 30 s wait (the GPU starts after it) */
 +	have_rtc = apollo_pmic_early_init();
 +#endif
  // RTC is not present on this target
@@ -82,16 +82,19 @@
  bsd/dev/sweet_keys.c			standard
 --- /dev/null
 +++ b/bsd/dev/apollo_pmic.c
-@@ -0,0 +1,523 @@
+@@ -0,0 +1,530 @@
 +/*
 + * apollo (xnu 0181): the clock, power off / restart and the flashlight, through the Mi 10T's PMICs.
 + *
 + * Every part is off unless its option is set. An option is a boot-arg or, because the boot line is full (607 characters at
 + * most), a 32-bit property of the ADT's /sweet-options node (tools/mkadt.py --option NAME=N); the boot-arg wins.
 + *
-+ *   apollo_rtc=1    the calendar starts from the PM8150's real-time clock (SID 0, 0x6000), and bsd_init stops waiting 30 s
-+ *                   for an "IORTC" that nothing in this tree publishes (IOKitInitializeTime). Time set by iOS (timed,
++ *   apollo_rtc=1    the calendar starts from the PM8150's real-time clock (SID 0, 0x6000). Time set by iOS (timed,
 + *                   Settings) is kept as an offset to the clock, in memory only: lost at the next boot.
++ *   apollo_rtc_nowait=1  with the clock in use, bsd_init no longer waits 30 s for an "IORTC" that nothing in this tree
++ *                   publishes (IOKitInitializeTime). NOT with the GPU as it starts today: boot 121 (2026-11-04) had
++ *                   backboardd's Metal open Turnip before the GPU's bring-up ("SWEET GPU: probe in 15 s" counts from
++ *                   before that wait), VK_ERROR_DEVICE_LOST and a black screen. Only once the GPU's users wait for it.
 + *   apollo_rtc=2    the same, and time set by iOS is written into the PMIC clock (Linux's rtc-pm8xxx, pm8941 registers),
 + *                   so it survives a reboot -- only if the arbiter gives this system the clock's channel (logged).
 + *   apollo_power=1  power off and restart from iOS go to the firmware: PSCI SYSTEM_OFF / SYSTEM_RESET (as mainline Linux
@@ -574,7 +577,7 @@
 +
 +/* ---- start (IOKitInitializeTime, before the calendar is read) ----------------------------------------- */
 +
-+/* true: the clock is used, so IOKitInitializeTime need not wait for an IORTC */
++/* true: the clock is used and apollo_rtc_nowait=1, so IOKitInitializeTime does not wait for an IORTC */
 +bool
 +apollo_pmic_early_init(void)
 +{
@@ -603,6 +606,10 @@
 +			printf("apollo pmic: the clock is not readable or not running: not used\n");
 +		}
 +	}
-+	return rtc_used;
++	if (rtc_used && apollo_option("apollo_rtc_nowait", 0) >= 1) {
++		printf("apollo pmic: apollo_rtc_nowait=1: not waiting 30 s for an IORTC\n");
++		return true;
++	}
++	return false;
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
