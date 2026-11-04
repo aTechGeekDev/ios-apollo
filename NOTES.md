@@ -8,14 +8,14 @@ Builds: kernel run 41216279299 (xnu through 0168, Xcode 16.0), userland run 4121
 Run on the user's Kali PC from ~/ios-apollo on `main` (research/, shim/out, recovery/recovery.img and sweet-bt/ are local, not in git).
 `--artwork-subtype 2556` stays on every boot (Dynamic Island).
 
-**iOS on Metal boot (next, 113):** kernel xnu run 41804503730 (0171), sweet-metal2 metal2 run 41804503640 (plug-in with stderr log + Turnip fallback); `--files-from tools/root-files/metal2-on.txt`; boot-arg `sweetmtl=2`; no GL bridge; Turnip and libsweet-fix are on the root since boot 112. Read back: `grep -a -E 'SWEET MTL|MTL2\[|native-metal|CRASH backboardd|SWEET GPU: kept|SWEET FB'`.
+**iOS on Metal boot (next, 114: boot 113 + the cache fix):** kernel xnu run 41804503730 (0171), sweet-metal2 metal2 run 41806600419 (plug-in with stderr log + Turnip fallback); `--files-from tools/root-files/metal2-on.txt`; boot-arg `sweetmtl=2`; no GL bridge; Turnip and libsweet-fix are on the root since boot 112. Read back: `grep -a -E 'SWEET MTL|MTL2\[|native-metal|CRASH backboardd|SWEET GPU: kept|SWEET FB'`.
 
 ```sh
 git pull && R=aTechGeekDev/ios-apollo &&
-gh run watch 41804503730 -R $R --exit-status && gh run watch 41804503640 -R $R --exit-status &&
+gh run watch 41804503730 -R $R --exit-status && gh run watch 41806600419 -R $R --exit-status &&
 rm -rf xnu/out sweet-metal2 &&
 gh run download 41804503730 -R $R -n xnu-kernel -D xnu/out &&
-gh run download 41804503640 -R $R -n sweet-metal2 -D sweet-metal2 &&
+gh run download 41806600419 -R $R -n sweet-metal2 -D sweet-metal2 &&
 python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --artwork-subtype 2556 \
     --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
     --gmu-fw research/apollo-gpu/a650_gmu.bin --sqe-fw research/apollo-gpu/a650_sqe.fw \
