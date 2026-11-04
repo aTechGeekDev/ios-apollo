@@ -257,7 +257,7 @@ static bool listed(void)
 		}
 		/* Default Adreno 640 GMEM tiling autotune with concurrent binning off (AdrenoMetal@461a8421); overridable via mtl2-env or mtl2-tu-debug */
 		setenv("TU_DEBUG", "nocb", 0);
-		/* debugging: Turnip options for this process from /var/local/mtl2-tu-debug (TU_DEBUG), its log to /var/local/turnip-<proc>.log */
+		/* debugging: Turnip options for this process from /var/local/mtl2-tu-debug (TU_DEBUG) (its messages on stderr) */
 		{
 			char opts[128] = { 0 };
 			FILE *f = fopen("/var/local/mtl2-tu-debug", "r");
@@ -267,11 +267,11 @@ static bool listed(void)
 				fclose(f);
 			}
 			if (opts[0]) {
-				char path[128];
-				snprintf(path, sizeof(path), "/var/local/turnip-%s.log", getprogname());
+				/* ios-apollo (boot 117): Turnip's own messages stay on stderr (backboardd is in sweetnull: they
+				 * reach the kernel's log); /var/local/turnip-<proc>.log was not writable for backboardd (mobile),
+				 * and boot 117's DeviceLost went unexplained */
 				setenv("TU_DEBUG", opts, 1);
-				setenv("MESA_LOG_FILE", path, 1);
-				sm2_log("TU_DEBUG=%s, log %s", opts, path);
+				sm2_log("TU_DEBUG=%s, Turnip's messages on stderr", opts);
 			}
 		}
 		uint64_t registryID = 0;
