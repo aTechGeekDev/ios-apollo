@@ -1,0 +1,96 @@
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -46,6 +46,8 @@
+ #include <mach/vm_param.h>
+ #include <sys/proc.h>
+ #include <sys/errno.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
+ 
+ #include "SweetSurface.h"
+ 
+@@ -180,6 +182,9 @@
+ 	uint32_t id, fence;                     /* a surface the GPU was told to write by submission `fence` */
+ } gSurfaceWrites[GPU_SURFACE_WRITES];
+ static uint32_t gSurfaceWriteNext;
++/* (xnu 0171) the last submission of any Turnip client: the display waits for it before it shows a surface (Turnip
++ * draws into IOSurfaces it imported by their pages, not by id, so its writes are not in gSurfaceWrites) */
++static uint32_t gV2LastFence;
+ 
+ /* Wait for submission `fence`; with the lock held, which is let go of while waiting. */
+ static bool
+@@ -222,6 +227,52 @@
+ 	return (uint64_t)left / NSEC_PER_MSEC > GPU_PATIENCE_MS ? GPU_PATIENCE_MS : (uint64_t)left / NSEC_PER_MSEC;
+ }
+ 
++/*
++ * (xnu 0174) The GPU's watchdog. A hung core was noticed only by a program waiting a second or more for a fence
++ * (gpuWait): Turnip's clients wait in short steps, and boot 115 froze in Settings with no "no answer" in the log
++ * (backboardd sent no frame again; whether the GPU had hung is not known). Every 500 ms: the last submission there is
++ * becomes the one watched; if the one watched has not passed 5 s later (no frame of iOS's takes that long), what the
++ * core says is logged and it is recovered as 0163 does (every fence before then reads as passed, so waiters go on).
++ * Boot-arg sweetgpudog=0: off; =N: N seconds.
++ */
++#define GPU_DOG_LOOK_MS         500
++
++static void
++gpuWatchdog(__unused void *arg, __unused wait_result_t result)
++{
++	uint32_t watched = 0, seconds = 5, recoveries = 0;
++	uint64_t since = 0, patience;
++
++	PE_parse_boot_argn("sweetgpudog", &seconds, sizeof(seconds));
++	if (seconds == 0) {
++		IOLog("SweetGPU: watchdog off (sweetgpudog=0)\n");
++		return;
++	}
++	nanoseconds_to_absolutetime((uint64_t)seconds * NSEC_PER_SEC, &patience);
++	IOLog("SweetGPU: watchdog on: a submission not done after %u s resets the core (xnu 0174)\n", seconds);
++	for (;;) {
++		IOSleep(GPU_DOG_LOOK_MS);
++		IOLockLock(gGPULock);
++		uint32_t last = sweet_gpu_last();
++		if (gGPUStopped || last == 0) {
++			watched = 0;
++		} else if (watched == 0 || sweet_gpu_done(watched)) {
++			/* the one watched passed (or none was): the newest not yet done is watched now */
++			watched = sweet_gpu_done(last) ? 0 : last;
++			since = mach_absolute_time();
++		} else if (mach_absolute_time() - since >= patience) {
++			IOLog("SweetGPU: watchdog: submission %u not done after %u s (the last is %u; Turnip's last %u): the "
++			    "core is reset (%u so far)\n", watched, seconds, last, gV2LastFence, ++recoveries);
++			sweet_gpu_report("watchdog");
++			gGPUStopped = !sweet_gpu_recover();     /* (0163) */
++			IOLog("SweetGPU: watchdog: %s\n", gGPUStopped ? "the core did not come back: the GPU is stopped" :
++			    "the core is back");
++			watched = 0;
++		}
++		IOLockUnlock(gGPULock);
++	}
++}
++
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
+ class SweetGPU : public IOService
+@@ -267,6 +318,11 @@
+ 	}
+ 	gpu->release();
+ 	sweet_accelerator_start(provider);      /* (0170) the Vulkan / Metal service, with boot-arg sweetmtl */
++	thread_t dog = THREAD_NULL;             /* (xnu 0174) */
++	if (kernel_thread_start(gpuWatchdog, NULL, &dog) == KERN_SUCCESS) {
++		thread_set_thread_name(dog, "sweet gpu watchdog");
++		thread_deallocate(dog);
++	}
+ }
+ 
+ /*
+@@ -275,9 +331,6 @@
+  */
+ #define GPU_V2_WINDOWS          64              /* window i: (i + 1) * 4 GiB, 4 GiB long, one per client */
+ static uint64_t gV2Windows;
+-/* (xnu 0171) the last submission of any Turnip client: the display waits for it before it shows a surface (Turnip
+- * draws into IOSurfaces it imported by their pages, not by id, so its writes are not in gSurfaceWrites) */
+-static uint32_t gV2LastFence;
+ 
+ extern "C" {
+ int sweet_gpu_v2_window(uint64_t *base, uint64_t *size);
