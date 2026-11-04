@@ -2,19 +2,19 @@
 
 ## Agent handoff / active work
 
-### >>> CURRENT BOOT COMMANDS (as of 2026-11-04; boot 112 = vktest ALL PASS; next: boot 113, iOS on Metal) <<<
+### >>> CURRENT BOOT COMMANDS (as of 2026-11-04; boot 114 = iOS on Metal works, slow; next: boot 115, xnu 0172 GPU copy) <<<
 
 Builds: kernel run 41216279299 (xnu through 0168, Xcode 16.0), userland run 41218791846, metal run 41655855519 (artifact sweet-metal).
 Run on the user's Kali PC from ~/ios-apollo on `main` (research/, shim/out, recovery/recovery.img and sweet-bt/ are local, not in git).
 `--artwork-subtype 2556` stays on every boot (Dynamic Island).
 
-**iOS on Metal boot (next, 114: boot 113 + the cache fix):** kernel xnu run 41804503730 (0171), sweet-metal2 metal2 run 41806600419 (plug-in with stderr log + Turnip fallback); `--files-from tools/root-files/metal2-on.txt`; boot-arg `sweetmtl=2`; no GL bridge; Turnip and libsweet-fix are on the root since boot 112. Read back: `grep -a -E 'SWEET MTL|MTL2\[|native-metal|CRASH backboardd|SWEET GPU: kept|SWEET FB'`.
+**iOS on Metal boot (next, 115: xnu 0172, the display's GPU copy):** kernel xnu run 41809392184 (0172 on main 6d83269; built on push, may still be running: `gh run watch` waits), sweet-metal2 metal2 run 41806600419 (same as boot 114); `--files-from tools/root-files/metal2-on.txt`; boot-arg `sweetmtl=2`; no GL bridge. `sweetblit=0` (not on the line) would turn 0172's GPU copy off. Read back: `grep -a -E 'SWEET MTL|MTL2\[|native-metal|CRASH backboardd|SWEET GPU: kept|SWEET FB|SweetGPU: the display'`.
 
 ```sh
-git pull && R=aTechGeekDev/ios-apollo &&
-gh run watch 41804503730 -R $R --exit-status && gh run watch 41806600419 -R $R --exit-status &&
+cd ~/ios-apollo && git pull && R=aTechGeekDev/ios-apollo &&
+gh run watch 41809392184 -R $R --exit-status &&
 rm -rf xnu/out sweet-metal2 &&
-gh run download 41804503730 -R $R -n xnu-kernel -D xnu/out &&
+gh run download 41809392184 -R $R -n xnu-kernel -D xnu/out &&
 gh run download 41806600419 -R $R -n sweet-metal2 -D sweet-metal2 &&
 python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --artwork-subtype 2556 \
     --touch-fw research/apollo-fw/novatek_nt36675_j3s_fw01.bin \
@@ -106,6 +106,17 @@ grep -a -E 'probe:|sweet-fix: configd: metal|SWEET GPU: kept|SweetGPU:' logs/apo
 ```
 
 User preference: give paste-ready commands at once, do not wait on CI (`gh run watch RUN -R $R --exit-status &&` in front when a build is pending); `[skip ci]` on notes-only commits.
+
+### >>> xnu 0172 (2026-11-04, commit 6d83269, xnu run 41809392184 started; user after boot 114: "the acceleration works but its slow some things glitches"): the display's GPU copy of Metal frames; NOT YET BOOTED (boot 115) <<<
+
+**What it does (written, not yet run on the phone):** a swap whose only layer is backboardd's whole display (1125x2502, 4 bytes a pixel, rows a multiple of 64) is scaled by the GPU's 2D engine into a free page-flip frame (lines 0..2400 of the panel, bilinear), queued in the ring *behind* the Turnip work that drew it, and the frame is flipped to once that copy's fence passes (the present thread polls every 0.2 ms, up to 100 ms; after that the frame stays the copy's until its fence passes). The stream is Turnip's r2d path for vkCmdBlitImage (tu_clear_blit.cc, Mesa 25), checked against a6xx.xml: CCU flush/invalidate, WFI, RB_CCU_CNTL 0x18000000 (A650 sysmem), CP_SET_MARKER RM6_BLIT2DSCALE, RB/GRAS_2D_BLIT_CNTL 0x10f03000, SP_2D_DST_FORMAT 0xf180, SP_PS_2D_SRC_INFO 0x00500430|filter, CP_BLIT SCALE, CCU colour flush. Surfaces are entered into the GPU's address space once and held (8 entries: the 3 panel frames kept, sources LRU / given back after 2 s idle; each new source has its cache lines cleaned once). Stream in a WC page, 4 slots. Every other frame: the processor's copy, waiting for the Turnip fence that was the last at **swap** time (0171 waited for the last one at present time, which kept moving: the cause of boot 114's dropped frames). sweet_gpu_surface_ready() no longer waits on Turnip (it still drops the CPU cache lines). Boot-arg `sweetblit=0`: no GPU copy.
+**Expect in the log:** `SweetGPU: the display's GPU copy: commands at GPU address ...`, `SweetGPU: the display's GPU copy holds surface N (1125x2502, rows of R ...)`, `SWEET FB: the GPU copies backboardd's frames (0172): surface ...` (once), then every 10 s `SWEET FB: N frames copied by the GPU (0172), X ms from the swap's turn to the panel on average`. If refused: up to 4 lines `SWEET FB: (0172) surface ... the processor copies: <reason>` (e.g. rows not a multiple of 64 bytes, more than one layer). Wrong colours or garbage would point at the stream's format/swap values; a GPU hang at the copy, at the stream (0163 recovers; boot with `sweetblit=0` to compare).
+**Guesses, not checked:** that metal2vulkan's scheduled handler (which CoreAnimation waits on before it swaps) runs after Turnip's vkQueueSubmit reached the kernel, so ring order = frame order. If not, the GPU copy shows the previous frame's content (lag/flicker), as 0171 would have too. The "glitches" of boot 114 are not described yet (asked the user).
+**Parallel work:** branch `claude/wonderful-allen-3gaupe` (another agent) has its own xnu 0172-0174 (PMIC clock/power/torch, battery, tweak loader; files apollo_pmic.c, sweet_spmi.c, SweetBattery.cpp, IOStartIOKit.cpp, IOPlatformExpert.cpp, kern_exec.c, bsd/conf/files). No file overlaps this 0172: merged into main they become 0173-0175.
+
+### >>> BOOT 114 (2026-11-04, kernel 41804503730 = 0171, metal2 41806600419, sweetmtl=2): iOS DRAWS ON THE GPU THROUGH METAL + TURNIP -- slow, "some things glitch" (user) -> xnu 0172 <<<
+
+**Observed (user's log):** backboardd's Metal device came up: `device Turnip Adreno (TM) 650` in 725 ms, `SWEET MTL: backboardd opens the GPU (window 0x100000000)`; CoreAnimation rendered on Metal (user: "the acceleration works"). SWEET FB every 10 s: iOS gave 25-45 frames a second, 12-40 reached the panel, thousands "waited for the GPU", the CPU copy 4-7 ms. **Cause (reading 0171):** sweet_gpu_surface_ready waited for gV2LastFence, re-read on each 0.5 ms retry, so it kept chasing the next frame's submission; and the 24/25 copy by the processor. User: "its slow some things glitches" (which things and how not described yet).
 
 ### >>> BOOT 113 (2026-11-04, kernel 41804503730 = 0171, sweetmtl=2, metal2-on.txt, no GL bridge): Metal device REFUSED (shader cache permission) -> CPU rendering, "glitchy and slow" (user) -> plug-in cache fallback <<<
 
