@@ -1,0 +1,2 @@
+# Turnip chooses GMEM or memory per render pass again (/var/local/mtl2-tu-debug = "nocb", the plug-in's own default).
+/private/var/local/mtl2-tu-debug=tools/root-files/mtl2-tu-default 0:0:0644

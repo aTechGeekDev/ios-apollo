@@ -1,0 +1,5 @@
+# Turnip draws every render pass straight into memory (TU_DEBUG=sysmem) instead of choosing GMEM tiles or memory per
+# pass (autotune): the SweetMetal2 plug-in reads /var/local/mtl2-tu-debug when backboardd makes its Metal device.
+# CoreAnimation's passes mostly blend layers onto a full-screen target: in GMEM every such pass loads and stores the
+# whole target. Stays on the root: tools/root-files/mtl2-autotune.txt undoes it.
+/private/var/local/mtl2-tu-debug=tools/root-files/mtl2-tu-sysmem 0:0:0644

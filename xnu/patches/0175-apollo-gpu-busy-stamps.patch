@@ -1,0 +1,148 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1049,6 +1049,12 @@
+ #define KEPT_VA_SIZE          0xe0000000ull
+ #define KEPT_VA_GRANULE       0x10000ull
+ #define KEPT_FENCE_AT         0x40u           /* in the scratch page of step 21 */
++/* (xnu 0175) each submission's start and end on the core's always-on counter (19.2 MHz), and its number, in 32-byte
++ * slots of the scratch page: slot = fence % KEPT_STAMPS */
++#define KEPT_STAMPS_AT        0x400u
++#define KEPT_STAMPS           96u
++#define CP_REG_TO_MEM_OP      0x3eu
++#define GPU_ALWAYS_ON_LO      0x0980u         /* CP_ALWAYS_ON_COUNTER (a6xx.xml), as 0170's sweet_gpu_timestamp() */
+ #define KEPT_FREE_RUNS        1024
+ #define CP_INDIRECT_BUFFER    0x3fu           /* CP_INDIRECT_BUFFER_PFE */
+ #define EVENT_CCU_INVALIDATE_DEPTH 0x18u
+@@ -1292,10 +1298,36 @@
+  * register and, by CACHE_FLUSH_TS, in memory. Returns the submission's number;
+  * 0: the ring stays full (the core is not reading it).
+  */
++/* (xnu 0175) CP_REG_TO_MEM of the always-on counter (64 bits) into the fence's slot: start (0) or end (1) */
++static void
++kept_stamp(uint32_t fence, uint32_t which)
++{
++	kept_pkt7(CP_REG_TO_MEM_OP, 3);
++	kept_ring(GPU_ALWAYS_ON_LO | (2u << 18) | (1u << 30));
++	kept_ring(CORE_SCRATCH_VA + KEPT_STAMPS_AT + 32u * (fence % KEPT_STAMPS) + 8u * which);
++	kept_ring(0);
++}
++
++/* (xnu 0175) submission `fence`'s start and end (always-on counter ticks); false: its slot holds another's now */
++bool sweet_gpu_stamps(uint32_t fence, uint64_t *start, uint64_t *end);
++
++bool
++sweet_gpu_stamps(uint32_t fence, uint64_t *start, uint64_t *end)
++{
++	volatile uint32_t *s = (volatile uint32_t *)(kept.scratch + KEPT_STAMPS_AT + 32u * (fence % KEPT_STAMPS));
++
++	gpu_to_memory((vm_offset_t)s, 32);
++	if (s[4] != fence)
++		return false;
++	*start = s[0] | (uint64_t)s[1] << 32;
++	*end = s[2] | (uint64_t)s[3] << 32;
++	return true;
++}
++
+ uint32_t
+ sweet_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count)
+ {
+-	uint32_t wanted = 16u + 4u * count, room = 0;
++	uint32_t wanted = 29u + 4u * count, room = 0;
+ 	for (unsigned i = 0; i < 20000; ++i) {
+ 		room = (gpu_rd(kept.gpu, GPU_CP_RB_RPTR) + CORE_RING_WORDS - kept.at - 1u) % CORE_RING_WORDS;
+ 		if (room >= wanted)
+@@ -1310,12 +1342,20 @@
+ 	kept_ring(EVENT_CCU_INVALIDATE_DEPTH);
+ 	kept_pkt7(CP_EVENT_WRITE, 1);
+ 	kept_ring(EVENT_CCU_INVALIDATE_COLOR);
++	kept_stamp(kept.fence, 0);                      /* (0175) */
+ 	for (uint32_t i = 0; i < count; ++i) {
+ 		kept_pkt7(CP_INDIRECT_BUFFER, 3);
+ 		kept_ring((uint32_t)addresses[i]);
+ 		kept_ring((uint32_t)(addresses[i] >> 32));
+ 		kept_ring(words[i]);
+ 	}
++	/* (0175) the end once the core is idle, then whose slot it is */
++	kept_pkt7(CP_WAIT_FOR_IDLE, 0);
++	kept_stamp(kept.fence, 1);
++	kept_pkt7(CP_MEM_WRITE, 3);
++	kept_ring(CORE_SCRATCH_VA + KEPT_STAMPS_AT + 32u * (kept.fence % KEPT_STAMPS) + 16u);
++	kept_ring(0);
++	kept_ring(kept.fence);
+ 	kept_ring((4u << 28) | 1u | (gpu_parity(1) << 7) | (GPU_CP_SCRATCH_REG2 << 8) | (gpu_parity(GPU_CP_SCRATCH_REG2) << 27));
+ 	kept_ring(kept.fence);
+ 	kept_pkt7(CP_EVENT_WRITE, 4);
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -236,11 +236,55 @@
+  * Boot-arg sweetgpudog=0: off; =N: N seconds.
+  */
+ #define GPU_DOG_LOOK_MS         500
++/*
++ * (xnu 0175) And how busy the core is: each submission's start and end on the always-on counter (sweet_gpu_stamps(),
++ * 19.2 MHz, written by the ring around its command buffers), the done ones read every look; the time the core spent
++ * on them (overlaps counted once) and the longest one, said every 10 s while there is work.
++ */
++#define GPU_STAMP_SLOTS         96u             /* = KEPT_STAMPS of sweet_gpu.c */
++extern "C" bool sweet_gpu_stamps(uint32_t fence, uint64_t *start, uint64_t *end);
++static uint32_t gStampNext;
++static uint64_t gStampEnd, gStampBusy, gStampLongest, gStampSubmissions, gStampLost;
++
++/* with gGPULock held: the done submissions since the last look counted */
++static void
++gpuStampsCount(uint32_t last)
++{
++	if (gStampNext == 0) {
++		gStampNext = last + 1;
++		return;
++	}
++	while (gStampNext != last + 1 && gStampNext != 0 && sweet_gpu_done(gStampNext)) {
++		uint64_t start, end;
++
++		if (last - gStampNext >= GPU_STAMP_SLOTS) {
++			gStampLost += last - gStampNext - GPU_STAMP_SLOTS + 1;
++			gStampNext = last - GPU_STAMP_SLOTS + 1;
++			continue;
++		}
++		if (sweet_gpu_stamps(gStampNext, &start, &end) && end >= start) {
++			uint64_t from = start > gStampEnd ? start : gStampEnd;
++			if (end > from) {
++				gStampBusy += end - from;
++			}
++			if (end > gStampEnd) {
++				gStampEnd = end;
++			}
++			if (end - start > gStampLongest) {
++				gStampLongest = end - start;
++			}
++			gStampSubmissions++;
++		} else {
++			gStampLost++;
++		}
++		gStampNext++;
++	}
++}
+ 
+ static void
+ gpuWatchdog(__unused void *arg, __unused wait_result_t result)
+ {
+-	uint32_t watched = 0, seconds = 5, recoveries = 0;
++	uint32_t watched = 0, seconds = 5, recoveries = 0, looks = 0;
+ 	uint64_t since = 0, patience;
+ 
+ 	PE_parse_boot_argn("sweetgpudog", &seconds, sizeof(seconds));
+@@ -254,6 +298,14 @@
+ 		IOSleep(GPU_DOG_LOOK_MS);
+ 		IOLockLock(gGPULock);
+ 		uint32_t last = sweet_gpu_last();
++		gpuStampsCount(last);                   /* (0175) */
++		if (++looks % (10000 / GPU_DOG_LOOK_MS) == 0 && gStampSubmissions != 0) {
++			/* 19.2 ticks a microsecond: busy % of 10 s = ticks / 1920000; ms = ticks / 19200 */
++			IOLog("SweetGPU: 10 s: the core busy %llu.%llu %% (%llu submissions, the longest %llu.%llu ms; %llu not "
++			    "timed)\n", gStampBusy / 1920000, gStampBusy / 192000 % 10, gStampSubmissions, gStampLongest / 19200,
++			    gStampLongest / 1920 % 10, gStampLost);
++			gStampBusy = gStampLongest = gStampSubmissions = gStampLost = 0;
++		}
+ 		if (gGPUStopped || last == 0) {
+ 			watched = 0;
+ 		} else if (watched == 0 || sweet_gpu_done(watched)) {
