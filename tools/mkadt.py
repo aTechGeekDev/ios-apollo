@@ -132,7 +132,7 @@ def node(name, props=(), children=()):
 
 def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_extra=(), p3=False, files=(),
           deletes=(), lists=(), wifi=(), macs=(), bt=(), moves=(), native_display=False, display_height=None,
-          artwork_subtype=None):
+          artwork_subtype=None, options=()):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
     phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
     # Carve the panic log off the top so the kernel never allocates over it.
@@ -338,6 +338,9 @@ def build(seed=None, qemu=False, highmem=False, touch_fw=None, gmu_fw=None, gpu_
        ([node('sweet-gpu', [ph(), ('gmu-firmware', gmu_fw)] + list(gpu_extra))] if gmu_fw else []) +
        ([node('sweet-wifi', [ph()] + list(wifi))] if wifi else []) +
        ([node('sweet-bt', [ph()] + list(bt))] if bt else []) +
+       # --option NAME=N: /sweet-options, 32-bit values the kernel reads like boot-args when the boot line has no room
+       # (apollo_option() in xnu 0172's bsd/dev/apollo_pmic.c; a boot-arg of the same name wins)
+       ([node('sweet-options', [ph()] + [(name, u32(value)) for name, value in options])] if options else []) +
        ([node('sweet-files', [ph()] + [(f'list{i}', path.encode() + b'\0') for i, path in enumerate(lists)]
                               + [(f'delete{i}', path.encode() + b'\0') for i, path in enumerate(deletes)]
                               + [(f'move{i}', a.encode() + b'\0' + b.encode() + b'\0') for i, (a, b) in enumerate(moves)]
@@ -454,6 +457,15 @@ if __name__ == '__main__':
         if not macs:
             print('Bluetooth: no --wifi-fw, so no /chosen mac-address-bluetooth0: the chip keeps its NVM address',
                   file=sys.stderr)
+    options = []                                # (name, value): --option NAME=N, N decimal or 0x hex, 0 to 2^32-1
+    for i, arg in enumerate(sys.argv):
+        if arg == '--option':
+            name, eq, value = sys.argv[i + 1].partition('=')
+            if not eq or not re.fullmatch(r'[a-z][a-z0-9_]{0,30}', name) or not re.fullmatch(r'(0x[0-9a-fA-F]+|\d+)', value) \
+                    or int(value, 0) >= 1 << 32 or name in ('name', 'AAPL,phandle'):
+                sys.exit(f'--option {sys.argv[i + 1]}: give NAME=N (lower-case name, N a 32-bit number)')
+            options = [(n, v) for n, v in options if n != name] + [(name, int(value, 0))]
+            print(f'option: {name} = {int(value, 0)}', file=sys.stderr)
     files, deletes, lists, moves = [], [], [], []   # (path, data, (uid, gid, mode) or None); paths; paths; (from, to)
     wanted = []                                 # (where it came from, "DEST=LOCAL [UID:GID:MODE]" or "-DEST")
     for i, arg in enumerate(sys.argv):
@@ -510,6 +522,7 @@ if __name__ == '__main__':
                  gpu_extra=gpu_extra, p3='--p3' in sys.argv, native_display='--native-display' in sys.argv,
                  display_height=int(sys.argv[sys.argv.index('--display-height') + 1]) if '--display-height' in sys.argv else None,
                  artwork_subtype=int(sys.argv[sys.argv.index('--artwork-subtype') + 1]) if '--artwork-subtype' in sys.argv else None,
+                 options=options,
                  files=files, deletes=deletes, lists=lists, wifi=wifi, macs=macs, bt=bt,
                  moves=moves)
     blob = adt.serialize(root)

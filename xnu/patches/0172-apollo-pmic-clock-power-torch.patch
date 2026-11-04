@@ -1,0 +1,608 @@
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -69,18 +69,30 @@
+ #include <kern/clock.h>
+ #include <sys/time.h>
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* bsd/dev/apollo_pmic.c (xnu 0172): true if the PM8150's clock gives the calendar (apollo_rtc=1 or 2) */
++extern "C" bool apollo_pmic_early_init(void);
++#endif
++
+ void
+ IOKitInitializeTime( void )
+ {
+ 	mach_timespec_t         t;
++	bool                    have_rtc = false;
+ 
+ 	t.tv_sec = 30;
+ 	t.tv_nsec = 0;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* apollo: nothing in this tree publishes an IORTC; with the PMIC's clock in use, skip the 30 s wait for one */
++	have_rtc = apollo_pmic_early_init();
++#endif
+ // RTC is not present on this target
+ #ifndef BCM2837
+-	IOService::waitForService(
+-		IOService::resourceMatching("IORTC"), &t );
++	if (!have_rtc) {
++		IOService::waitForService(
++			IOService::resourceMatching("IORTC"), &t );
++	}
+ #endif
+ #if defined(__i386__) || defined(__x86_64__)
+ 	IOService::waitForService(
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -1357,12 +1357,24 @@
+ 	PESetUTCTimeOfDay(secs, 0);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* bsd/dev/apollo_pmic.c (xnu 0172): the PM8150's clock (apollo_rtc=1 or 2); -1 when not in use */
++extern "C" int apollo_pmic_time_get(clock_sec_t *secs);
++extern "C" void apollo_pmic_time_set(clock_sec_t secs);
++#endif
++
+ void
+ PEGetUTCTimeOfDay(clock_sec_t * secs, clock_usec_t * usecs)
+ {
+ 	clock_nsec_t    nsecs = 0;
+ 
+ 	*secs = 0;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (apollo_pmic_time_get(secs) == 0) {
++		*usecs = 0;
++		return;
++	}
++#endif
+ 	if (gIOPlatform) {
+ 		gIOPlatform->getUTCTimeOfDay(secs, &nsecs);
+ 	}
+@@ -1375,6 +1387,9 @@
+ PESetUTCTimeOfDay(clock_sec_t secs, clock_usec_t usecs)
+ {
+ 	assert(usecs < USEC_PER_SEC);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	apollo_pmic_time_set(secs);
++#endif
+ 	if (gIOPlatform) {
+ 		gIOPlatform->setUTCTimeOfDay(secs, usecs * NSEC_PER_USEC);
+ 	}
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -104,6 +104,7 @@
+ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
++bsd/dev/apollo_pmic.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+--- /dev/null
++++ b/bsd/dev/apollo_pmic.c
+@@ -0,0 +1,523 @@
++/*
++ * apollo (xnu 0172): the clock, power off / restart and the flashlight, through the Mi 10T's PMICs.
++ *
++ * Every part is off unless its option is set. An option is a boot-arg or, because the boot line is full (607 characters at
++ * most), a 32-bit property of the ADT's /sweet-options node (tools/mkadt.py --option NAME=N); the boot-arg wins.
++ *
++ *   apollo_rtc=1    the calendar starts from the PM8150's real-time clock (SID 0, 0x6000), and bsd_init stops waiting 30 s
++ *                   for an "IORTC" that nothing in this tree publishes (IOKitInitializeTime). Time set by iOS (timed,
++ *                   Settings) is kept as an offset to the clock, in memory only: lost at the next boot.
++ *   apollo_rtc=2    the same, and time set by iOS is written into the PMIC clock (Linux's rtc-pm8xxx, pm8941 registers),
++ *                   so it survives a reboot -- only if the arbiter gives this system the clock's channel (logged).
++ *   apollo_power=1  power off and restart from iOS go to the firmware: PSCI SYSTEM_OFF / SYSTEM_RESET (as mainline Linux
++ *                   does on SM8250); before, the kernel only halted and the phone stayed on until the power key was held.
++ *   apollo_power=2  the same, and a panic restarts the phone (kPEPanicRestartCPU -> SYSTEM_RESET).
++ *   apollo_torch=1  the sysctl apollo.torch (mA per channel, 0 = off, 25 to 150) lights the PM8150L's flash LED module
++ *                   (SID 5, 0xd300, "qcom,pm8150l-flash-led": three channels, Linux's leds-qcom-flash.c MVFLASH_3CH
++ *                   registers) in torch mode; apollo_torch_mask (default 3) = the channels the LED is on.
++ *
++ * The SPMI arbiter (version 5) as sweet_backlight.c drives it: reads through the observer (0xe600000, 0x80 per channel),
++ * writes through the channel's own page of "chnls" (0xc600000, 0x10000 per channel). This file has its own lock; it
++ * only uses the channels of the clock (0x060), the flash LED (0x5d3) and nothing else.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <stdbool.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <libkern/libkern.h>
++#include <mach/mach_types.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++/* IOKit/IOPlatformExpert.h (C++ only from bsd/): the halt/restart hook and its first types, in that enum's order */
++extern int (*PE_halt_restart)(unsigned int type);
++#define kPEHaltCPU              0
++#define kPERestartCPU           1
++#define kPEPanicRestartCPU      4
++
++int apollo_option(const char *name, int fallback);
++bool apollo_pmic_early_init(void);
++int apollo_pmic_time_get(clock_sec_t *secs);
++void apollo_pmic_time_set(clock_sec_t secs);
++
++/* ---- options ----------------------------------------------------------------------------------------- */
++
++int
++apollo_option(const char *name, int fallback)
++{
++	int value;
++	DTEntry entry;
++	void const *prop;
++	unsigned int size;
++
++	if (PE_parse_boot_argn(name, &value, sizeof(value))) {
++		return value;
++	}
++	if (SecureDTLookupEntry(NULL, "/sweet-options", &entry) == kSuccess &&
++	    SecureDTGetProperty(entry, name, &prop, &size) == kSuccess && size == 4) {
++		return (int)*(const uint32_t *)prop;
++	}
++	return fallback;
++}
++
++/* ---- the SPMI arbiter -------------------------------------------------------------------------------- */
++
++#define ARB_CORE_PHYS           0x0c440000UL
++#define ARB_CORE_SIZE           0x1100UL
++#define ARB_CNFG_PHYS           0x0c40a000UL
++#define ARB_CNFG_SIZE           0x1000UL
++#define ARB_CHANNELS_PHYS       0x0c600000UL
++#define ARB_OBSERVER_PHYS       0x0e600000UL
++#define ARB_REGION_SIZE         0x10000UL
++#define ARB_SYSTEM              0
++#define ARB_FEATURES            0x004
++#define ARB_CHANNEL(n)          (0x900 + 4 * (n))
++#define ARB_OWNER(n)            (0x700 + 4 * (n))
++#define CHANNEL_COMMAND         0x00
++#define CHANNEL_STATUS          0x08
++#define CHANNEL_WDATA0          0x10
++#define CHANNEL_RDATA0          0x18
++#define STATUS_DONE             0x1
++#define STATUS_BAD              0xe     /* failure, denied, dropped */
++#define OP_EXT_WRITEL           0u
++#define OP_EXT_READL            1u
++#define TRANSFER_TIMEOUT_US     2000
++
++static LCK_GRP_DECLARE(apollo_pmic_grp, "apollo-pmic");
++static LCK_SPIN_DECLARE(apollo_pmic_bus, &apollo_pmic_grp);
++static LCK_MTX_DECLARE(apollo_pmic_torch_lock, &apollo_pmic_grp);
++
++static vm_offset_t arb_core, arb_cnfg, arb_observer;
++static uint32_t arb_channels;
++static bool arb_tried, arb_ready;
++
++struct periph {
++	const char *name;
++	uint16_t id;            /* slave << 8 | peripheral */
++	bool tried, found, ours;
++	uint16_t channel;
++	vm_offset_t writes;
++};
++static struct periph rtc_periph = { .name = "the PM8150's clock", .id = 0x060 };
++static struct periph flash_periph = { .name = "the PM8150L's flash LED", .id = 0x5d3 };
++
++static inline uint32_t
++rd(vm_offset_t a)
++{
++	return *(volatile uint32_t *)a;
++}
++
++static inline void
++wr(vm_offset_t a, uint32_t v)
++{
++	*(volatile uint32_t *)a = v;
++}
++
++static bool
++arb_init(void)
++{
++	if (arb_tried) {
++		return arb_ready;
++	}
++	arb_tried = true;
++	arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
++	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
++	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_REGION_SIZE);
++	if (!arb_core || !arb_cnfg || !arb_observer) {
++		printf("apollo pmic: the SPMI arbiter could not be mapped\n");
++		return false;
++	}
++	uint32_t version = rd(arb_core);
++	arb_channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
++	if (version < 0x50000000u || version >= 0x70000000u || arb_channels == 0 || arb_channels > 512) {
++		printf("apollo pmic: SPMI arbiter version %#x with %u channels: not the one expected\n", version, arb_channels);
++		return false;
++	}
++	arb_ready = true;
++	return true;
++}
++
++/* the peripheral's channel: the first, unless a later one is this system's (as Linux chooses); writes only on our own */
++static bool
++periph_find(struct periph *p, bool want_writes)
++{
++	if (!p->tried) {
++		p->tried = true;
++		if (!arb_init()) {
++			return false;
++		}
++		for (uint32_t n = 0; n < arb_channels; n++) {
++			uint32_t map = rd(arb_core + ARB_CHANNEL(n));
++			if (map == 0 || ((map >> 8) & 0xfff) != p->id) {
++				continue;
++			}
++			if (!p->found || (rd(arb_cnfg + ARB_OWNER(n)) & 7) == ARB_SYSTEM) {
++				p->found = true;
++				p->channel = (uint16_t)n;
++			}
++		}
++		if (!p->found) {
++			printf("apollo pmic: no SPMI channel is %s (%#x)\n", p->name, p->id);
++			return false;
++		}
++		p->ours = (rd(arb_cnfg + ARB_OWNER(p->channel)) & 7) == ARB_SYSTEM;
++		if (p->ours) {
++			p->writes = ml_io_map(ARB_CHANNELS_PHYS + 0x10000UL * p->channel, 0x1000);
++		}
++		printf("apollo pmic: %s is channel %u, owned by system %u%s\n", p->name, p->channel,
++		    rd(arb_cnfg + ARB_OWNER(p->channel)) & 7, p->ours ? " (ours: writable)" : " (read only)");
++	}
++	return p->found && (!want_writes || p->writes != 0);
++}
++
++/* `count` (1 to 4) registers from `reg` on (the peripheral's own 8-bit offset); 0, or -1 */
++static int
++spmi_read(struct periph *p, uint8_t reg, uint8_t *bytes, uint32_t count)
++{
++	if (!periph_find(p, false)) {
++		return -1;
++	}
++	vm_offset_t ch = arb_observer + 0x10000UL * ARB_SYSTEM + 0x80UL * p->channel;
++	uint64_t start = mach_absolute_time(), limit;
++	uint32_t status, data;
++
++	nanoseconds_to_absolutetime(TRANSFER_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &limit);
++	lck_spin_lock(&apollo_pmic_bus);
++	wr(ch + CHANNEL_COMMAND, OP_EXT_READL << 27 | (uint32_t)reg << 4 | (count - 1));
++	do {
++		status = rd(ch + CHANNEL_STATUS);
++	} while (!(status & STATUS_DONE) && mach_absolute_time() - start < limit);
++	data = rd(ch + CHANNEL_RDATA0);
++	lck_spin_unlock(&apollo_pmic_bus);
++	if (!(status & STATUS_DONE) || (status & STATUS_BAD)) {
++		printf("apollo pmic: reading %s +%#x: status %#x\n", p->name, reg, status);
++		return -1;
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		bytes[i] = (uint8_t)(data >> (8 * i));
++	}
++	return 0;
++}
++
++static int
++spmi_write(struct periph *p, uint8_t reg, const uint8_t *bytes, uint32_t count)
++{
++	if (!periph_find(p, true)) {
++		return -1;
++	}
++	uint32_t status = 0, data = 0;
++
++	for (uint32_t i = 0; i < count; i++) {
++		data |= (uint32_t)bytes[i] << (8 * i);
++	}
++	/* the arbiter drops one now and then (boot 86, sweet_backlight.c): up to three tries */
++	for (unsigned attempt = 0; attempt < 3; attempt++) {
++		uint64_t start = mach_absolute_time(), limit;
++		nanoseconds_to_absolutetime(TRANSFER_TIMEOUT_US * (uint64_t)NSEC_PER_USEC, &limit);
++		lck_spin_lock(&apollo_pmic_bus);
++		wr(p->writes + CHANNEL_WDATA0, data);
++		wr(p->writes + CHANNEL_COMMAND, OP_EXT_WRITEL << 27 | (uint32_t)reg << 4 | (count - 1));
++		do {
++			status = rd(p->writes + CHANNEL_STATUS);
++		} while (!(status & STATUS_DONE) && mach_absolute_time() - start < limit);
++		lck_spin_unlock(&apollo_pmic_bus);
++		if ((status & STATUS_DONE) && !(status & STATUS_BAD)) {
++			return 0;
++		}
++		delay(50);
++	}
++	printf("apollo pmic: writing %s +%#x: status %#x\n", p->name, reg, status);
++	return -1;
++}
++
++static int
++spmi_write1(struct periph *p, uint8_t reg, uint8_t value)
++{
++	return spmi_write(p, reg, &value, 1);
++}
++
++/* ---- the clock (PM8150 RTC: Linux's rtc-pm8xxx.c, pm8941_regs) ---------------------------------------- */
++
++#define RTC_WRITE               0x40    /* 0x6040: 4 bytes, little endian */
++#define RTC_CTRL                0x46    /* bit 7: the clock runs */
++#define RTC_READ                0x48    /* 0x6048: 4 bytes */
++#define RTC_ENABLE              0x80
++
++static int rtc_mode;                    /* apollo_rtc */
++static bool rtc_used;
++static int64_t rtc_offset;              /* what iOS set minus the clock (apollo_rtc=1, or when the clock is not ours) */
++
++static int
++rtc_read_raw(uint32_t *secs)
++{
++	uint8_t v[4], lsb;
++
++	if (spmi_read(&rtc_periph, RTC_READ, v, 4) || spmi_read(&rtc_periph, RTC_READ, &lsb, 1)) {
++		return -1;
++	}
++	if (lsb < v[0] && spmi_read(&rtc_periph, RTC_READ, v, 4)) {     /* carried over between the two: again */
++		return -1;
++	}
++	*secs = (uint32_t)v[0] | (uint32_t)v[1] << 8 | (uint32_t)v[2] << 16 | (uint32_t)v[3] << 24;
++	return 0;
++}
++
++/* Linux's __pm8xxx_rtc_set_time without the alarm (nothing here sets one): stop, LSB 0, bytes 1-3, byte 0, run */
++static int
++rtc_write_raw(uint32_t secs)
++{
++	uint8_t ctrl, v[4] = { (uint8_t)secs, (uint8_t)(secs >> 8), (uint8_t)(secs >> 16), (uint8_t)(secs >> 24) };
++
++	if (spmi_read(&rtc_periph, RTC_CTRL, &ctrl, 1)) {
++		return -1;
++	}
++	if (spmi_write1(&rtc_periph, RTC_CTRL, ctrl & ~RTC_ENABLE)) {
++		return -1;
++	}
++	int error = spmi_write1(&rtc_periph, RTC_WRITE, 0) || spmi_write(&rtc_periph, RTC_WRITE + 1, &v[1], 3) ||
++	    spmi_write1(&rtc_periph, RTC_WRITE, v[0]);
++	/* run again whatever happened: a stopped clock would lose time from here on */
++	if (spmi_write1(&rtc_periph, RTC_CTRL, ctrl | RTC_ENABLE)) {
++		error = 1;
++	}
++	return error ? -1 : 0;
++}
++
++int
++apollo_pmic_time_get(clock_sec_t *secs)
++{
++	uint32_t raw;
++
++	if (!rtc_used || rtc_read_raw(&raw)) {
++		return -1;
++	}
++	*secs = (clock_sec_t)((int64_t)raw + rtc_offset);
++	return 0;
++}
++
++void
++apollo_pmic_time_set(clock_sec_t secs)
++{
++	uint32_t raw;
++
++	if (!rtc_used || rtc_read_raw(&raw)) {
++		return;
++	}
++	int64_t was = (int64_t)raw + rtc_offset, now = (int64_t)secs;
++	if (now - was < 2 && was - now < 2) {
++		return;         /* a small correction: the clock is good enough, spare it the writes */
++	}
++	if (rtc_mode >= 2 && now >= 0 && now <= 0xffffffffLL && periph_find(&rtc_periph, true) && rtc_write_raw((uint32_t)now) == 0) {
++		rtc_offset = 0;
++		printf("apollo pmic: clock set to %lld (was %lld); kept by the PMIC\n", now, was);
++		return;
++	}
++	rtc_offset = now - (int64_t)raw;
++	printf("apollo pmic: clock set to %lld (was %lld); offset %lld kept in memory only\n", now, was, rtc_offset);
++}
++
++/* ---- power off / restart ------------------------------------------------------------------------------ */
++
++#define PSCI_SYSTEM_OFF         0x84000008ULL
++#define PSCI_SYSTEM_RESET       0x84000009ULL
++
++static int power_mode;                  /* apollo_power */
++
++static int32_t
++psci_call(uint64_t function)
++{
++	register uint64_t x0 __asm__("x0") = function;
++	register uint64_t x1 __asm__("x1") = 0;
++	register uint64_t x2 __asm__("x2") = 0;
++	register uint64_t x3 __asm__("x3") = 0;
++	__asm__ volatile ("smc #0" : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3) : :
++	    "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	return (int32_t)x0;
++}
++
++static int
++apollo_halt_restart(unsigned int type)
++{
++	uint64_t function;
++
++	switch (type) {
++	case kPEHaltCPU:
++		function = PSCI_SYSTEM_OFF;
++		break;
++	case kPERestartCPU:
++		function = PSCI_SYSTEM_RESET;
++		break;
++	case kPEPanicRestartCPU:
++		if (power_mode < 2) {
++			return -1;
++		}
++		function = PSCI_SYSTEM_RESET;
++		break;
++	default:
++		return -1;
++	}
++	printf("apollo pmic: %s through PSCI\n", function == PSCI_SYSTEM_OFF ? "powering off" : "restarting");
++	delay(100 * 1000);      /* the console's last lines out */
++	int32_t rc = psci_call(function);
++	/* only reached if the firmware refused */
++	printf("apollo pmic: PSCI %#llx returned %d\n", function, rc);
++	return -1;
++}
++
++/* ---- the flashlight (PM8150L flash LED module, MVFLASH_3CH) ------------------------------------------- */
++
++#define FLASH_TYPE              0x04    /* 0x18 */
++#define FLASH_SUBTYPE           0x05    /* 0x04: 3 channels, PM8150 */
++#define FLASH_STATUS1           0x08
++#define FLASH_STATUS2           0x09
++#define FLASH_STATUS3           0x0a
++#define FLASH_CHAN_TIMER(c)     ((uint8_t)(0x40 + (c)))    /* 0: no safety timer (torch) */
++#define FLASH_ITARGET(c)        ((uint8_t)(0x43 + (c)))    /* [6:0]: (current / resolution) - 1 */
++#define FLASH_MODULE_EN         0x46            /* bit 7 */
++#define FLASH_IRESOLUTION       0x47            /* 2 bits per channel: 3 = 5 mA steps (torch) */
++#define FLASH_CHAN_STROBE(c)    ((uint8_t)(0x49 + (c)))    /* bit 2 HW/SW, bit 1 edge/level, bit 0 active high */
++#define FLASH_CHAN_EN           0x4c            /* [2:0] */
++#define TORCH_STEP_MA           5
++#define TORCH_MAX_MA            150             /* Linux allows 500 per channel; a torch needs far less */
++
++static int torch_mode;                  /* apollo_torch */
++static int torch_ma;                    /* what apollo.torch says now */
++
++static int
++torch_set(int ma)
++{
++	uint8_t type, subtype, s[3];
++	unsigned mask = (unsigned)apollo_option("apollo_torch_mask", 3) & 7;
++
++	if (torch_mode < 1) {
++		return ENODEV;
++	}
++	if (ma != 0 && (ma < TORCH_STEP_MA || ma > TORCH_MAX_MA)) {
++		return EINVAL;
++	}
++	if (spmi_read(&flash_periph, FLASH_TYPE, &type, 1) || spmi_read(&flash_periph, FLASH_SUBTYPE, &subtype, 1)) {
++		return EIO;
++	}
++	if (type != 0x18 || subtype != 0x04) {
++		printf("apollo pmic: the flash LED module is type %#x subtype %#x, not the PM8150L's 0x18/0x04: left alone\n",
++		    type, subtype);
++		return ENODEV;
++	}
++	if (!periph_find(&flash_periph, true)) {
++		return EPERM;
++	}
++	/* off first (strobe off, module off), as Linux's brightness_set */
++	uint8_t en;
++	if (spmi_read(&flash_periph, FLASH_CHAN_EN, &en, 1) || spmi_write1(&flash_periph, FLASH_CHAN_EN, en & ~mask) ||
++	    spmi_write1(&flash_periph, FLASH_MODULE_EN, 0)) {
++		return EIO;
++	}
++	if (ma == 0) {
++		printf("apollo pmic: torch off\n");
++		return 0;
++	}
++	uint8_t ires;
++	if (spmi_read(&flash_periph, FLASH_IRESOLUTION, &ires, 1)) {
++		return EIO;
++	}
++	for (unsigned c = 0; c < 3; c++) {
++		if (!(mask & (1u << c))) {
++			continue;
++		}
++		ires = (uint8_t)((ires & ~(3u << (2 * c))) | (3u << (2 * c)));
++		if (spmi_write1(&flash_periph, FLASH_ITARGET(c), (uint8_t)(ma / TORCH_STEP_MA - 1)) ||
++		    spmi_write1(&flash_periph, FLASH_CHAN_TIMER(c), 0) ||
++		    spmi_write1(&flash_periph, FLASH_CHAN_STROBE(c), 0x01)) {   /* software strobe, level, active high */
++			return EIO;
++		}
++	}
++	if (spmi_write1(&flash_periph, FLASH_IRESOLUTION, ires) || spmi_write1(&flash_periph, FLASH_MODULE_EN, 0x80) ||
++	    spmi_write1(&flash_periph, FLASH_CHAN_EN, (uint8_t)((en & ~mask) | mask))) {
++		(void)spmi_write1(&flash_periph, FLASH_MODULE_EN, 0);
++		return EIO;
++	}
++	delay(20 * 1000);
++	if (spmi_read(&flash_periph, FLASH_STATUS1, s, 3) == 0) {
++		printf("apollo pmic: torch on, %d mA on channels %#x; status %02x %02x %02x\n", ma, mask, s[0], s[1], s[2]);
++		if (s[0] & 0x07) {      /* over-temperature stage 1-3: off again */
++			(void)spmi_write1(&flash_periph, FLASH_CHAN_EN, en & ~mask);
++			(void)spmi_write1(&flash_periph, FLASH_MODULE_EN, 0);
++			printf("apollo pmic: the flash LED module reports over-temperature: torch off\n");
++			return EBUSY;
++		}
++	}
++	return 0;
++}
++
++static int
++sysctl_apollo_torch SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int value = torch_ma, changed = 0;
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++
++	if (error || !changed) {
++		return error;
++	}
++	lck_mtx_lock(&apollo_pmic_torch_lock);
++	error = torch_set(value);
++	if (error == 0) {
++		torch_ma = value;
++	}
++	lck_mtx_unlock(&apollo_pmic_torch_lock);
++	return error;
++}
++
++static int
++sysctl_apollo_rtc SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	uint32_t raw = 0;
++	long long value = rtc_read_raw(&raw) == 0 ? (long long)raw : -1;
++	return SYSCTL_OUT(req, &value, sizeof(value));
++}
++
++SYSCTL_NODE(, OID_AUTO, apollo, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "apollo (Mi 10T) hardware");
++SYSCTL_PROC(_apollo, OID_AUTO, torch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, sysctl_apollo_torch, "I",
++    "flashlight: mA per channel, 0 = off (apollo_torch=1)");
++SYSCTL_PROC(_apollo, OID_AUTO, rtc_raw, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED, NULL, 0, sysctl_apollo_rtc, "Q",
++    "the PM8150 clock's seconds, -1 if unreadable");
++
++/* ---- start (IOKitInitializeTime, before the calendar is read) ----------------------------------------- */
++
++/* true: the clock is used, so IOKitInitializeTime need not wait for an IORTC */
++bool
++apollo_pmic_early_init(void)
++{
++	rtc_mode = apollo_option("apollo_rtc", 0);
++	power_mode = apollo_option("apollo_power", 0);
++	torch_mode = apollo_option("apollo_torch", 0);
++	printf("apollo pmic: apollo_rtc=%d apollo_power=%d apollo_torch=%d\n", rtc_mode, power_mode, torch_mode);
++
++	if (power_mode >= 1) {
++		if (PE_halt_restart == NULL) {
++			PE_halt_restart = apollo_halt_restart;
++			printf("apollo pmic: power off and restart through PSCI%s\n", power_mode >= 2 ? " (panics restart too)" : "");
++		} else {
++			printf("apollo pmic: another halt/restart handler is installed: left alone\n");
++		}
++	}
++	if (rtc_mode >= 1) {
++		uint8_t ctrl;
++		uint32_t raw;
++		if (spmi_read(&rtc_periph, RTC_CTRL, &ctrl, 1) == 0 && (ctrl & RTC_ENABLE) && rtc_read_raw(&raw) == 0) {
++			rtc_used = true;
++			printf("apollo pmic: the clock runs, %u s (control %#x)%s\n", raw, ctrl,
++			    rtc_mode >= 2 ? (periph_find(&rtc_periph, true) ? "; time set by iOS is written to it" :
++			    "; its channel is not ours: time set by iOS is kept in memory only") : "");
++		} else {
++			printf("apollo pmic: the clock is not readable or not running: not used\n");
++		}
++	}
++	return rtc_used;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

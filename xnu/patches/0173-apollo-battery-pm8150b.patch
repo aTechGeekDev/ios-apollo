@@ -1,0 +1,178 @@
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -88,7 +88,8 @@
+ {
+ 	/* Restrict access to the battery blocks; keys retain their own lanes. */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
++	/* apollo (xnu 0173): SID 2 too, the Mi 10T's PM8150B (charger + fuel gauge; sweet's PM6150 is SID 0) */
++	if (!sp_ready || !out || (sid != 0 && sid != 2) || addr > 0xffffu ||
+ 	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+ 	    peripheral != 0x13 && peripheral != 0x48)) {
+ 		return -1;
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -3,6 +3,13 @@
+  * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+  * See report.md for binary evidence, register provenance and integration.
++ *
++ * apollo (xnu 0173): the Mi 10T's charger and fuel gauge are the PM8150B's, SPMI slave 2 (sweet's PM6150 is slave 0),
++ * with the same smb5 charger / QG register blocks (Linux's pm8150b.dtsi; downstream qg-reg.h, smb5-reg.h); its
++ * battery is 5000 mAh. sweetbattery is also read from the ADT (mkadt.py --option sweetbattery=1, apollo_option() in
++ * bsd/dev/apollo_pmic.c: the boot line is full); sweetbattery_sid (default 2) picks the slave. Every 10th poll
++ * (5 min) logs the raw values, so a log shows whether the gauge's last-ADC registers move at all without Android's
++ * QG driver running.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -15,6 +22,11 @@
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* bsd/dev/apollo_pmic.c (xnu 0172): a boot-arg, else the ADT's /sweet-options */
++extern "C" int apollo_option(const char *name, int fallback);
++/* the PMIC slave of the charger and the gauge (apollo: PM8150B = 2) and the battery's design capacity */
++static unsigned sweet_battery_sid = 2;
++static const unsigned kSweetDesignMAh = 5000;
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -28,6 +40,7 @@
+ 	IOTimerEventSource *fTimer;
+ 	bool fTimerAdded, fRunning, fReal;
+ 	int fLastMode;
++	unsigned fPolls;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+@@ -72,6 +85,7 @@
+ 		}
+ 	}
+ 	fLastMode = -1;
++	fPolls = 0;
+ 	return true;
+ }
+ 
+@@ -101,11 +115,11 @@
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+-	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	/* Use consistent mAh units. powerd computes C*100/M. */
++	const unsigned capacity = (kSweetDesignMAh * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setMaxCapacity(kSweetDesignMAh);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -119,8 +133,8 @@
+ 	putBool("FullyCharged", full);
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+-	putNumber("AppleRawMaxCapacity", 5020);
+-	putNumber("DesignCapacity", 5020);
++	putNumber("AppleRawMaxCapacity", kSweetDesignMAh);
++	putNumber("DesignCapacity", kSweetDesignMAh);
+ 	putNumber("InstantAmperage", (UInt32)ma);
+ 	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
+ 	putNumber("Temperature", 2500);
+@@ -137,7 +151,7 @@
+ 		const char *keys[] = {kIOBatteryCurrentChargeKey, kIOBatteryCapacityKey,
+ 		    kIOBatteryVoltageKey, kIOBatteryAmperageKey, kIOBatteryCycleCountKey,
+ 		    kIOBatteryFlagsKey};
+-		UInt32 values[] = {capacity, 5020, mv, (UInt32)ma, 0,
++		UInt32 values[] = {capacity, kSweetDesignMAh, mv, (UInt32)ma, 0,
+ 		    (UInt32)(kIOBatteryInstalled | (external ? kIOBatteryChargerConnect : 0) |
+ 		    (charging ? kIOBatteryCharge : 0))};
+ 		for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {
+@@ -154,7 +168,7 @@
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    measured ? "PMIC gauge / estimated SOC" : "static fallback",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -169,8 +183,8 @@
+ 	uint16_t previous = 0;
+ 	for (unsigned attempt = 0; attempt < 4; ++attempt) {
+ 		uint8_t lo, hi;
+-		if (sweet_spmi_read(0, address, &lo) ||
+-		    sweet_spmi_read(0, address + 1, &hi)) {
++		if (sweet_spmi_read(sweet_battery_sid, address, &lo) ||
++		    sweet_spmi_read(sweet_battery_sid, address + 1, &hi)) {
+ 			return false;
+ 		}
+ 		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
+@@ -188,8 +202,9 @@
+ {
+ 	/* Generic single-cell curve, intentionally NOT advertised as QG SOC.
+ 	 * Load sag, temperature, aging and charging introduce large errors. */
++	/* apollo: the Mi 10T's cell charges to 4.4 V (was 4.35 for sweet) */
+ 	static const unsigned volts[] = {3400, 3500, 3600, 3700, 3800, 3900,
+-	    4000, 4100, 4200, 4350};
++	    4000, 4100, 4200, 4400};
+ 	static const unsigned soc[] = {1, 5, 10, 20, 40, 60, 75, 85, 93, 100};
+ 	if (mv <= volts[0]) {
+ 		return soc[0];
+@@ -206,18 +221,26 @@
+ void
+ SweetBattery::poll(void)
+ {
+-	uint8_t type, present, usb, path, charger, error, temperature;
+-	uint16_t rawVoltage;
++	/* apollo: zeroed, as the raw log line prints them even when a read failed */
++	uint8_t type = 0, present = 0, usb = 0, path = 0, charger = 0, error = 0, temperature = 0;
++	uint16_t rawVoltage = 0;
++	const unsigned sid = sweet_battery_sid;
+ 	bool valid = fReal &&
+-	    !sweet_spmi_read(0, 0x4804, &type) && type == 0x0d &&
+-	    !sweet_spmi_read(0, 0x4808, &present) && (present & 1u) &&
++	    !sweet_spmi_read(sid, 0x4804, &type) && type == 0x0d &&
++	    !sweet_spmi_read(sid, 0x4808, &present) && (present & 1u) &&
+ 	    readWord(0x48c0, &rawVoltage) && rawVoltage != 0x8000 &&
+-	    !sweet_spmi_read(0, 0x1310, &usb) &&
+-	    !sweet_spmi_read(0, 0x110b, &path) &&
+-	    !sweet_spmi_read(0, 0x1006, &charger) &&
+-	    !sweet_spmi_read(0, 0x1007, &error) &&
+-	    !sweet_spmi_read(0, 0x100d, &temperature);
++	    !sweet_spmi_read(sid, 0x1310, &usb) &&
++	    !sweet_spmi_read(sid, 0x110b, &path) &&
++	    !sweet_spmi_read(sid, 0x1006, &charger) &&
++	    !sweet_spmi_read(sid, 0x1007, &error) &&
++	    !sweet_spmi_read(sid, 0x100d, &temperature);
+ 	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 194637u) / 1000000u) : 0;
++	if (fReal && (fPolls++ % 10) == 0) {
++		/* apollo: what the gauge and the charger say, raw (every 5 minutes) */
++		IOLog("SWEET BATTERY: SID %u: gauge type %#x present %#x voltage %#x (%u mV); usb %#x path %#x charger %#x "
++		    "error %#x temperature flags %#x; %s\n", sid, type, present, rawVoltage, mv, usb, path, charger, error,
++		    temperature, valid ? "read" : "NOT read");
++	}
+ 	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+ 	valid = valid && mv >= 2800 && mv <= 4600;
+ 	if (!valid) {
+@@ -234,7 +257,7 @@
+ 	int ma = 0;
+ 	uint8_t subtype;
+ 	uint16_t rawCurrent;
+-	bool currentValid = !sweet_spmi_read(0, 0x4805, &subtype) &&
++	bool currentValid = !sweet_spmi_read(sid, 0x4805, &subtype) &&
+ 	    (subtype == 3 || subtype == 4) && readWord(0x48c2, &rawCurrent) &&
+ 	    rawCurrent != 0x8000;
+ 	if (currentValid) {
+@@ -262,8 +285,8 @@
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	int real = 0;
+-	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
++	int real = apollo_option("sweetbattery", 0);
++	sweet_battery_sid = (unsigned)apollo_option("sweetbattery_sid", 2);
+ 	fReal = real == 1 && sweet_spmi_init() == 0;
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
