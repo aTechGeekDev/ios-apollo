@@ -133,17 +133,16 @@ jobs:
           cat ath11k-build/out/kernel-calls.txt | tr '\n' ' '; echo
           echo "SWEET_OBJECTS=$PWD/ath11k-build/out/ath11k.o" >> "$GITHUB_ENV"
 
-      # BearSSL's git lives only on bearssl.org (xnu/patches/0020-stage-bearssl.sh). When that host is down
-      # (502 for hours on 2026-11-04), take the copy 0020 staged in the last green run (its xnu-buildtree
-      # artifact, kept 7 days): same pinned commit, the same files.
+      # BearSSL's git lives only on bearssl.org (xnu/patches/0020-stage-bearssl.sh), which answered 502 on and
+      # off for hours on 2026-11-04. Have the copy 0020 staged in a recent green run (its xnu-buildtree artifact,
+      # kept 7 days: same pinned commit, the same files) ready for when the fetch fails.
       - name: BearSSL fallback when bearssl.org is down
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if git ls-remote https://www.bearssl.org/git/BearSSL >/dev/null 2>&1; then
-            echo "bearssl.org answers"; exit 0
-          fi
-          echo "bearssl.org does not answer: looking for a staged copy in earlier green runs"
+          # Always (run 41837027398: ls-remote answered, then the fetch got 502 three times): 0020 still tries
+          # bearssl.org first and takes this copy only when that fails.
+          echo "looking for a staged BearSSL copy in earlier green runs (used only if bearssl.org fails)"
           for id in $(gh run list -R "$GITHUB_REPOSITORY" -w xnu.yml -s success -L 10 --json databaseId -q '.[].databaseId'); do
             rm -rf "bt-$id" && mkdir -p "bt-$id"
             if gh run download "$id" -R "$GITHUB_REPOSITORY" -n xnu-buildtree -D "bt-$id" &&
@@ -152,7 +151,7 @@ jobs:
               echo "using run $id's copy"; exit 0
             fi
           done
-          echo "no staged copy found: 0020 will try bearssl.org once more and fail if it is still down"
+          echo "no staged copy found: 0020 needs bearssl.org"
 
       - name: Build
         working-directory: dxb
