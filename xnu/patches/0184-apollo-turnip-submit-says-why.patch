@@ -1,0 +1,188 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -859,17 +859,16 @@
+ }
+ 
+ /*
+- * After pages are added to a live context: its TLB forgotten. (xnu 0179) Every table entry is written to memory where it
+- * is written (gpu_map, gpu_unmap, gpu_next_table, gpu_new_table): the pass that pushed every table of the space out of
+- * this processor's cache again, here, on every map and unmap -- a 4 KiB clean per table, hundreds of tables once Turnip's
+- * clients have their buffers -- is gone; a barrier makes sure those writes are done before the SMMU is told.
++ * After pages are added to a live context: its tables out to memory, its TLB forgotten. (xnu 0184: 0179 had dropped the
++ * pass over every table, as each entry is cleaned where it is written; it is back while boots 121/123's intermittent
++ * device losses are not explained -- it costs little: Turnip maps a few hundred buffers in 10 s.)
+  */
+ static void
+ gpu_smmu_refresh(vm_offset_t smmu, uint32_t pg, uint32_t npg, uint32_t context, struct gpu_space *sp)
+ {
+ 	uint32_t cb = (npg + context) * pg;
+-	(void)sp;
+-	__asm__ volatile("dsb sy" ::: "memory");
++	for (unsigned i = 0; i < sp->count; ++i)
++		gpu_to_memory((vm_offset_t)sp->table[i], 4096);
+ 	gpu_wr(smmu, cb + SMMU_CB_TLBIASID, context);
+ 	gpu_wr(smmu, cb + SMMU_CB_TLBSYNC, 1);
+ 	for (unsigned i = 0; i < 100 && (gpu_rd(smmu, cb + SMMU_CB_TLBSTATUS) & 1u); ++i)
+@@ -1107,6 +1106,15 @@
+ 
+ /* (xnu 0170) for the Turnip client (SweetAccelerator.cpp): a change of this count means a reset lost work */
+ uint32_t sweet_gpu_recovery_count(void);
++/* (xnu 0184) the last submission that had passed when the core was last reset (0: never reset) */
++static uint32_t sweet_gpu_done_at_reset;
++uint32_t sweet_gpu_recovery_done(void);
++
++uint32_t
++sweet_gpu_recovery_done(void)
++{
++	return sweet_gpu_done_at_reset;
++}
+ 
+ uint32_t
+ sweet_gpu_recovery_count(void)
+@@ -1550,6 +1558,9 @@
+ 		return false;
+ 	}
+ 	kept.at = kept.sent = at;
++	/* (xnu 0184) what had really passed when the core was reset: work after it was lost (sweet_gpu_recovery_done) */
++	gpu_to_memory(kept.scratch + KEPT_FENCE_AT, 4);
++	sweet_gpu_done_at_reset = *(volatile uint32_t *)(kept.scratch + KEPT_FENCE_AT);
+ 	*(volatile uint32_t *)(kept.scratch + KEPT_FENCE_AT) = kept.fence;   /* everything before: done */
+ 	gpu_to_memory(kept.scratch + KEPT_FENCE_AT, 4);
+ 	printf("SWEET GPU: kept: RECOVERED the hung core (recovery %u, %llu ms; smmu fsr was %#x); submissions up to %u count as done\n",
+--- a/iokit/Kernel/arm/SweetAccelerator.cpp
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -45,6 +45,8 @@
+ uint32_t sweet_gpu_v2_submit(const uint64_t *iova, const uint32_t *dwords, uint32_t n, bool *busy);
+ int sweet_gpu_v2_wait(uint32_t fence, uint64_t timeout_ns);
+ uint32_t sweet_gpu_recovery_count(void);
++uint32_t sweet_gpu_recovery_done(void);         /* (xnu 0184) sweet_gpu.c */
++uint32_t sweet_gpu_last(void);
+ uint64_t sweet_gpu_timestamp(void);
+ void sweet_accelerator_start(IOService *provider);
+ }
+@@ -419,6 +421,14 @@
+ 	} else {
+ 		r = call(selector, isz ? args->structureInput : NULL, isz, o, &osz);
+ 	}
++	if (r != kIOReturnSuccess && method < V2_STAT_METHODS && !(method == NativeAdrenoMethodWaitFence && r == kIOReturnTimeout) &&
++	    !(method == NativeAdrenoMethodSubmit && r == kIOReturnBusy)) {
++		/* (xnu 0184) any other refusal, said (the first 32): Turnip turns some of them into a lost device */
++		static uint32_t refusals;
++		if (refusals++ < 32) {
++			IOLog("SWEET MTL: %s: %s refused: %#x (%u bytes in)\n", fName, gV2Names[method], r, isz);
++		}
++	}
+ 	if (method < V2_STAT_METHODS) {
+ 		/* (xnu 0179) */
+ 		SInt64 took = (SInt64)(mach_absolute_time() - began);
+@@ -607,27 +617,57 @@
+ 	case NativeAdrenoMethodBoCpuUnmap:
+ 		return kIOReturnSuccess;        /* the mapping is the client's (IOConnectUnmapMemory64) */
+ 	case NativeAdrenoMethodSubmit: {
++		/*
++		 * (xnu 0184) Boot 123: Turnip's "submit failed: 0xe00002c2" (kIOReturnBadArgument) -- one refused call and
++		 * Turnip loses its device for good: backboardd's Metal gone, the screen stuck. Which check refused was not
++		 * said. Now every refusal says why (the first 16), and a command buffer that cannot be run is left out of the
++		 * submission instead of refusing all of it (a wrong frame, not a lost device); with none left the submission
++		 * is a fence alone.
++		 */
++		static uint32_t said;
++		if (in == NULL || inSize != sizeof(NativeAdrenoAbiSubmit) || out == NULL ||
++		    *outSize < sizeof(NativeAdrenoAbiSubmitReply)) {
++			if (said++ < 16) {
++				IOLog("SWEET MTL: %s: a submission refused: %u bytes in (%lu expected), %u out\n", fName, inSize,
++				    sizeof(NativeAdrenoAbiSubmit), out != NULL ? *outSize : 0);
++			}
++			return kIOReturnBadArgument;
++		}
+ 		V2_IN(NativeAdrenoAbiSubmit);
+ 		V2_OUT(NativeAdrenoAbiSubmitReply);
+ 		if (rq->buffer_count == 0 || rq->buffer_count > NativeAdrenoAbiMaxBuffers || rq->reserved) {
++			if (said++ < 16) {
++				IOLog("SWEET MTL: %s: a submission refused: %u command buffers, reserved %#x\n", fName,
++				    rq->buffer_count, rq->reserved);
++			}
+ 			return kIOReturnBadArgument;
+ 		}
+ 		uint64_t iova[NativeAdrenoAbiMaxBuffers];
+-		uint32_t dw[NativeAdrenoAbiMaxBuffers];
++		uint32_t dw[NativeAdrenoAbiMaxBuffers], n = 0;
+ 		for (uint32_t i = 0; i < rq->buffer_count; i++) {
+ 			const NativeAdrenoAbiSubmitBuffer *b = &rq->buffers[i];
+-			if ((b->bytes & 3) || b->bytes == 0 || b->bytes / 4 > 0xfffff || b->iova < fWinBase ||
+-			    b->iova + b->bytes > fWinBase + fWinSize) {
+-				return kIOReturnBadArgument;
++			const char *why = (b->bytes & 3) ? "not whole words" : b->bytes == 0 ? "empty" :
++			    b->bytes / 4 > 0xfffff ? "over 4 MiB" :
++			    b->iova < fWinBase || b->iova + b->bytes > fWinBase + fWinSize ? "outside its window" : NULL;
++			if (why != NULL) {
++				if (said++ < 16) {
++					IOLog("SWEET MTL: %s: command buffer %u of %u left out: %s (at %#llx, %llu bytes; window %#llx, "
++					    "%llu GB)\n", fName, i, rq->buffer_count, why, b->iova, b->bytes, fWinBase, fWinSize >> 30);
++				}
++				continue;
+ 			}
+-			iova[i] = b->iova;
+-			dw[i] = (uint32_t)(b->bytes / 4);
++			iova[n] = b->iova;
++			dw[n++] = (uint32_t)(b->bytes / 4);
+ 		}
+ 		if (rq->wait_fence != 0 && sweet_gpu_v2_wait((uint32_t)rq->wait_fence, rq->wait_timeout_ns) != 0) {
++			if (said++ < 16) {
++				IOLog("SWEET MTL: %s: a submission's wait for %llu timed out (the last submitted %u)\n", fName,
++				    rq->wait_fence, sweet_gpu_last());
++			}
+ 			return kIOReturnTimeout;
+ 		}
+ 		bool busy = false;
+-		uint32_t fence = sweet_gpu_v2_submit(iova, dw, rq->buffer_count, &busy);
++		uint32_t fence = sweet_gpu_v2_submit(iova, dw, n, &busy);
+ 		if (fence == 0) {
+ 			return busy ? kIOReturnBusy : kIOReturnNotReady;
+ 		}
+@@ -637,7 +677,18 @@
+ 	}
+ 	case NativeAdrenoMethodWaitFence: {
+ 		V2_IN(NativeAdrenoAbiWaitFence);
+-		return sweet_gpu_v2_wait((uint32_t)rq->fence, rq->timeout_ns) != 0 ? kIOReturnTimeout : kIOReturnSuccess;
++		if (sweet_gpu_v2_wait((uint32_t)rq->fence, rq->timeout_ns) == 0) {
++			return kIOReturnSuccess;
++		}
++		/* (xnu 0184) a long wait that came to nothing: Turnip calls that a hung GPU and loses its device (boot 121:
++		 * "GPU faulted or hung", a commit 5.3 s); say which submission it was and where the ring was */
++		static uint32_t said_waits;
++		if (rq->timeout_ns >= 1000000000ull && said_waits++ < 16) {
++			IOLog("SWEET MTL: %s waited %llu ms for submission %llu: not done (the last submitted %u, this client's %u, "
++			    "recoveries %u)\n", fName, rq->timeout_ns / 1000000ull, rq->fence, sweet_gpu_last(), fLastFence,
++			    sweet_gpu_recovery_count());
++		}
++		return kIOReturnTimeout;
+ 	}
+ 	case NativeAdrenoMethodGetTimestamp: {
+ 		V2_OUT(NativeAdrenoAbiTimestamp);
+@@ -646,12 +697,23 @@
+ 	}
+ 	case NativeAdrenoMethodGetStatus: {
+ 		V2_OUT(NativeAdrenoAbiStatus);
+-		/* a recovery since the last look lost whatever of this client's was queued: its context is lost */
++		/*
++		 * a recovery since the last look lost whatever of this client's was queued: its context is lost.
++		 * (xnu 0184) Only if it had work after the last submission that had passed when the core was reset: a
++		 * recovery for someone else's hang (the display's copy, Mesa, the watchdog) is not this client's fault, and
++		 * Turnip treats any fault as a lost device for good.
++		 */
+ 		uint32_t now = sweet_gpu_recovery_count();
+ 		if (now != fEpoch) {
++			uint32_t done = sweet_gpu_recovery_done();
+ 			fEpoch = now;
+-			if (fLastFence != 0) {
++			if (fLastFence != 0 && (int32_t)(fLastFence - done) > 0) {
+ 				fFaults++;
++				IOLog("SWEET MTL: %s lost work in a GPU recovery (its last submission %u; %u had passed): told it\n",
++				    fName, fLastFence, done);
++			} else if (fLastFence != 0) {
++				IOLog("SWEET MTL: %s: a GPU recovery after its work was done (its last submission %u, %u had "
++				    "passed): not its fault\n", fName, fLastFence, done);
+ 			}
+ 		}
+ 		rp->faults = fFaults;
