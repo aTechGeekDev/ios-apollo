@@ -237,6 +237,13 @@ User preference: give paste-ready commands at once, do not wait on CI (`gh run w
 
 All of them stuck, including 124 without Metal. **Test before blaming Metal:** the same boot without `--option apollo_ui=1`, or with sweet-ui from ui run 41829738713. If that boots, the fault is mine (first suspect: the AVFCapture dlopen inside an image initializer). Metal agent: 123's DeviceLost may still be real (122 had none), but the stuck logo is not proven to be yours.
 
+**Boot 124's log (user):**
+- `SWEET FB: iOS gave 0 frames` for minutes (once 4 frames) without Metal.
+- `|SpringBoard| sweet-ui: iOS's flashlight drives apollo.torch` printed: SpringBoard alive.
+- So the stuck logo is **mine**, not Metal's.
+**Guess:** once +hasFlashlight said YES, SpringBoard made an AVFlashlight whose _setupFlashlight waits on mediaserverd's FigFlashlight (no camera here).
+**Fix (ui run 41842152626, main 1430d45):** _setupFlashlight / _reconnectToServer / _teardownFlashlight are no-ops. Kernel unchanged (41837987204). If still stuck, drop `--option apollo_ui=1`.
+
 ### >>> BOOT 123 (2026-11-04, kernel 41837987204, metal2 41827349433 + metal2-on.txt, sweet-ui 41837027762 (island rect + flashlight), same options): STUCK AT THE APPLE LOGO -- Metal DeviceLost again (see the correction in the note for the Metal agent) <<<
 
 **Observed:**
