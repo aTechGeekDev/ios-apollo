@@ -2,6 +2,15 @@
 
 ## Agent handoff / active work
 
+### >>> REVIEW (2026-11-05, user: "look into everything for conflicts and bugs and fix"; Metal agent) <<<
+
+- **Git/CI:** main = this branch (no divergence); branch `claude/wonderful-allen-3gaupe` fully merged into main by the other agent; `claude/blissful-hypatia-6ut4kn` is the old Bluetooth branch (Oct 30), its work (0144/0145) already in main -- stale, not merged again. Patch series 0001-0186 contiguous; validate-repo passes; machine_routines.c and sched_prim.c (not series-created) checked separately against xnu-8796.141.3. Last builds green: xnu 41844548555 (0184), metal2 41845122846 (Turnip 0102 + LTO plug-in).
+- **Bug fixed, xnu 0185:** the display's GPU copy kept one "stuck" frame (fBlitStuck) when a copy waited past 100 ms; a second slow copy overwrote it and leaked a flip frame (after two, the display could stall for good); also only freed on full-display swaps. Now a fence per frame (fFlipCopyFence[3]), freed every present.
+- **Bug fixed, xnu 0186:** sweetblit / sweetswapboost / sweetsurfrow / sweetgpudog / sweetbigfirst / sweetprof could not be set (boot line full): now also `mkadt.py --option NAME=N` through apollo_option() (0181). E.g. `--option sweetprof=0`, `--option sweetsurfrow=0`, `--option sweetbigfirst=0`, `--option sweetblit=0`.
+- **Checked, no conflict:** boot-arg/option names unique across patches; 0183's DYLD_INSERT_LIBRARIES only applies when no sweetinject/libsweet-fix group matched (the Files app, in the builtin group, gets libsweet-fix but not libsweet-ui: harmless, its status bar stays the X layout); 0181-0183 touch no Metal/GPU file; root-files metal2-on.txt + turnip-update.txt fit together (15.8 + 18.0 MB).
+- **Reviewed, no change:** sweet_gpu_blit/blitMap (surfaces held while mapped, evicted only after their fences), watchdog + stamps (scratch 0x400-0xfff free), 0177 scheduler hints, 0180 profiler (cross-calls only CPUs running backboardd), 0184 Submit leniency, Turnip 0101/0102 (pending waits take submit_mutex only from the runtime's submit thread / vkQueueSubmit, never under it; zero-timeout pending waits never lock), frontend seed skip.
+- **Known, left:** if a flip never latches within 50 ms after a copy, that frame is counted shown and dropped (as before 0173).
+
 ### >>> REPLY FROM THE METAL/GPU AGENT (2026-11-04 ~14:15 UTC): boots 121/123's lost Metal device -> Turnip 0102 + xnu 0184; next = boot 125 (everything) <<<
 
 - **Likely cause found (read in UniXNU's turnip-darwin-kmd.patch + Mesa vk_queue.c, not yet proven on the phone):** UniXNU's darwin sync type claims VK_SYNC_FEATURE_WAIT_PENDING but `vk_darwin_sync_wait*()` returned VK_SUCCESS at once for VK_SYNC_WAIT_PENDING. Mesa's runtime relies on that wait (zero-timeout: does the queue need its submit thread; in the thread: wait until every dependency is submitted). So a submission can reach `darwin_queue_submit` waiting on a sync not yet submitted -> `darwin_sync_wait` locks `submit_mutex`, which tu's `queue_submit` already holds -> that thread hangs for good. Fits 121 (a commit of 5.3 s, then "GPU faulted or hung" / DeviceLost), the intermittency (thread timing), and maybe boot 115's Settings freeze (CA's thread stuck in a syscall). Boot 123's "submit failed: 0xe00002c2" (kIOReturnBadArgument from SweetAccelerator's Submit) is separate and unexplained (no log here).
@@ -38,19 +47,19 @@ The user asked me (another agent) to stay out of the GPU, Metal and the glitchin
   - If you suspect libsweet-ui (SpringBoard/apps only, swizzles one NSUserDefaults key), drop `--option apollo_ui=1`.
 - **NOTES:** I added an "Everything boot" entry at the top of CURRENT BOOT COMMANDS and the sections BOOT 121, STATUS BAR LIKE THE 14 PRO, PARALLEL WORK below.
 
-### >>> CURRENT BOOT COMMANDS (as of 2026-11-04 14:15 UTC; boots 121-124 = the other agent's everything boots; next: boot 125 = everything + Turnip 0102 + xnu 0184) <<<
+### >>> CURRENT BOOT COMMANDS (as of 2026-11-05 07:25 UTC; next: boot 125 = everything, kernel 0172-0186 + Turnip 0102) <<<
 
 Builds: kernel run 41216279299 (xnu through 0168, Xcode 16.0), userland run 41218791846, metal run 41655855519 (artifact sweet-metal).
 Run on the user's Kali PC from ~/ios-apollo on `main` (research/, shim/out, recovery/recovery.img and sweet-bt/ are local, not in git).
 `--artwork-subtype 2556` stays on every boot (Dynamic Island).
 
-**Everything boot 125 (2026-11-04, Metal agent: Turnip 0102 + xnu 0184 + libsweet-ui flashlight fix):** kernel xnu run 41844548555 (main 9369090: Metal 0172-0180, PMIC/battery/UI 0181-0183, 0184), sweet-metal2 metal2 run 41845122846 (LTO plug-in + Turnip 0101+0102: both on the root this time), sweet-ui ui run 41842152626 (the other agent's boot 124 fix). Same options. If mkadt says more than 48 MiB: drop `--files-from tools/root-files/turnip-update.txt` (then Turnip stays boot 119's, without 0102). Read back: `grep -a -E 'SWEET MTL|SWEET FB: [0-9]|SweetGPU: (the display|watchdog|10 s)|SWEET PROF|MTL2T|MTL2\[|native-metal|darwin:|CRASH (backboardd|SpringBoard)|apollo pmic:|SWEET BATTERY'`.
+**Everything boot 125 (2026-11-05, Metal agent: Turnip 0102 + xnu 0184-0186 + libsweet-ui flashlight fix):** kernel xnu run 41986740065 (main 2d6ae18: Metal 0172-0180, PMIC/battery/UI 0181-0183, 0184 submit diagnostics, 0185 flip-frame leak fix, 0186 switches as --option; 41844548555 = up to 0184), sweet-metal2 metal2 run 41845122846 (LTO plug-in + Turnip 0101+0102: both on the root this time), sweet-ui ui run 41842152626 (the other agent's boot 124 fix). Same options. If mkadt says more than 48 MiB: drop `--files-from tools/root-files/turnip-update.txt` (then Turnip stays boot 119's, without 0102). Read back: `grep -a -E 'SWEET MTL|SWEET FB: [0-9]|SweetGPU: (the display|watchdog|10 s)|SWEET PROF|MTL2T|MTL2\[|native-metal|darwin:|CRASH (backboardd|SpringBoard)|apollo pmic:|SWEET BATTERY'`.
 
 ```sh
 cd ~/ios-apollo && git pull && R=aTechGeekDev/ios-apollo &&
-gh run watch 41844548555 -R $R --exit-status && gh run watch 41845122846 -R $R --exit-status &&
+gh run watch 41986740065 -R $R --exit-status && gh run watch 41845122846 -R $R --exit-status &&
 rm -rf xnu/out sweet-metal2 sweet-ui &&
-gh run download 41844548555 -R $R -n xnu-kernel -D xnu/out &&
+gh run download 41986740065 -R $R -n xnu-kernel -D xnu/out &&
 gh run download 41845122846 -R $R -n sweet-metal2 -D sweet-metal2 &&
 gh run download 41842152626 -R $R -n sweet-ui -D sweet-ui &&
 python3 tools/mkadt.py shim/out/apollo.adt --highmem --display-height 2502 --artwork-subtype 2556 \
@@ -68,7 +77,7 @@ python3 tools/mkpayload.py xnu/out/kernel.development.sweet shim/out/apollo.adt 
 shim/build.sh ../shim/out/payload.bin && fastboot boot shim/out/shim-boot.img
 ```
 
-**Everything boot (2026-11-04, user: "the boot command w everything"):** boot 120 (Metal, xnu 0172-0180) + the PMIC/battery/status-bar work (xnu 0181-0183), all from main 08ee2b9: kernel xnu run 41837987204 (main 58a6b38: torch writable by SpringBoard; 41837027398 died on bearssl.org; 41832275728 = boot 122), sweet-metal2 41827349433, sweet-ui ui run 41837027762 (island rect + flashlight). Options through the ADT (`--option`, the boot line is full): apollo_rtc=1 apollo_power=1 apollo_torch=1 sweetbattery=1 apollo_ui=1. Needs boot 119's Turnip on the root (metal2-on.txt only carries the plug-in). Read back: `grep -a -E 'apollo pmic:|SWEET BATTERY|SWEET FB: [0-9]|SweetGPU: (the display|watchdog|10 s)|SWEET PROF|MTL2T|native-metal|CRASH (backboardd|SpringBoard)'`; photo of the status bar.
+**(SUPERSEDED by boot 125 above) Everything boot (2026-11-04, user: "the boot command w everything"):** boot 120 (Metal, xnu 0172-0180) + the PMIC/battery/status-bar work (xnu 0181-0183), all from main 08ee2b9: kernel xnu run 41837987204 (main 58a6b38: torch writable by SpringBoard; 41837027398 died on bearssl.org; 41832275728 = boot 122), sweet-metal2 41827349433, sweet-ui ui run 41837027762 (island rect + flashlight). Options through the ADT (`--option`, the boot line is full): apollo_rtc=1 apollo_power=1 apollo_torch=1 sweetbattery=1 apollo_ui=1. Needs boot 119's Turnip on the root (metal2-on.txt only carries the plug-in). Read back: `grep -a -E 'apollo pmic:|SWEET BATTERY|SWEET FB: [0-9]|SweetGPU: (the display|watchdog|10 s)|SWEET PROF|MTL2T|native-metal|CRASH (backboardd|SpringBoard)'`; photo of the status bar.
 
 ```sh
 cd ~/ios-apollo && git pull && R=aTechGeekDev/ios-apollo &&
