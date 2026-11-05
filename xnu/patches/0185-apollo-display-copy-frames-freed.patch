@@ -1,0 +1,64 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -286,8 +286,7 @@
+ 	/* (xnu 0172) the GPU's copy of Metal frames */
+ 	bool          fBlitOn;                  /* boot-arg sweetblit, default 1 */
+ 	uint32_t      fPendingFence;            /* the last Turnip submission when fPending was swapped */
+-	int           fBlitStuck;               /* a frame a copy still writes into after the wait gave up (-1: none) */
+-	uint32_t      fBlitStuckFence;
++	uint32_t      fFlipCopyFence[3];        /* (xnu 0185) a copy still writing frame f after the wait gave up (0: none) */
+ 	uint32_t      fStatBlit, fStatBlitWait, fBlitRefusalsSaid;
+ 	bool          fBlitSaid;
+ 	uint64_t      fStatBlitAbs;
+@@ -545,7 +544,6 @@
+ 	int blitOn = 1;
+ 	PE_parse_boot_argn("sweetblit", &blitOn, sizeof(blitOn));
+ 	fBlitOn = fFlipCount == 3 && blitOn != 0 && fFlipSurf[2] != NULL;
+-	fBlitStuck = -1;
+ 	if (fFlipCount == 3) {
+ 		IOLog("SWEET FB: GPU scaling %s (frames %u, %u, %u; rows of %u)\n", fScanReady ? "offered" :
+ 		    scanOn ? "NOT offered: no surfaces" : "not offered (sweetscan=0)", fFlipSurf[0] ? fFlipSurf[0]->id : 0,
+@@ -771,6 +769,19 @@
+ 		IOLockUnlock(fLock);
+ 		uint64_t began = mach_absolute_time();
+ 		/*
++		 * (xnu 0185) frames earlier copies gave up waiting for: free again once each copy has passed. 0172/0173 kept
++		 * one such frame: a second slow copy overwrote it and its frame was never given back (two of the three gone
++		 * after two slow copies: the display stalled), and it was looked at only for frames covering the display.
++		 */
++		for (int f = 0; f < 3 && fFlipCount == 3; f++) {
++			if (fFlipCopyFence[f] != 0 && sweet_gpu_fence_passed(fFlipCopyFence[f])) {
++				IOLockLock(fLock);
++				fFlipOwner[f] = SWEET_SCAN_FREE;
++				IOLockUnlock(fLock);
++				fFlipCopyFence[f] = 0;
++			}
++		}
++		/*
+ 		 * (xnu 0156) where to draw: with flips and a swap covering the display, the frame neither scanned nor waiting
+ 		 * to be (the last flip settled first: at most a refresh); else the scanned one, as before.
+ 		 */
+@@ -799,13 +810,6 @@
+ 			if (!early && settleWait()) {
+ 				fStatFlipWaits++;
+ 			}
+-			/* (xnu 0172) a frame an earlier copy gave up waiting for: free again once that copy has passed */
+-			if (fBlitStuck >= 0 && sweet_gpu_fence_passed(fBlitStuckFence)) {
+-				IOLockLock(fLock);
+-				fFlipOwner[fBlitStuck] = SWEET_SCAN_FREE;
+-				IOLockUnlock(fLock);
+-				fBlitStuck = -1;
+-			}
+ 			if (gpuFrame < 0) {
+ 				/* the processor copies: into a frame nobody has (marked so while it does) */
+ 				IOLockLock(fLock);
+@@ -843,8 +847,7 @@
+ 				}
+ 				if (!shown) {
+ 					blitStuck = true;
+-					fBlitStuck = target;
+-					fBlitStuckFence = blitFence;
++					fFlipCopyFence[target] = blitFence;     /* (0185) the frame stays the copy's */
+ 					fStatBlitWait++;
+ 				}
+ 			} else if (swapFence != 0 && !sweet_gpu_fence_passed(swapFence)) {
