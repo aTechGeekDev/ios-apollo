@@ -1,0 +1,101 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -130,6 +130,7 @@
+ extern "C" bool sweet_gpu_surface_ready(uint32_t id, void *kernel, uint64_t size);     /* SweetGPU.cpp */
+ extern "C" uint32_t sweet_gpu_v2_last(void);                                    /* (xnu 0172) */
+ extern "C" void sweet_cpufreq_boost(uint32_t ms);                               /* (xnu 0178) bsd/dev/sweet_cpufreq.c */
++extern "C" int apollo_option(const char *name, int fallback);   /* (xnu 0186) a boot-arg, else mkadt.py --option */
+ extern "C" bool sweet_gpu_fence_passed(uint32_t fence);                         /* (xnu 0172) */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" bool apollo_backlight_fade(bool on, bool wait);      /* bsd/dev/sweet_backlight.c (xnu 0151) */
+@@ -538,11 +539,9 @@
+ 		fScanReady = fFlipSurf[f] != NULL;
+ 	}
+ 	/* (xnu 0178) */
+-	fSwapBoostMs = 100;
+-	PE_parse_boot_argn("sweetswapboost", &fSwapBoostMs, sizeof(fSwapBoostMs));
++	fSwapBoostMs = (uint32_t)apollo_option("sweetswapboost", 100);        /* (0186) also --option */
+ 	/* (xnu 0172) */
+-	int blitOn = 1;
+-	PE_parse_boot_argn("sweetblit", &blitOn, sizeof(blitOn));
++	int blitOn = apollo_option("sweetblit", 1);                             /* (0186) also --option */
+ 	fBlitOn = fFlipCount == 3 && blitOn != 0 && fFlipSurf[2] != NULL;
+ 	if (fFlipCount == 3) {
+ 		IOLog("SWEET FB: GPU scaling %s (frames %u, %u, %u; rows of %u)\n", fScanReady ? "offered" :
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -45,6 +45,7 @@
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
+ #include <pexpert/pexpert.h>       /* (xnu 0176) PE_parse_boot_argn */
++extern "C" int apollo_option(const char *name, int fallback);   /* (xnu 0186) bsd/dev/apollo_pmic.c */
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -321,8 +322,7 @@
+ 	 */
+ 	static int row64 = -1;
+ 	if (row64 < 0) {
+-		int on = 1;
+-		PE_parse_boot_argn("sweetsurfrow", &on, sizeof(on));
++		int on = apollo_option("sweetsurfrow", 1);      /* (0186) a boot-arg, else mkadt.py --option */
+ 		row64 = on != 0;
+ 	}
+ 	if (row64 && (s->bytesPerRow & (SWEET_SURFACE_ROW_ALIGN - 1)) != 0 && props->getObject("IOSurfacePlaneInfo") == NULL &&
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -244,6 +244,7 @@
+ #define GPU_STAMP_SLOTS         96u             /* = KEPT_STAMPS of sweet_gpu.c */
+ extern "C" bool sweet_gpu_stamps(uint32_t fence, uint64_t *start, uint64_t *end);
+ extern "C" size_t sweet_accelerator_stats(char *out, size_t size);     /* (xnu 0179) SweetAccelerator.cpp */
++extern "C" int apollo_option(const char *name, int fallback);           /* (xnu 0186) bsd/dev/apollo_pmic.c */
+ static uint32_t gStampNext;
+ static uint64_t gStampEnd, gStampBusy, gStampLongest, gStampSubmissions, gStampLost;
+ 
+@@ -288,7 +289,7 @@
+ 	uint32_t watched = 0, seconds = 5, recoveries = 0, looks = 0;
+ 	uint64_t since = 0, patience;
+ 
+-	PE_parse_boot_argn("sweetgpudog", &seconds, sizeof(seconds));
++	seconds = (uint32_t)apollo_option("sweetgpudog", (int)seconds);        /* (0186) also mkadt.py --option */
+ 	if (seconds == 0) {
+ 		IOLog("SweetGPU: watchdog off (sweetgpudog=0)\n");
+ 		return;
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -130,6 +130,7 @@
+ 
+ /* (xnu 0177) the little cores for the scheduler; said when `say` */
+ extern uint64_t sweet_little_cpus;              /* osfmk/kern/sched_prim.c */
++extern int apollo_option(const char *name, int fallback);       /* (xnu 0186) apollo_pmic.c */
+ extern int sweet_fast_pri;
+ 
+ static void
+@@ -138,7 +139,7 @@
+ 	unsigned bigfirst = 1, cpus = 0;
+ 	uint64_t little = 0;
+ 
+-	(void)PE_parse_boot_argn("sweetbigfirst", &bigfirst, sizeof(bigfirst));
++	bigfirst = (unsigned)apollo_option("sweetbigfirst", 1);        /* (0186) a boot-arg, else mkadt.py --option */
+ 	for (unsigned cpu = 0; cpu < GOV_CPUS; cpu++) {
+ 		uint32_t mpidr;
+ 		uint64_t idle;
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -3146,6 +3146,7 @@
+ 
+ void sweet_prof_start(void);
+ extern void thread_set_thread_name(thread_t th, const char *name);
++extern int apollo_option(const char *name, int fallback);       /* (xnu 0186) bsd/dev/apollo_pmic.c */
+ 
+ static void
+ sweet_prof_count(struct sweet_prof_slot *table, uint32_t n, uint64_t key)
+@@ -3374,7 +3375,7 @@
+ 	uint32_t on = 1;
+ 	thread_t thread;
+ 
+-	PE_parse_boot_argn("sweetprof", &on, sizeof(on));
++	on = (uint32_t)apollo_option("sweetprof", 1);  /* (0186) a boot-arg, else mkadt.py --option */
+ 	if (started || on == 0) {
+ 		return;
+ 	}
