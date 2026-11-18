@@ -1,0 +1,98 @@
+IOS-26-Hot 0132 (d249939b) as it applies to this series: its osfmk/kern/printf.c hunk is left out (it adds a
+declaration inside the paniclog-to-log-ring block of that project's Pixel 4 patches, which this series does not have).
+
+diff --git a/EXTERNAL_HEADERS/CodeSignature/Entitlements.h b/EXTERNAL_HEADERS/CodeSignature/Entitlements.h
+new file mode 100644
+index 0000000..4a6a11e
+--- /dev/null
++++ b/EXTERNAL_HEADERS/CodeSignature/Entitlements.h
+@@ -0,0 +1,10 @@
++/* Standalone SWEET compatibility constants, as supplied by dxb's
++ * patches/15.0/entitlements.patch at bd88697145b2d8008bbed951fef99795308262f0.
++ * These names are used by kern_exec.c and necp_client.c. */
++#ifndef SWEET_CODESIGNATURE_ENTITLEMENTS_H
++#define SWEET_CODESIGNATURE_ENTITLEMENTS_H
++#define kCSWebBrowserNetworkEntitlement "com.apple.developer.web-browser-engine.networking"
++#define kCSWebBrowserWebContentEntitlement "com.apple.developer.web-browser-engine.webcontent"
++#define kCSWebBrowserGPUEntitlement "com.apple.developer.web-browser-engine.rendering"
++#define kCSWebBrowserHostEntitlement "com.apple.developer.web-browser-engine.host"
++#endif
+diff --git a/bsd/net/necp_client.c b/bsd/net/necp_client.c
+index 8361634..37885ae 100644
+--- a/bsd/net/necp_client.c
++++ b/bsd/net/necp_client.c
+@@ -76,9 +76,7 @@
+ 
+ #include <os/refcnt.h>
+ 
+-#if !defined(SWEET)
+ #include <CodeSignature/Entitlements.h>
+-#endif /* !SWEET: this file uses no CodeSignature declarations. */
+ 
+ #if SKYWALK
+ #include <skywalk/os_skywalk_private.h>
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 2902910..cd53189 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3982,9 +3982,9 @@ sleh_irq(arm_saved_state_t *state)
+ 	if (intid == sweet_vtimer_intid) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
+ 		cdp->cpu_decrementer = -1; /* Large */
+-		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
++		ml_interrupt_masked_debug_start(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 		rtclock_intr(TRUE);
+-		INTERRUPT_MASKED_DEBUG_END();
++		ml_interrupt_masked_debug_end();
+ 		__builtin_arm_wsr64("ICC_EOIR1_EL1", iar);
+ 	} else if (intid < 16) {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_IPI);
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index c7063a0..ed72a18 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -961,7 +961,8 @@ exception_triage(
+ }
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+-#include <vm/vm_shared_region.h>
++#include <vm/vm_shared_region_xnu.h>
++#include <vm/vm_map_internal.h>
+ #include <arm/thread.h>
+ 
+ /*
+@@ -1014,23 +1015,21 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+ 	printf("%s\n", line);
+ 
+ 	if (sig == 11 || sig == 10) {
+-		/* Which mapping the faulting address is in, or which two it falls between. */
++		/* Use the region API: XNU 26 replaced the old whole-map read lock. */
+ 		uint64_t far = (uint64_t)saved_state64(ss)->far;
+ 		vm_map_t map = current_map();
+-		vm_map_entry_t entry;
+-		vm_map_lock_read(map);
+-		bool inside = vm_map_lookup_entry(map, (vm_map_offset_t)far, &entry);
+-		for (int i = 0; i < 2 && entry != vm_map_to_entry(map); i++) {
++		vm_map_offset_t addr = far;
++		vm_map_size_t size = 0;
++		natural_t depth = 0;
++		vm_region_submap_info_data_64_t info;
++		mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_V2_COUNT_64;
++		if (vm_map_region_recurse_64(map, &addr, &size, &depth,
++		    (vm_region_submap_info_64_t)&info, &count) == KERN_SUCCESS) {
+ 			printf("CRASH %s map%s 0x%llx-0x%llx prot %d/%d tag %d\n", name,
+-			    inside && i == 0 ? " (far inside)" : (i == 0 ? " before far" : " after far"),
+-			    (uint64_t)entry->vme_start, (uint64_t)entry->vme_end, entry->protection,
+-			    entry->max_protection, (int)VME_ALIAS(entry));
+-			if (inside) {
+-				break;
+-			}
+-			entry = entry->vme_next;
++			    addr <= far && far - addr < size ? " (far inside)" : " after far",
++			    (uint64_t)addr, (uint64_t)(addr + size), info.protection,
++			    info.max_protection, info.user_tag);
+ 		}
+-		vm_map_unlock_read(map);
+ 	}
+ 	if (sig == 6 || sig == 5) {
+ 		sweet_crash_strings(name);

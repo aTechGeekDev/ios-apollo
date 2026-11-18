@@ -27,6 +27,9 @@
   - `kmem_alloc*`/`KMA_*` need `<vm/vm_kern_xnu.h>` on 12377. Fixed by 1900 for our 4 files; 0131 fixes the base's.
   - `sysreg_restore` in the base's cpu.c, and the CoreEntitlements `#error` reached from IOKitBSDInit.cpp via amfi.h: both are fixed by IOS-26-Hot 0131, now included without its two Pixel 4 file sections.
   - The next run will reach IOKit (our Sweet*.cpp drivers), where more 12377 API errors are expected.
+- Run 44312965616 (6ca2002): BSD and osfmk errors in 6 files.
+  - Base files: kern_exec.c / necp_client.c CodeSignature/Entitlements.h and kCSWebBrowserNetworkEntitlement, sleh.c INTERRUPT_MASKED_DEBUG_*, exception.c VM calls. All fixed by IOS-26-Hot 0132, now taken without its printf.c hunk.
+  - Ours: MAX_SCHED_CPUS (1153/1180) becomes MAX_CPUS, and the -fbounds-safety errors in 1135's uipc_syscalls.c diagnostics are fixed. Both are in 1900.
 
 **Not yet taken from IOS-26-Hot:** its other generic iOS 26 patches. They are tangled with its Pixel 4 / Realme files, which collide by name with ours (sweet_gpu.c, SweetAccelerator.cpp, ...).
 - **Conflict hunks**, measured by cherry-picking onto the base:

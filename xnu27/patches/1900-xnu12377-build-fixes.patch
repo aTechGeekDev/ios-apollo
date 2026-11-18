@@ -1,6 +1,9 @@
 xnu-12377 build fixes for project-BadApple's apollo files (1082-1186), one place for all of them.
 - kmem_alloc, kmem_alloc_contig and the KMA_* flags are declared in <vm/vm_kern_xnu.h> on xnu-12377
-  (run 44306947678: sweet_adsp.c, sweet_gpu.c, sweet_sound.c, sweet_wifi.c).
+  (build 44306947678: sweet_adsp.c, sweet_gpu.c, sweet_sound.c, sweet_wifi.c).
+- processor_array is [MAX_CPUS] on xnu-12377 (MAX_SCHED_CPUS is gone): machine_routines.c (1153, 1180).
+- bsd/kern/uipc_syscalls.c is built with -fbounds-safety: sweet_connect_said (1135) compares with memcmp and
+  reads the address through a pointer bounded by sa_len (build 44312965616).
 
 diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
 index 70d0608..fbf99e8 100644
@@ -54,3 +57,69 @@ index 04ac2d4..8a41582 100644
  #include <pexpert/pexpert.h>
  #include <pexpert/device_tree.h>
  #include <libkern/libkern.h>
+diff --git a/bsd/kern/uipc_syscalls.c b/bsd/kern/uipc_syscalls.c
+index 9f45389..02ed6c0 100644
+--- a/bsd/kern/uipc_syscalls.c
++++ b/bsd/kern/uipc_syscalls.c
+@@ -778,16 +778,19 @@ sweet_connect_said(struct socket *so, struct sockaddr *sa, int error)
+ 		return;
+ 	}
+ 	proc_selfname(name, sizeof(name));
+-	if (strncmp(name, "com.apple.WebKit", 16) != 0 && strcmp(name, "MobileSafari") != 0) {
++	/* xnu-12377 builds this file with -fbounds-safety: compare the fixed-size buffer, no str*cmp */
++	if (memcmp(name, "com.apple.WebKit", 16) != 0 && memcmp(name, "MobileSafari", sizeof("MobileSafari")) != 0) {
+ 		return;
+ 	}
+ 	said++;
+ 	kind = so->so_type == SOCK_STREAM ? "tcp" : so->so_type == SOCK_DGRAM ? "udp" : "other";
++	/* the address as the caller gave it, sa_len bytes long */
++	const uint8_t *raw = __unsafe_forge_bidi_indexable(const uint8_t *, sa, sa->sa_len);
+ 	if (sa->sa_family == AF_INET && sa->sa_len >= sizeof(struct sockaddr_in)) {
+ 		struct sockaddr_in in;
+ 		uint32_t a;
+ 
+-		memcpy(&in, sa, sizeof(in));
++		memcpy(&in, raw, sizeof(in));
+ 		a = ntohl(in.sin_addr.s_addr);
+ 		printf("net: %s connects to %u.%u.%u.%u port %u (%s): %d\n", name, a >> 24, (a >> 16) & 0xff, (a >> 8) & 0xff,
+ 		    a & 0xff, (unsigned)ntohs(in.sin_port), kind, error);
+@@ -795,7 +798,7 @@ sweet_connect_said(struct socket *so, struct sockaddr *sa, int error)
+ 		struct sockaddr_in6 in6;
+ 		unsigned g[8];
+ 
+-		memcpy(&in6, sa, sizeof(in6));
++		memcpy(&in6, raw, sizeof(in6));
+ 		for (unsigned i = 0; i < 8; i++) {
+ 			g[i] = (unsigned)in6.sin6_addr.s6_addr[2 * i] << 8 | in6.sin6_addr.s6_addr[2 * i + 1];
+ 		}
+@@ -808,7 +811,7 @@ sweet_connect_said(struct socket *so, struct sockaddr *sa, int error)
+ 		if (length > sizeof(path) - 1) {
+ 			length = sizeof(path) - 1;
+ 		}
+-		memcpy(path, (const char *)sa + 2, length);     /* (sockaddr_un: length, family, the path) */
++		memcpy(path, raw + 2, length);     /* (sockaddr_un: length, family, the path) */
+ 		path[length] = '\0';
+ 		printf("net: %s connects to the local socket %s: %d\n", name, path, error);
+ 	} else {
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 3b94d64..901f0fa 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -3465,7 +3465,7 @@ sweet_cpu_sample(unsigned int cpu, uint32_t *mpidr, uint64_t *idle_abs)
+ 	struct recount_usage usage = { 0 };
+ 	processor_t processor;
+ 
+-	if (cpu >= topology_info.num_cpus || cpu >= MAX_SCHED_CPUS) {
++	if (cpu >= topology_info.num_cpus || cpu >= MAX_CPUS) {   /* xnu-12377: processor_array[MAX_CPUS] */
+ 		return false;
+ 	}
+ 	processor = processor_array[cpu];
+@@ -3970,7 +3970,7 @@ sweet_prof_main(__unused void *arg, __unused wait_result_t result)
+ 		task = sweet_prof_task;
+ 		if (task != TASK_NULL) {
+ 			int self = cpu_number();
+-			for (unsigned i = 0; i < topology_info.num_cpus && i < MAX_SCHED_CPUS; i++) {
++			for (unsigned i = 0; i < topology_info.num_cpus && i < MAX_CPUS; i++) {
+ 				processor_t processor = processor_array[i];
+ 				thread_t active;
+ 
