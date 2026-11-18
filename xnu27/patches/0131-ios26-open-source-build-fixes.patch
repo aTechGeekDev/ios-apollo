@@ -1,0 +1,103 @@
+IOS-26-Hot 0131 (d249939b) without its sections for bsd/dev/sweet_gpu.c and bsd/dev/sweet_pmem.c, which are
+that project's Pixel 4 files; project-BadApple's own sweet_gpu.c gets the same include fix in 1900.
+
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index eee65bd..a142adb 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -34,7 +34,7 @@
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+-#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 1116ace..3debd7e 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -19,7 +19,7 @@
+ #include <machine/machine_routines.h>
+ #include <arm/caches_internal.h>
+ #include <vm/pmap.h>
+-#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/locks.h>
+ #include <sys/kpi_mbuf.h>
+diff --git a/bsd/net/necp_client.c b/bsd/net/necp_client.c
+index 37885ae..8361634 100644
+--- a/bsd/net/necp_client.c
++++ b/bsd/net/necp_client.c
+@@ -76,7 +76,9 @@
+ 
+ #include <os/refcnt.h>
+ 
++#if !defined(SWEET)
+ #include <CodeSignature/Entitlements.h>
++#endif /* !SWEET: this file uses no CodeSignature declarations. */
+ 
+ #if SKYWALK
+ #include <skywalk/os_skywalk_private.h>
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 8861fea..13c817e 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -222,6 +222,7 @@ WARNFLAGS_STD := \
+ 	-Wno-ms-bitfield-padding \
+ 	-Wno-partial-availability \
+ 	-Wno-reserved-id-macro \
++	-Wno-reserved-identifier \
+ 	-Wno-shift-sign-overflow \
+ 	-Wno-switch-enum \
+ 	-Wno-unaligned-access \
+@@ -407,6 +408,11 @@ ifdef RC_NONARCH_CFLAGS
+ OTHER_CFLAGS = $(RC_NONARCH_CFLAGS)
+ endif
+ 
++ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
++# The standalone AMFI shim uses CEAcquireUnmanagedContext.
++OTHER_CFLAGS += -DCORE_ENTITLEMENTS_I_KNOW_WHAT_IM_DOING
++endif
++
+ #
+ # Debug info
+ #
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index a8cc5f0..1854dad 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -942,7 +942,7 @@ cpu_start(int cpu)
+ 		CleanPoC_DcacheRegion_Force((vm_offset_t)cpu_data_ptr, sizeof(cpu_data_t));
+ 		CleanPoC_DcacheRegion_Force((vm_offset_t)&ResetHandlerData, sizeof(ResetHandlerData));
+ 		CleanPoC_DcacheRegion_Force((vm_offset_t)BootArgs, sizeof(*BootArgs));
+-		CleanPoC_DcacheRegion_Force((vm_offset_t)&sysreg_restore, sizeof(sysreg_restore));
++		/* XNU 26 start.s programs TCR/MAIR directly; no sysreg_restore table. */
+ 		CleanPoC_DcacheRegion_Force((vm_offset_t)&cpu_ttep, sizeof(cpu_ttep));
+ 		CleanPoC_DcacheRegion_Force((vm_offset_t)bootstrap_pagetables, BOOTSTRAP_TABLE_SIZE);
+ 		__builtin_arm_dsb(DSB_SY);
+diff --git a/pexpert/pexpert/arm64/apple_arm64_cpu.h b/pexpert/pexpert/arm64/apple_arm64_cpu.h
+index e462ede..8f2e309 100644
+--- a/pexpert/pexpert/arm64/apple_arm64_cpu.h
++++ b/pexpert/pexpert/arm64/apple_arm64_cpu.h
+@@ -32,6 +32,7 @@
+ 
+ #include <stdbool.h>
+ #include <sys/cdefs.h>
++#include <pexpert/arm64/apple_arm64_regs.h>
+ 
+ /**
+  * Defines the core type of the executing CPU.
+@@ -50,7 +51,9 @@ __enum_closed_decl(arm64_core_type_t, unsigned int, {
+ static inline arm64_core_type_t
+ arm64_core_type(void)
+ {
+-#ifdef __arm64__
++#if defined(SWEET)
++	return P_CORE;
++#elif defined(__arm64__)
+ 	return (arm64_core_type_t)((__builtin_arm_rsr64("MPIDR_EL1") >> MPIDR_CORETYPE_SHIFT) & MPIDR_CORETYPE_MASK);
+ #else
+ 	/**

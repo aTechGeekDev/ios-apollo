@@ -12,14 +12,15 @@ translation", as Scion does) and the kernel emulates what is left. Built by `.gi
 | --- | --- | --- |
 | `0000`, `0001`, `0019`, `0020`, `0026`, `0058` `.sh` | Staging: CoreEntitlements v2 headers (stand-in KDK), TrustCache headers, libpthread-539.100.4, BearSSL, hfs-715.120.4, IOHIDFamily-2238.120.5; each fetched at a pinned commit and checked | IOS-26-Hot `xnu/patches-26` at d249939b |
 | `0003`-`0081` | The SWEET baseline on xnu-12377 (the same patches as our `xnu/patches` 0001-0081 on xnu-8796, rebased) | IOS-26-Hot d249939b |
-| `0129`, `0130`, `0133`, `0135`, `0140`, `0141` | Generic iOS 26 changes: arm64e Mach-O exec and the shared region, the ARMv8.3/8.4 PAC instruction emulator in `sleh.c`, the production fuse query, the kmem RNG board guard, IPC service ports, the IOMobileFramebuffer swap layout | IOS-26-Hot d249939b |
+| `0129`, `0130`, `0131`, `0133`, `0135`, `0140`, `0141` | Generic iOS 26 changes: arm64e Mach-O exec and the shared region, the ARMv8.3/8.4 PAC instruction emulator in `sleh.c`, the open-source build fixes (0131, without its two Pixel 4 file sections: `sysreg_restore`, the CoreEntitlements define, `vm_kern_xnu.h` includes), the production fuse query, the kmem RNG board guard, IPC service ports, the IOMobileFramebuffer swap layout | IOS-26-Hot d249939b |
 | `0900` | iOS 27 (Darwin 26) system calls in slots xnu-12377 leaves `nosys`: `pipe2`, `dup3`, `fchflagsat`, `getumask`, `aio_readv`/`aio_writev` (ENOTSUP), `fsctlat`, `guarded_ftruncate_np` | UniXNU `patches/xnu-12377/darwin26-syscalls.patch` at be2cb0c7 (BSD-2-Clause-Patent) |
 | `0901` | Shared-region slide capped so iOS 27's larger shared cache still maps | UniXNU `patches/xnu-12377/darwin26-shared-region.patch` at be2cb0c7 |
 | `1082`-`1186` | project-BadApple's apollo drivers and fixes: `xnu/patches` 0082-0186 with a leading 1, moved onto this base. 96 applied unchanged; re-ported by hand: `1128` (the Wi-Fi object's link line in `makedefs/MakeInc.def`), `1153` (its `machine_routines.c` block appended at the end of 12377's file; `1155`, `1160`, `1180`, `1186` then apply), `1181` (`IOKitInitializeTime`: 12377 has no `BCM2837` guard), `1177` (only its definitions: the three choice sites in 12377's restructured `sched_prim.c` are not ported yet, so XNU's own CPU order is used). Not carried: `0167` (xnu-12377 has `IORPC.kernelContent`). Generated at build time: `1999-generated-sweet-wlfw-ath11k.patch` (the QCA6390 WLFW messages, from Linux 7.0.14) | this repository |
+| `1900` | xnu-12377 build fixes for the apollo files, collected in one patch: so far `<vm/vm_kern_xnu.h>` for `kmem_alloc*`/`KMA_*` in sweet_adsp.c, sweet_gpu.c, sweet_sound.c, sweet_wifi.c (build 44306947678) | this repository |
 
 Not taken from IOS-26-Hot: its Pixel 4 (`flame`) and Realme X2 Pro (`rmx1931`) drivers (0083-0128 and later
 `flame-*`), whose file names collide with ours (`sweet_gpu.c`, `SweetAccelerator.cpp`, ...). Its other generic
-iOS 26 patches (0131 build fixes, 0132, 0134 firehose, 0136, 0137, 0138 PAC fast path, 0142 IOSurface ABI, 0148)
+iOS 26 patches (0132, 0134 firehose, 0136, 0137, 0138 PAC fast path, 0142 IOSurface ABI, 0148)
 also edit those phones' code; they are being split (NOTES.md, "iOS 27 TRACK") and join as their generic parts are
 resolved.
 

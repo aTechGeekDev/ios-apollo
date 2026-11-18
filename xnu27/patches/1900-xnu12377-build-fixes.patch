@@ -1,0 +1,56 @@
+xnu-12377 build fixes for project-BadApple's apollo files (1082-1186), one place for all of them.
+- kmem_alloc, kmem_alloc_contig and the KMA_* flags are declared in <vm/vm_kern_xnu.h> on xnu-12377
+  (run 44306947678: sweet_adsp.c, sweet_gpu.c, sweet_sound.c, sweet_wifi.c).
+
+diff --git a/bsd/dev/sweet_adsp.c b/bsd/dev/sweet_adsp.c
+index 70d0608..fbf99e8 100644
+--- a/bsd/dev/sweet_adsp.c
++++ b/bsd/dev/sweet_adsp.c
+@@ -85,7 +85,7 @@
+ #include <sys/systm.h>
+ #include <sys/vnode.h>
+ #include <sys/vnode_internal.h>
+-#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>   /* xnu-12377: kmem_alloc*, KMA_* moved here */
+ #include "hakios.audio.h"         /* apollo: this tree's, beside it */
+ #include "hakios.input.h"
+ #include "hakios.apollo_input.h"
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 4cf7c2d..b4e7ef6 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -119,7 +119,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <mach/vm_param.h>
+-#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>   /* xnu-12377: kmem_alloc*, KMA_* moved here */
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ 
+diff --git a/bsd/dev/sweet_sound.c b/bsd/dev/sweet_sound.c
+index e6149d2..028caa6 100644
+--- a/bsd/dev/sweet_sound.c
++++ b/bsd/dev/sweet_sound.c
+@@ -102,7 +102,7 @@
+ #include "hakios.apollo_input.h"   /* apollo: this tree's, beside it */
+ #include "hakios.apollo_audio.h"
+ #include "hakios.audio.h"
+-#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>   /* xnu-12377: kmem_alloc*, KMA_* moved here */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern uint64_t kvtophys(vm_offset_t va);
+diff --git a/bsd/dev/sweet_wifi.c b/bsd/dev/sweet_wifi.c
+index 04ac2d4..8a41582 100644
+--- a/bsd/dev/sweet_wifi.c
++++ b/bsd/dev/sweet_wifi.c
+@@ -54,7 +54,7 @@
+ #include <kern/thread.h>
+ #include <machine/machine_routines.h>
+ #include <mach/vm_param.h>
+-#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>   /* xnu-12377: kmem_alloc*, KMA_* moved here */
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>

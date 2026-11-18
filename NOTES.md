@@ -23,7 +23,10 @@
 **Builds:**
 - Run 44305848202 (base): cancelled by the next push.
 - Run 44306099719 (base + 0900/0901, commit 6912aef): still building when c50efed (apollo 1082-1186 + Wi-Fi steps) was pushed, so cancelled.
-- The next xnu27 run builds everything together. Its result is the first compile check of the whole series; read errors from its "Compile errors" step.
+- Run 44306947678 (465e97c, everything): all patches and staging applied in CI; the Wi-Fi object built. The BSD compile failed with 57 errors of 3 kinds, the build stopping before IOKit:
+  - `kmem_alloc*`/`KMA_*` need `<vm/vm_kern_xnu.h>` on 12377. Fixed by 1900 for our 4 files; 0131 fixes the base's.
+  - `sysreg_restore` in the base's cpu.c, and the CoreEntitlements `#error` reached from IOKitBSDInit.cpp via amfi.h: both are fixed by IOS-26-Hot 0131, now included without its two Pixel 4 file sections.
+  - The next run will reach IOKit (our Sweet*.cpp drivers), where more 12377 API errors are expected.
 
 **Not yet taken from IOS-26-Hot:** its other generic iOS 26 patches. They are tangled with its Pixel 4 / Realme files, which collide by name with ours (sweet_gpu.c, SweetAccelerator.cpp, ...).
 - **Conflict hunks**, measured by cherry-picking onto the base:
