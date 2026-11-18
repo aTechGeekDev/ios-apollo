@@ -19,7 +19,17 @@
 - **[Bergamota](https://github.com/ry-diffusion/bergamota):** iOS 18.7.8 to SpringBoard on an SDM845.
 - **[ios26-sweet](https://github.com/marnov999/ios26-sweet):** our lineage on 12377; preparation only.
 
-**iOS 27 itself on a CPU without PAC: nobody has published it** (darwin-lisa's survey, 2026-11-16: every UniXNU 27 board has PAC; garnet, the one without, "not bootable"). But per darwin-lisa:
+**UPDATE (same day, user: "hakios got it and some other ppl got it using PAC translation"; link https://hackios-web.vercel.app/en/changelog): iOS 27 on a CPU without PAC HAS been done, by Scion.**
+- **Where it isn't:** HakiOS's own changelog (that page and GitHub `CHANGELOG.md`) stops at 2.3.4 (2026-11-05), iOS 16.5 only, and has no iOS 27 or PAC entry. Upstream `oosexgang/hakios-xnu-kernel` has no iOS 27 branch (last commit 2026-11-06).
+- **Where it is: [Scion-Project/scion-kernel](https://github.com/Scion-Project/scion-kernel)** ("a fork of HakiOS"; cloned at 553a198, 2026-11-18):
+  - **Result:** iOS 27.0.1 (24A446, iPhone 11 `iPhone12,1` userland) "seen on a phone" on the Galaxy S9 (Exynos 9810: Mongoose M3 ARMv8.0 + Cortex-A55, no PAC). Home screen, 8 cores, touch, storage, GPU (OpenGL ES, or Metal with Liquid Glass); SpringBoard stable (`docs/ios27/AOT-REWRITE.md`, 9 Nov). Known: hard hangs some minutes in, slow in places.
+  - **PAC translation:** `tools/ios27/a64e/a64e-rewrite.py` rewrites arm64e to arm64 over the shared cache; `a64e-rewrite2` handles PACGA and LDRAA/LDRAB writeback; root step `10-macho-a64e` covers every arm64e Mach-O outside the cache; the kernel's `osfmk/arm64/sweet_a64e.c` emulates what is left ("STARLTE A64E 0 emulated" on the phone). libcorecrypto is skipped (its FIPS self-check hashes its own code).
+  - **Kernel:** `Scion-Project/xnu` branches `scion/xnu-12377` (27a3e12d) and `scion/xnu-12377-starlte` (56c907c4). It is an iPhoneOS-target xnu-12377 build (`docs/ios27/IOS27-TARGET.md`) with Darwin 27's system calls, the 8 GiB shared region (`0403`) and `ptrauth_disabled=1` for injected processes (`0324`).
+  - **Root build:** `docs/ios27/INSTALL-S9.md`, `FULLROOT.md`. Mac-based (`hdiutil`, `aea` for the encrypted DMGs); darwin-lisa did the decryption on Linux with `ipsw` 3.1.743 + apfs-fuse.
+  - **Licenses:** APSL-2.0 for the kernel and drivers, MIT/MIT-0 for tools and docs (`LICENSING.md`).
+- **For apollo our CPU is easier than the S9's M3:** the A77/A55 have LSE, FP16, DotProd, RDM and RCpc natively, so most of Scion's extra rewriting (LSE, FP16, LDAPR) is not needed; PAC plus a few ARMv8.3+ instructions (FJCVTZS, FCMA, LRCPC2, ...) remain (measure with featscan for Cortex-A77). Not verified here yet.
+
+**Before that update I wrote (darwin-lisa's survey, 2026-11-16):** nobody had published iOS 27 on a CPU without PAC; every UniXNU 27 board has PAC, and garnet, the one without, is "not bootable". Also per darwin-lisa:
 - **The same technique applies:** de-PAC does not depend on the iOS version.
 - **The CPU floor hasn't moved:** iOS 27 still supports the A13 (iPhone 11 gets 27.2.1).
 - **The kernel is the same:** UniXNU's "iOS 27" kernel is xnu-12377.121.6 + `darwin26-syscalls.patch` (pipe2, dup3, fchflagsat, getumask, aio_readv/writev, fsctlat, guarded_ftruncate_np) + `darwin26-shared-region.patch` (+ `darwin26-kpi.patch`, only for Apple kexts, which we don't load). Apple's own 27 kernel (xnu-13432) is not public.
