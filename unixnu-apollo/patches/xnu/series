@@ -1,0 +1,5 @@
+# Board patch paths, one per line in application order, relative to this directory.
+#
+# Empty in this stage: the apollo drivers are project-BadApple's xnu/patches 0082-0186 (repository
+# root), built into the SWEET kernel by .github/workflows/xnu.yml. See the OS profile's series and
+# porting.toml (area "packaging") for how they move here.

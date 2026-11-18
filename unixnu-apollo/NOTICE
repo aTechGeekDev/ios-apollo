@@ -1,0 +1,17 @@
+unixnu-apollo (project-BadApple's UniXNU device repository)
+
+Licenses, by file:
+
+- Files written for this directory (board.toml, feeds.toml, porting.toml, dts/, configs/, os-profiles/,
+  patches/xnu/series, scripts/apollo-adt.py, scripts/install-os-profile.sh, proprietary-files.txt,
+  local.toml.example, README.md, AGENTS.md, evidence/): MIT License, as the rest of project-BadApple
+  (../LICENSE).
+- scripts/package.sh and .github/workflows/porting-record.yml: copied unchanged from UniXNU's device
+  template (examples/device, templates/package.sh), BSD-2-Clause-Patent, Copyright 2026 UniXNU
+  contributors.
+
+Hardware facts credited in comments: Pistachio-Project/UniXNU-apollo and UniXNU-sm8250-common (DRAM
+banks and SoC description measured on a Mi 10T), Pistachio-Project/uefi-apollo (memory map, boot image
+values). Their files are not copied here; UniXNU-sm8250-common is fetched at the commit in feeds.toml.
+
+Not in this directory: any file of iOS, and the phone's firmware (proprietary-files.txt lists it).

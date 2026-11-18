@@ -1,0 +1,131 @@
+# unixnu-apollo image assembly, host check 2026-11-18 (Linux container; dtc 1.7.0, mtools 4.0.43, Ubuntu clang 18.1.3)
+# UniXNU 563595abedfdfa413ad583b66b6176d82007e633, uefi-apollo ab70992cdf353d7531df77649740bcce405365f4
+# The kernel is a 4 MiB stand-in file (random bytes), NOT a kernel: this checks the image path, not a boot.
+# Firmware blobs given to tools/mkadt.py are random stand-ins of plausible sizes; no Apple D22AP tree (no /product).
+
+$ UNIXNU_UNIQUE_CHIP_ID=5357454554000001 ./unixnu payload -D <ios-apollo>/unixnu-apollo --kernel <scratch>/standin-kernel.macho
+== submodules <UniXNU>
+== tree <UniXNU>/out/apollo/ios-16.7.16-20H392/apollo/tree
+== payload
+== kernel args: debug=0xc serial=3 cpumask=0xf1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 sweetfb_noconsole=1 sweetfb_height=2502 sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetgpulevel=6 sweetmtl=2 sweetwifi=12 apollo_audio=5 apollo_sound_gain=0 apollo_sound_below=80 apollo_mic=4 apollo_haptic=5 sweetbt=6 sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool sweetnull=backboardd,SpringBoard,bluetoothd,BlueTool,mediaserverd
++ /usr/bin/dtc -I dts -O dtb -o <UniXNU>/out/apollo/ios-16.7.16-20H392/apollo/device-tree/hardware.dtb -i <UniXNU>/out/feeds/UniXNU-sm8250-common-f14fb517/dts <ios-apollo>/unixnu-apollo/dts/apollo.dts
+== payload: <UniXNU>/out/apollo/ios-16.7.16-20H392/apollo/payload/payload.img (128 MiB)
+== next: run ./unixnu bootimg to pack this payload into the boot image
+exit 0
+
+$ mdir / mtype of payload.img
+KERNEL~1 MAC   4194304 1980-01-01   0:00  kernel.macho
+KERNEL~1 ADT     14132 1980-01-01   0:00  kernel.macho.adt
+version = 1
+[boot]
+timeout = 3
+default = "xnu"
+[kits]
+autoload = false
+[[entry]]
+id = "xnu"
+title = "iOS 16.7.16 (BadApple)"
+type = "xnu"
+path = "Payloads/kernel.macho"
+args = "debug=0xc serial=3 cpumask=0xf1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 sweetfb_noconsole=1 sweetfb_height=2502 sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetgpulevel=6 sweetmtl=2 sweetwifi=12 apollo_audio=5 apollo_sound_gain=0 apollo_sound_below=80 apollo_mic=4 apollo_haptic=5 sweetbt=6 sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool sweetnull=backboardd,SpringBoard,bluetoothd,BlueTool,mediaserverd"
+
+{
+  "kernel_sha256": "ae9ef3668f53258083b9199ff7058ad2bf65f3cb5049e04c2a8552a7ff925186",
+  "payload_kernel_sha256": "ae9ef3668f53258083b9199ff7058ad2bf65f3cb5049e04c2a8552a7ff925186",
+  "adt_sha256": "3e551ac6e75e5462f258ae0a744230f4421c643bb667d26325498cada09ebd31",
+  "kernel_args": "debug=0xc serial=3 cpumask=0xf1 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 ufslogsecs=1 sweetfb_noconsole=1 sweetfb_height=2502 sweetfb_hz=60 sweetgpu=22 sweetgpukeep=1 sweetgpulevel=6 sweetmtl=2 sweetwifi=12 apollo_audio=5 apollo_sound_gain=0 apollo_sound_below=80 apollo_mic=4 apollo_haptic=5 sweetbt=6 sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool sweetnull=backboardd,SpringBoard,bluetoothd,BlueTool,mediaserverd",
+  "trust_cache_sha256": null,
+  "gpu_addon_sha256": null,
+  "data_ramdisk_sha256": null,
+  "skip_setup": false,
+  "panic_screen": false,
+  "payload_sha256": "f5bf832ffde7b8d36e0f329ffcc8a8605417bae574b44a979b431ac1957b3ba4",
+  "payload_bytes": 134217728,
+  "hardware_tested": false
+}
+
+$ python3 tools/mkadt.py <scratch>/mkadt.adt --highmem --display-height 2502 --artwork-subtype 2556 --touch-fw ... --gmu-fw ... --sqe-fw ... --zap-mdt ... --zap-seg ... --wifi-fw <dir> --bt-fw <dir> --file /usr/local/lib/libsweet-bt.dylib=... --option apollo_rtc=1 --option sweetbattery=1
+(1581760 bytes; warning: d22ap.adt missing, no /product node)
+
+$ mcopy kernel.macho.adt out of payload.img; python3 unixnu-apollo/scripts/apollo-adt.py gap <generated> <scratch>/mkadt.adt
+nodes the SWEET kernel tree has and the generator does not (13):
+  /arm-io/gic: compatible, interrupt-controller, reg, virtual-timer-intid
+  /arm-io/wdt: no-pmu
+  /arm-io/disp0: canvas-height, canvas-width, compatible, device_type
+  /arm-io/wlan: compatible, device_type
+  /sweet-fbcon: height, reg, stride, width
+  /pram: reg
+  /sweet-ufs: compatible, reg
+  /sweet-touch: firmware
+  /sweet-gpu: gmu-firmware, sqe-firmware, zap-metadata, zap-segment
+  /sweet-wifi: amss, board, m3, regdb
+  /sweet-bt: nvm, patch
+  /sweet-options: apollo_rtc, sweetbattery
+  /sweet-files: file0
+properties missing in nodes both have (102):
+  /chosen mac-address-wifi0 (6 bytes)
+  /chosen mac-address-bluetooth0 (6 bytes)
+  /chosen mac-address-ethernet0 (6 bytes)
+  /cpus #address-cells (4 bytes)
+  /cpus #size-cells (4 bytes)
+  /cpus/cpu{0,1,2,3,4,5,6,7} cpu-id (4 bytes)
+  /cpus/cpu{0,1,2,3,4,5,6,7} cluster-id (4 bytes)
+  /cpus/cpu{0,1,2,3,4,5,6,7} cluster-type (4 bytes)
+  /cpus/cpu{0,1,2,3,4,5,6,7} die-cluster-id (4 bytes)
+  /cpus/cpu{0,1,2,3,4,5,6,7} cluster-core-id (4 bytes)
+  /cpus/cpu{0,1,2,3,4,5,6,7} l2-cache-id (4 bytes)
+  /cpus/cpu{0,1,2,3,4,5,6,7} l3-cache-id (4 bytes)
+  /cpus/cpu{0,1,2,3,4,5,6,7} clock-frequency (4 bytes)
+  /cpus/cpu{0,1,2,3,4,5,6,7} bus-frequency (4 bytes)
+  /cpus/cpu{0,1,2,3,4,5,6,7} memory-frequency (4 bytes)
+  /cpus/cpu{0,1,2,3,4,5,6,7} peripheral-frequency (4 bytes)
+  /cpus/cpu{0,1,2,3,4,5,6,7} fixed-frequency (4 bytes)
+  /arm-io compatible (16 bytes)
+properties both have with other values (21):
+  /chosen dram-base: SWEET 0x100000000 / generator 0x80000000
+  /chosen dram-size: SWEET 0xfff00000 / generator 0x200000000
+  /chosen firmware-version: SWEET 'sweet-shim' / generator 'unixnu-darwinboot'
+  /chosen system-firmware-version: SWEET 'sweet-shim' / generator 'unixnu-darwinboot'
+  /cpus/cpu{0,1,2,3} compatible: SWEET 'qcom,kryo470|ARM,v8' / generator 'arm,cortex-a55'
+  /cpus/cpu{1,2,3,4,5,6,7} state: SWEET 'stopped' / generator 'waiting'
+  /cpus/cpu{4,5,6,7} compatible: SWEET 'qcom,kryo470|ARM,v8' / generator 'arm,cortex-a77'
+  /arm-io device_type: SWEET 'sweet-io' / generator 'arm-io'
+  /arm-io ranges: SWEET <0x0 0x1000000 0xff000000> / generator <0x0 0x1000000 0x17000000>
+nodes only the generator writes (7): /chosen/manifest-properties, /psci, /arm-io/intc, /arm-io/ufshc, /arm-io/ufsphy, /options, /product
+
+$ cp payload.img <scratch>/payload-test.img; python3 unixnu-apollo/scripts/apollo-adt.py payload <scratch>/payload-test.img <scratch>/mkadt.adt
+apollo-adt.py: <tmp>/kernel.macho.adt: 1581804 bytes; window 0xc0000000+0x100000000, /pram 0x27ff00000
+apollo-adt.py: <scratch>/payload-test.img: kernel.macho.adt replaced; now run "unixnu bootimg"
+exit 0
+read back: identical to a standalone merge
+
+$ ./unixnu firmware -D <ios-apollo>/unixnu-apollo --uefi <uefi-apollo> --target RELEASE   (tail of the earlier run)
+== firmware: uefi-apollo
+== firmware: initializing submodules of the Mu-Silicium checkout
+== firmware: building BaseTools
++ build -p Platforms/Xiaomi/apolloPkg/apollo.dsc -a AARCH64 -b RELEASE -t CLANGPDB -n 4 -D FD_BASE=0x9fc00000 -D FD_SIZE=0x300000 -D FD_BLOCKS=768 -D ENABLE_SECUREBOOT=0 -D DEVICE_MODEL=0 -D MEMORY_PROTECTION=TRUE -D SHIP_MODE=FALSE -D BUILDID_STRING=apollo-badapple
+== firmware: <uefi-apollo>/Build/apolloPkg/RELEASE_CLANGPDB/FV/SILICIUM_UEFI.fd
+exit 0
+SILICIUM_UEFI.fd sha256 fde1abcf5c0dfb65e4c02865f752521517e9f399a02c961364b85e9684de6a50, 3145728 bytes
+
+$ ./unixnu bootimg -D <ios-apollo>/unixnu-apollo --uefi <uefi-apollo> --dtb <uefi-apollo>/Resources/DTBs/apollo.dtb --target RELEASE
+== ramdisk: <UniXNU>/out/apollo/ios-16.7.16-20H392/apollo/payload/payload.img (use --ramdisk none for an empty one)
+== bootimg
+== bootimg: <UniXNU>/out/apollo/ios-16.7.16-20H392/apollo/boot/boot.img (136153088 bytes)
+{
+  "kernel_sha256": "c16c7ad3090e2ca855656a158627be67a0105a00e743e31b8ff3a72d22f5458a",
+  "ramdisk_bytes": 134217728,
+  "header_version": 1,
+  "kernel_address": "0x10008000",
+  "tags_address": "0x10000100",
+  "ramdisk_encoding": "none",
+  "ramdisk_decoded_bytes": 134217728,
+  "image_sha256": "f8c5683a8642b9fdc94d3712501765fac86300b98089d9e1f5edc27e09d402d7",
+  "image_bytes": 136153088,
+  "fd_sha256": "fde1abcf5c0dfb65e4c02865f752521517e9f399a02c961364b85e9684de6a50",
+  "dtb_sha256": "02d50e3b02bc5084a826c8a8bf2ecf9c435b8f88bbc43986e8afbc83f1a97ffd",
+  "shim_bytes": 192,
+  "hardware_tested": false,
+  "compatibility": {},
+  "selected_fd_sha256": "fde1abcf5c0dfb65e4c02865f752521517e9f399a02c961364b85e9684de6a50"
+}

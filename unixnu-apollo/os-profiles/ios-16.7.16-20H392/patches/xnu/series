@@ -1,0 +1,9 @@
+# iOS 16.7.16 (xnu-8796.141.3) kernel patches, in application order, relative to this directory.
+#
+# Empty in this stage. project-BadApple's own series (xnu/patches 0001-0186 at the repository root,
+# with its staging scripts 0019/0020/0026 and the generated ath11k objects) is applied by
+# .github/workflows/xnu.yml through darwin-xnu-build, and the kernel reaches the payload with
+# "unixnu payload --kernel". Moving it here means splitting it the UniXNU way: 0001-0081 (the ios-sweet
+# baseline: toolchain, machine config, platform expert, SMP, console) as this OS profile's series,
+# SM8250 platform operations into UniXNU-sm8250-common, and the apollo drivers 0082-0186 into
+# patches/xnu or components (porting.toml, area "packaging").

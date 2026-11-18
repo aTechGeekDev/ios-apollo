@@ -1,0 +1,89 @@
+// SPDX-License-Identifier: MIT
+// Xiaomi Mi 10T 5G / Mi 10T Pro 5G (apollo), SM8250: the board hardware description UniXNU compiles
+// (with UniXNU-sm8250-common's sm8250.dtsi) and turns into the ADT (scripts/unixnu/devicetree.py).
+//
+// Sources: [MEASURED] project-BadApple on the user's phone (NOTES.md, tools/mkadt.py, shim/);
+// [PISTACHIO] Pistachio-Project/UniXNU-apollo dts/apollo.dts, measured on a Mi 10T (M2007J3SY,
+// 8 GiB) on 2026-11-12; [UEFI] uefi-apollo ab70992 MemoryMapLib.c, the firmware this board boots.
+
+/dts-v1/;
+/include/ "sm8250.dtsi"
+
+/ {
+    model = "Xiaomi Mi 10T 5G (apollo)";
+    // The generator puts the OS profile's identity (D22AP, iPhone10,3) in front of these.
+    // "xiaomi,sweet" must stay: the SWEET kernel's platform expert matches only that string (xnu 0016).
+    compatible = "xiaomi,sweet", "xiaomi,apollo", "qcom,sm8250", "AppleARM";
+
+    // DRAM: 8 GiB. [PISTACHIO] the bootloader's memory node on an 8 GiB unit has three banks,
+    // 0x80000000 + 0x3bb00000, 0xc0000000 + 0xc0000000 and 0x180000000 + 0x100000000; the generator
+    // takes one contiguous range, so the hole is reserved below. [MEASURED] the user's phone runs the
+    // SWEET kernel in 0x1_00000000 + 4 GiB (mkadt.py --highmem, boots 28-125), which is RAM only on an
+    // 8 GiB unit: inferred 8 GiB, not read from the phone. A 6 GiB unit needs its own memory node.
+    memory@80000000 {
+        device_type = "memory";
+        reg = <0 0x80000000 2 0x00000000>;
+    };
+
+    reserved-memory {
+        #address-cells = <2>;
+        #size-cells = <2>;
+        ranges;
+
+        // Not DRAM: the gap between the bootloader's first and second banks [PISTACHIO].
+        dram_hole: dram-hole@bbb00000 { reg = <0 0xbbb00000 0 0x4500000>; no-map; };
+        // Firmware carve-outs, as the UEFI memory map reserves them [UEFI].
+        hyp_mem: hyp@80000000 { reg = <0 0x80000000 0 0x600000>; no-map; };
+        // AOP command DB: sweet_rpmh.c reads it here (xnu 0126) [MEASURED].
+        cmd_db: reserved-memory@80860000 { reg = <0 0x80860000 0 0x20000>; no-map; };
+        smem_mem: smem@80900000 { reg = <0 0x80900000 0 0x200000>; no-map; };
+        tz_apps: tz-apps@82400000 { reg = <0 0x82400000 0 0x3a00000>; no-map; };
+        // Peripheral images (the audio DSP's among them: sweet_adsp.c, xnu 0138).
+        pil_mem: pil@86000000 { reg = <0 0x86000000 0 0xd200000>; no-map; };
+        // The panel's framebuffer, left running by the firmware: 1080x2400 a8r8g8b8, stride 4320.
+        // [MEASURED] live FDT cont_splash_region 0x2300000; [UEFI] "Display Reserved" 0x2400000.
+        splash_region: splash_region@9c000000 {
+            reg = <0 0x9c000000 0 0x2400000>;
+            label = "cont_splash_region";
+        };
+        // ABL's kernel window: the boot image (BootShim, firmware volume, payload ramdisk) lands here [UEFI].
+        abl_kernel: abl-kernel@a0000000 { reg = <0 0xa0000000 0 0x10000000>; no-map; };
+        // The kernel panic log (/pram, 1 MiB): the top of DRAM, outside DarwinBoot's window, which takes
+        // the lowest free run of owned_memory_size (DarwinBoot AllocateWindow). scripts/apollo-adt.py
+        // points /pram here (--pram) until the SWEET kernel takes it from this node.
+        panic_log: pram@27ff00000 { reg = <2 0x7ff00000 0 0x100000>; no-map; };
+    };
+};
+
+// All eight cores [MEASURED]: MPIDR Aff1 0-7 (mkadt.py cpu reg = core << 8), cores 0-3 Cortex-A55 and
+// 4-7 Cortex-A77 (xnu 0177 sweet_little_cpus: Aff1 < 4). The SWEET kernel runs them as one SMP cluster
+// (cluster-type 0 in mkadt.py), so the
+// SoC DTSI's E/P cluster types are removed here; xnu-8796 then takes CLUSTER_TYPE_SMP.
+&cpu0 { /delete-property/ unixnu,cluster-type; };
+&cpu1 { /delete-property/ unixnu,cluster-type; };
+&cpu2 { /delete-property/ unixnu,cluster-type; };
+&cpu3 { /delete-property/ unixnu,cluster-type; };
+&cpu4 { /delete-property/ unixnu,cluster-type; };
+&cpu5 { /delete-property/ unixnu,cluster-type; };
+&cpu6 { /delete-property/ unixnu,cluster-type; };
+&cpu7 { /delete-property/ unixnu,cluster-type; };
+
+// UFS: the iOS root is an HFS+ image in LUN 0's userdata partition (sda34), mounted with rd=ufsroot0
+// by sweet_ufs.c (xnu 0028), which today reads /sweet-ufs (0x1d84000 + 0x3000) [MEASURED].
+// Enabling the SoC's ufshc also sets the /arm-io window base to 0x01000000, the SOC_BASE the
+// SWEET kernel already uses (mkadt.py).
+&ufs { status = "okay"; };
+&ufsphy { status = "okay"; };
+
+// Board wiring the SWEET kernel drives today at fixed addresses (each named by its xnu patch). They
+// stay disabled here until a driver reads its node from the ADT instead:
+//   QUPv3 SE4 SPI 0x990000: Novatek NT36675 touch, RST gpio8, IRQ gpio9 (xnu 0082-0094, 0119).
+//   QUPv3 SE3 I2C 0x98c000: two CS35L41 amplifiers, with the audio DSP (xnu 0138-0139, from hakios-apollo).
+//   QUPv3 SE11 I2C 0xa8c000: AW8697 haptics, microphones (xnu 0146-0147).
+//   QUPv3 SE6 UART 0x998000, GPIO 16-19: QCA6390 Bluetooth, BT_EN GPIO 21, 115200 then 921600 baud
+//         (xnu 0136-0137, 0141-0143, 0145).
+//   PCIe0 + apps SMMU stream 0x1c01: QCA6390 Wi-Fi, ath11k (xnu 0126-0133, 0135).
+//   GPU: Adreno 650, GMU, gpu SMMU (xnu 0096-0112, 0163, 0169-0186 with Turnip/Metal).
+//   DPU INTF_1 / DSI0: the panel and page flips (xnu 0125, 0148-0152, 0156); backlight (0151, 0154).
+//   EPSS cpufreq (xnu 0095, 0098, 0153). SPMI: PM8150B battery and charger (xnu 0182), PM8150L torch,
+//         RTC and PSCI power-off (0181).

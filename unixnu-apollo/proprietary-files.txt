@@ -1,0 +1,24 @@
+# Required firmware inputs: relative path | source on the phone | SHA-256 | consumer
+# Paths are relative to .cache/firmware (ignored by git). project-BadApple's pull scripts (tools/pull-*-fw.sh,
+# tools/pull-mic-haptic-fw.sh, tools/nvt-fw-find.py) copy them from the phone (recovery or Android, adb)
+# into ~/ios-apollo/research/; link that folder as .cache/firmware or copy the files. No file listed here
+# is in any repository. "unmeasured": the hash on the user's phone is not recorded yet
+# (sha256sum .cache/firmware/<path>); Pistachio-Project/UniXNU-apollo lists hashes of another Mi 10T.
+# The SWEET kernel takes these through tools/mkadt.py (ADT nodes) or the iOS root (/usr/local/fw).
+
+touch/novatek_nt36675_j3s_fw01.bin | the phone's touch firmware (tools/nvt-fw-find.py) | unmeasured | NT36675 touch, /sweet-touch firmware (xnu 0093)
+gpu/a650_gmu.bin | /vendor/firmware/a650_gmu.bin (tools/pull-gpu-fw.sh) | unmeasured | Adreno 650 GMU, /sweet-gpu gmu-firmware (xnu 0100)
+gpu/a650_sqe.fw | /vendor/firmware/a650_sqe.fw | unmeasured | Adreno 650 SQE microcode, /sweet-gpu sqe-firmware (xnu 0102)
+gpu/a650_zap.mdt | /vendor/firmware/a650_zap.mdt | unmeasured | GPU zap shader metadata, /sweet-gpu zap-metadata (xnu 0105)
+gpu/a650_zap.b02 | /vendor/firmware/a650_zap.b02 | unmeasured | GPU zap shader segment, /sweet-gpu zap-segment (xnu 0105)
+wifi/amss20.bin | /vendor/firmware_mnt/image/amss20.bin (tools/pull-wifi-fw.sh) | unmeasured | QCA6390 Wi-Fi firmware, /sweet-wifi amss (xnu 0126)
+wifi/m3.bin | /vendor/firmware_mnt/image/m3.bin | unmeasured | QCA6390 M3 image, /sweet-wifi m3 (xnu 0127)
+wifi/regdb.bin | /vendor/firmware_mnt/image/regdb.bin | unmeasured | QCA6390 regulatory database, /sweet-wifi regdb (xnu 0127)
+wifi/bd_j3sgl.elf | /vendor/firmware_mnt/image/bd_j3sgl.elf | unmeasured | QCA6390 board data (apollo global), /sweet-wifi board (xnu 0127)
+bt/htbtfw20.tlv | /vendor/bt_firmware/image/htbtfw20.tlv (tools/pull-bt-fw.sh) | unmeasured | QCA6390 Bluetooth patch, /sweet-bt patch (xnu 0136)
+bt/htnv20.bin | /vendor/bt_firmware/image/htnv20.bin | unmeasured | QCA6390 Bluetooth NVM, /sweet-bt nvm (xnu 0136)
+audio/adsp.mdt | /vendor/firmware_mnt/image/adsp.mdt (tools/pull-audio-fw.sh) | unmeasured | audio DSP, root /usr/local/fw (xnu 0138)
+audio/adsp.b00 .. adsp.bNN | /vendor/firmware_mnt/image/adsp.b* | unmeasured | audio DSP segments, root /usr/local/fw (xnu 0138)
+audio/aw8697_haptic.bin | /vendor/firmware/aw8697_haptic.bin (tools/pull-mic-haptic-fw.sh) | unmeasured | AW8697 haptics (xnu 0146)
+audio/acdb/*_cal.acdb | /vendor/etc/acdbdata/<board>/*_cal.acdb | unmeasured | microphone calibration source (tools/acdb-mic.py, xnu 0146)
+ipsw/d22ap.adt | DeviceTree.d22ap.im4p of the 20H392 IPSW (tools/remotezip.py, ipsw img4 im4p extract) | unmeasured | /product and /product/haptics of the iPhone X (tools/mkadt.py)

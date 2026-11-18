@@ -2,6 +2,62 @@
 
 ## Agent handoff / active work
 
+### >>> UNIXNU PORT STARTED (2026-11-18, user: "https://unixnu.com/porting/ start porting this"; branch claude/awesome-einstein-qskxih) <<<
+
+**What UniXNU is (read on unixnu.com / github.com/UniXNU/UniXNU docs, at 563595ab):** a UEFI boot chain for iOS/macOS on non-Apple ARM64. The stock ABL boots BootShim + a Mu-Silicium firmware volume, which starts UniXNU.efi. That reads `EFI/UniXNU/unixnu.toml` from the payload ramdisk and hands the kernel and its ADT sidecar to DarwinBoot, which enters XNU. Device repos are "format 2": board.toml, a DTS that a common generator turns into the ADT, a pinned SoC repo, an OS profile and porting.toml. UniXNU's own kernels prelink Apple's original kexts, which ours does not.
+
+**Already there (observed in their repos, not ours):**
+- **Pistachio-Project (enesuzun2002, hakios-apollo's author):**
+  - `UniXNU-apollo`: iOS 16.5 on xnu-8796.121.2; on the phone the kernel reaches `bsd_init` (2026-11-13). Its NOTICE credits this repo for Bluetooth.
+  - `UniXNU-sm8250-common`: SoC DTSI.
+  - `uefi-apollo`: its RELEASE firmware reaches the UniXNU menu on a Mi 10T (M2007J3SY, 2026-11-12).
+- **Other ports:**
+  - devices.toml lists 12 boards with an `ios-16.7.16-20H392` profile.
+  - dragon120820/UniXNU-enchilada uses the same approach as here: the ios-sweet "SWEET" kernel with prelink skipped.
+
+**Done (this session; nothing booted):**
+- **`unixnu-apollo/`**, a format 2 device repo inside this repo; it can later be split out with `git subtree split --prefix=unixnu-apollo`.
+  - **Pins:** SoC Pistachio sm8250-common 13f1d873; OS profile `os-profiles/ios-16.7.16-20H392` (iPhone X identity, xnu-8796.141.3 1b191cb5), linked into UniXNU by `scripts/install-os-profile.sh`.
+  - **Components:** only DarwinBoot.
+  - **Firmware:** uefi-apollo ab70992.
+  - **Payload:** boot 125's command line (567 bytes); 4 GiB DarwinBoot window; chip-id 0x8015 with seed 5357454554000001, so IOPlatformUUID and the root's ByHost prefs stay the same.
+  - **DTS:** 8 GiB at 0x80000000 with UEFI's carve-outs reserved, CPUs without E/P (one SMP pset), UFS enabled; `/arm-io` base comes out 0x01000000 = our SOC_BASE.
+- **Decision: the kernel stays ours.** It is the SWEET kernel from xnu.yml (0001-0186), handed over with `unixnu payload --kernel`. UniXNU's arch series is not used: our 0001-0081 are the same layer (enchilada measured 151/184 rejects).
+- **`unixnu-apollo/scripts/apollo-adt.py`:**
+  - `gap`: lists what our kernel reads and UniXNU's generator does not write (the migration worklist).
+  - `payload`: puts mkadt.py's tree plus DarwinBoot's `darwinboot-memory-size` and memory-map placeholders into payload.img; sets `dram-base`/`dram-size` to the window (`--window`, default 0xc0000000:0x100000000) and `/pram` to 0x27ff00000 (`--pram`); refuses a command line ≥ 608 bytes.
+- **CI: `.github/workflows/unixnu.yml`** (Linux): resolve, record check, DTS → ADT, gap report.
+- **Environment:** at the user's request ("allow everything to resolve") this cloud environment's network is now unrestricted (it was limited; unixnu.com was blocked).
+
+**Host results (observed here; logs in `unixnu-apollo/evidence/host/`):**
+- `./unixnu defconfig/fetch/status/tree`: exit 0; layers arm64 → sm8250 → ios-16.7.16-20H392 → device.
+- `porting-record.py check`: "apollo: 13 structured areas checked".
+- `unixnu payload` with a 4 MiB stand-in kernel: 128 MiB BADAPPLE FAT volume.
+- `apollo-adt.py payload`: ADT replaced in place; reads back identical.
+- `unixnu firmware --target RELEASE` (uefi-apollo ab70992, clang 18): SILICIUM_UEFI.fd, sha256 fde1abcf…6a50.
+- `unixnu bootimg`: 136153088 bytes; header v1, kernel 0x10008000, ramdisk 0x11000000, page 2048.
+- **Gap with every mkadt.py firmware option given** (stand-in files; 13 nodes, 102 properties, 21 differing values):
+  - Nodes: `/arm-io/{gic,wdt,disp0,wlan}`, `/sweet-{fbcon,ufs,touch,gpu,wifi,bt,options,files}`, `/pram`.
+  - Properties: per-CPU ids, cluster and frequency props; `/chosen` MAC addresses.
+  - Differing values: `dram-base`/`dram-size`, CPU `state` waiting/stopped, `arm-io` `device_type`/`ranges`.
+
+**Facts read in source (not yet seen on the phone):**
+- DarwinBoot 3c757340:
+  - It needs an LC_UNIXTHREAD of 288 bytes, flavor 6; our kernel has one.
+  - It places the window at the lowest free run. Predicted ~0xc0000000 from uefi-apollo's memory map, which differs from shim's 0x1_00000000.
+  - It writes Darwin 23 boot_args (1024-byte command line). xnu-8796 reads 608 bytes, and its memSizeActual at 0x2d8 reads 0 (falls back to memSize).
+- xnu-8796 uses `/chosen` `dram-base`/`dram-size` only for `is_dram_addr()`: VM_WIMG_IO of DRAM becomes Device-GRE. That is why the bridge keeps dram = the window.
+- UniXNU's payload check now allows `/` and `:` in values (sweetinject passes), but not `;`.
+- The boot image header is Pistachio's measured v1 (base 0x10000000, page 2048). Our shim's v2 (base 0, page 4096, separate DTB) is the known-good fallback for the user's ABL.
+
+**Not done / next (concrete):**
+1. Build a real image on the PC (commands in `unixnu-apollo/README.md` "Build (host)": firmware, payload with `xnu/out/kernel.development.sweet`, `apollo-adt.py payload`, bootimg with `dtb/boot_unpacked/dtb`) and `fastboot boot` it. Expect the UniXNU menu, then DarwinBoot's large-type hand-off screen. Photograph `pa=`/`owned=` and the video line; rebuild with `--window` if `pa` ≠ 0xc0000000.
+2. If ABL refuses the v1 image: try `[bootimg.image]` = shim's v2 values.
+3. Measure the userdata (sda34) start/size and the firmware hashes; record them in porting.toml.
+4. Then shrink the gap one item at a time (first `/sweet-ufs` → `/arm-io/ufshc` in sweet_ufs.c).
+5. Later: split xnu/patches into OS (0001-0081) / SoC / device series so `./unixnu kernel` builds it.
+6. Publishing (own repo `UniXNU-apollo`, GitHub topic `unixnu`, devices.toml entry) needs a repo this session cannot create: the user's call.
+
 ### >>> REVIEW (2026-11-05, user: "look into everything for conflicts and bugs and fix"; Metal agent) <<<
 
 - **Git/CI:** main = this branch (no divergence); branch `claude/wonderful-allen-3gaupe` fully merged into main by the other agent; `claude/blissful-hypatia-6ut4kn` is the old Bluetooth branch (Oct 30), its work (0144/0145) already in main -- stale, not merged again. Patch series 0001-0186 contiguous; validate-repo passes; machine_routines.c and sched_prim.c (not series-created) checked separately against xnu-8796.141.3. Last builds green: xnu 41844548555 (0184), metal2 41845122846 (Turnip 0102 + LTO plug-in).

@@ -1,0 +1,168 @@
+schema_version = 2
+
+# UniXNU format 2 board for the Xiaomi Mi 10T 5G / Mi 10T Pro 5G (apollo, SM8250), migrated from
+# project-BadApple (this repository's xnu/, shim/ and tools/). Read README.md and porting.toml first.
+#
+# Stage of the migration (2026-11-18): the boot chain moves to UniXNU (Mu-Silicium UEFI -> UniXNU.efi ->
+# DarwinBoot) while the kernel stays project-BadApple's SWEET kernel (xnu-8796.141.3 + xnu/patches
+# 0001-0186, built by .github/workflows/xnu.yml) and is handed to the payload with --kernel. Nothing
+# in this file has booted on the phone yet; porting.toml says what is measured and what is planned.
+# Sources of the values: [MEASURED] on the user's Mi 10T by project-BadApple (NOTES.md), [PISTACHIO]
+# measured by Pistachio-Project/UniXNU-apollo on another Mi 10T (named in each comment), [UEFI] the
+# pinned uefi-apollo checkout.
+
+[board]
+name = "apollo"
+soc = "SM8250"
+soc_source = "sm8250"
+# The iPhone X userland project-BadApple runs. UniXNU reads OS profiles only from its own
+# profiles/os/: scripts/install-os-profile.sh links os-profiles/ios-16.7.16-20H392 there.
+os_profile = "ios-16.7.16-20H392"
+description = "Xiaomi Mi 10T 5G / Mi 10T Pro 5G (apollo), SM8250, iOS 16.7.16 with the project-BadApple kernel"
+kit = "apollo"
+
+[components]
+# Only what this stage uses. The SWEET kernel carries its own platform expert, CPU, UFS, display,
+# GPU, input, Wi-Fi, Bluetooth, audio and power drivers (xnu/patches), so no kernel-stage catalog
+# component is selected (an ordinary array replaces the SoC's ["ArmCpu", "ArmDTPlatform"]).
+# DarwinBoot is the UEFI loader built into the firmware volume.
+include = ["DarwinBoot"]
+
+[kernel]
+defconfig = "apollo_defconfig"
+config_fragments = ["arch:configs/common.config", "soc:configs/sm8250.config", "os:configs/ios.config"]
+# The arch series targets xnu-10063 and is a second implementation of the layer xnu/patches 0001-0081
+# already are (the ios-sweet baseline); it is not stacked on them (the same finding as
+# dragon120820/UniXNU-enchilada: 151 of 184 patches reject). The three series below are empty in this
+# stage: "./unixnu kernel" is not used, see patches/xnu/series.
+patch_series = ["soc:patches/xnu/series", "os:patches/xnu/series", "device:patches/xnu/series"]
+# No kernel-stage component, so no archive builder (an ordinary array replaces the inherited plan).
+archives = []
+
+[device_tree]
+source = "device:dts/apollo.dts"
+include_dirs = ["soc:dts"]
+
+[firmware]
+# The firmware checkout is Pistachio-Project/uefi-apollo (Mu-Silicium with apolloPkg), pinned in
+# local.toml.example / unixnu.local.toml (--uefi). Values from uefi-apollo ab70992 [UEFI]; this commit
+# reached the UniXNU menu on a Mi 10T (M2007J3SY) on 2026-11-12 [PISTACHIO].
+# FD: 0x9FC00000, 0x300000 bytes (Resources/Configs/apollo.toml).
+config = "apollo"
+dsc = "Platforms/Xiaomi/apolloPkg/apollo.dsc"
+fd = "Build/apolloPkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
+packages = ["{uefi}", "{uefi}/Platforms/Xiaomi", "{tree}/package", "{tree}/drivers/DarwinBoot", "{edk2}", "{uefi}/Common/Mu", "{uefi}/Common/Mu_OEM_Sample", "{uefi}/Silicon/Qualcomm", "{uefi}/Silicon/Silicium", "{uefi}/Silicium-ACPI", "{uefi}/Silicium-ACPI/Platforms/Xiaomi", "{uefi}/Silicium-ACPI/Silicon/Qualcomm"]
+# Binaries is Pistachio-Project/Device-Binaries (apollo's XBL drivers, extracted from the phone's XBL).
+submodules = ["Binaries", "Common/Mu", "Common/Mu_OEM_Sample", "Silicium-ACPI", "Silicon/Silicium/OpensslPkg/Library/OpensslLib/openssl"]
+patches = ["Resources/MuPatches/AsmMacroLib.patch", "Resources/MuPatches/Auth-Service.patch", "Resources/MuPatches/Boot-Manager.patch", "Resources/MuPatches/Timer.patch", "Resources/MuPatches/Usb-Bus.patch", "Resources/MuPatches/Gic-Spurious.patch"]
+
+[firmware.defines]
+ENABLE_SECUREBOOT = "0"
+DEVICE_MODEL = "0"
+MEMORY_PROTECTION = "TRUE"
+SHIP_MODE = "FALSE"
+BUILDID_STRING = "apollo-badapple"
+
+[bootimg]
+# The firmware DTB: the phone's own Android device tree, which shim/ already boots with
+# (tools/unpack_bootv2.py backup/boot.img dtb/boot_unpacked), or uefi-apollo Resources/DTBs/apollo.dtb.
+# Given at build time: [build] dtb in unixnu.local.toml, or --dtb.
+
+# Mu-Silicium's boot image values. With UniXNU's defaults (base 0, 4096-byte pages, tags at 0x1e00000)
+# apollo's ABL boots Android instead [PISTACHIO, 2026-11-12]. Note: the user's ABL takes shim/build.sh's
+# image every boot, which is a header v2 with base 0, 4096-byte pages, tags 0x100, ramdisk 0x1000000 and
+# a separate DTB at 0x1f00000 [MEASURED]; if these v1 values are refused on the user's phone, those are
+# the known-good alternative.
+[bootimg.image]
+header_version = 1
+base = 0x10000000
+kernel_offset = 0x8000
+ramdisk_offset = 0x01000000
+tags_offset = 0x100
+pagesize = 2048
+kernel_compression = "gzip"
+
+[payload]
+volume = "BADAPPLE"
+# The payload is the boot image's ramdisk and lands in ABL's 256 MiB kernel window at 0xA0000000
+# [UEFI MemoryMapLib "Kernel"]. ABL stalled receiving a 194 MiB boot image [PISTACHIO, 2026-11-13].
+# The SWEET kernel plus an ADT carrying firmware and root files (mkadt.py --files-from, up to 48 MiB)
+# needs more than Pistachio's 64 MiB; 128 MiB is a first value, not yet tried.
+size_mib = 128
+loader = "firmware"
+title = "iOS 16.7.16 (BadApple)"
+# Must equal the hardware DTS memory node (the generator checks it): 8 GiB from 0x80000000.
+dram_size = "0x200000000"
+timeout = 3
+# Boot 125's command line (NOTES.md, CURRENT BOOT COMMANDS), unchanged. UniXNU accepts up to 1000 bytes,
+# but xnu-8796 reads only BOOT_LINE_LENGTH = 608 bytes of boot_args: keep the joined line at 607 or
+# fewer (scripts/apollo-adt.py checks it). Options that do not fit go into the ADT (/sweet-options,
+# mkadt.py --option, xnu 0181/0186).
+kernel_args = [
+  "debug=0xc", "serial=3", "cpumask=0xf1", "keepsyms=1", "-enable_kprintf_spam", "-noprogress",
+  "rd=ufsroot0", "unentitled_ios_sim_launch=1", "ignition_level=1", "wdt_test=no_user_checkin",
+  "ufsrw=1", "rootrw=1", "launchd_unsecure_cache=1", "wdt=-1", "ufslogsecs=1",
+  "sweetfb_noconsole=1", "sweetfb_height=2502", "sweetfb_hz=60",
+  "sweetgpu=22", "sweetgpukeep=1", "sweetgpulevel=6", "sweetmtl=2", "sweetwifi=12",
+  "apollo_audio=5", "apollo_sound_gain=0", "apollo_sound_below=80", "apollo_mic=4", "apollo_haptic=5",
+  "sweetbt=6", "sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool",
+  "sweetnull=backboardd,SpringBoard,bluetoothd,BlueTool,mediaserverd",
+]
+
+[payload.adt]
+# The identity project-BadApple's root was set up with (tools/mkadt.py): chip-id of the A11 the iPhone X
+# userland expects, and the synthetic ECID 0x5357454554000001 ('SWEET' + 1) as the platform seed,
+# passed with --unique-chip-id / UNIXNU_UNIQUE_CHIP_ID. Both seed IOPlatformUUID: keeping them keeps
+# the existing root's ByHost preferences and its finished data migration.
+chip_id = "8015"
+unique_chip_id = "required"
+# DarwinBoot's window: 4 GiB, as shim/ gives the kernel today (mkadt.py --highmem).
+owned_memory_size = "0x100000000"
+
+# Board ADT values that the common generator can express (typed tables). The rest of what the SWEET
+# kernel reads is added by scripts/apollo-adt.py until it moves here, into the DTS or into the kernel.
+[adt.root.string]
+target-sub-type = "D22AP"
+manufacturer = "Apple Inc."
+
+[adt.chosen.string]
+firmware-version = "unixnu-darwinboot"
+system-firmware-version = "unixnu-darwinboot"
+
+[adt.chosen.u32]
+debug-enabled = 1
+embedded-panic-log-size = 0x100000
+# MobileGestalt's screen class (mkadt.py: scale 0 makes SpringBoard's display mode invalid).
+display-scale = 3
+
+[adt.chosen.bytes]
+# mkadt.py's fixed stand-in for iBoot's boot manifest hash: SHA-384 of b"sweet boot manifest".
+boot-manifest-hash = "5cbe36011d7d831515cdf1122a93ffcad48b05e9194388ad12e9752a1ae4a5a0b934008b37985301041d7e086fff5205"
+
+# Local boot policy (kern_csr.c), as mkadt.py: lp-sip0 0x6f, lp-sip1 1 (unsealed root).
+[adt.chosen.asmb.u64]
+lp-sip0 = 0x6f
+
+[adt.chosen.asmb.u32]
+lp-sip1 = 1
+
+[adt.defaults.u32]
+# keybagd reads the system bag as a plain plist (no effaceable storage on this phone).
+no-effaceable-storage = 1
+
+# The panel is an sRGB LCD: with the iPhone X's "P3" iOS picks deep-colour surfaces (boots 35/36).
+[adt.product.string]
+artwork-display-gamut = "sRGB"
+
+[adt.product.u32]
+oled-display = 0
+# 2556 (iPhone 14 Pro): the Dynamic Island (mkadt.py --artwork-subtype 2556, boot 104).
+artwork-device-subtype = 2556
+
+[package]
+# scripts/package.sh and scripts/install-os-profile.sh read this: the UniXNU checkout, relative to
+# this directory. Layout: ~/ios-apollo/unixnu-apollo and ~/UniXNU side by side with ~/ios-apollo.
+unixnu = "../../UniXNU"
+
+[package.defconfig]
+"ios-16.7.16-20H392" = "apollo_defconfig"

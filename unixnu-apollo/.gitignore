@@ -1,0 +1,7 @@
+/local.toml
+/build/
+/out/
+/.cache/
+__pycache__/
+*.pyc
+.DS_Store

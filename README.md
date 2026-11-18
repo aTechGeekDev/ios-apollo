@@ -354,6 +354,7 @@ None of these files are in git. Each tool runs with the phone in the temporary r
 | `userland/` | Programs for the phone: Mesa, the CoreAnimation bridge, the audio plug-in, the Bluetooth library, GPU tests ([details](userland/README.md)) |
 | `tools/` | Device tree builder, boot packer, iOS root builder, firmware pullers, log and crash tools |
 | `tools/root-files/` | One-boot file lists that add, move or remove files on the iOS root (e.g. `quiet-on.txt` / `quiet-max.txt`: switch off daemons that waste CPU) |
+| `unixnu-apollo/` | The port moving to [UniXNU](https://unixnu.com/porting/)'s UEFI boot chain (Mu-Silicium firmware → UniXNU → DarwinBoot) as a format 2 device repository: board, DTS, iOS 16.7.16 profile, ADT bridge, porting record. Builds on the host; not booted yet ([README](unixnu-apollo/README.md)) |
 | `site/` | The project website (status and documentation), published to GitHub Pages by `pages.yml` |
 | `.github/workflows/` | CI: the kernel, the iOS programs, and an analysis job for iOS's system libraries (nothing from Apple is stored) |
 | `NOTES.md` | The engineering log: every boot's result, current state, next steps |

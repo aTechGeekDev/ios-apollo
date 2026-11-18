@@ -1,0 +1,10 @@
+name: Device documentation
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  porting-record:
+    uses: UniXNU/UniXNU/.github/workflows/porting-record.yml@main

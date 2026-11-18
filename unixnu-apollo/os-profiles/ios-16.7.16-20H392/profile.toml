@@ -1,0 +1,80 @@
+# iOS 16.7.16 (20H392) OS profile for UniXNU, iPhone X (iPhone10,3 / D22AP) identity: the userland
+# project-BadApple runs on the Mi 10T (README.md, tools/build-ios-root.sh).
+#
+# UniXNU reads OS profiles only from its own profiles/os/: scripts/install-os-profile.sh links this
+# directory there until the profile is contributed upstream.
+#
+# Sources: the kernel tag is the one xnu/patches applies to (.github/workflows/xnu.yml, macOS 13.5) and
+# was checked out at the commit below (2026-11-18). The IPSW identity is the iPhone X restore image UniXNU
+# lists for iOS 16.7.16 (docs/guide/requirements.md) and tools/build-ios-root.sh downloads. The ADT
+# identity is what tools/mkadt.py has given every boot since boot 1; the full /product of the real
+# D22AP device tree is an Apple file and is not repeated here (mkadt.py reads it from the IPSW).
+# N1709/UniXNU-whyred carries a profile of the same name; its kernelcache pin and prelink roots are not
+# copied here because this board does not prelink (porting.toml, area "packaging").
+
+[os]
+name = "ios-16.7.16-20H392"
+darwin = "22.6.0"
+xnu_version = "8796.141.3"
+xnu_revision = "1b191cb58250d0705d8a51287127505aa4bc0789"
+driverkit_tag = "xnu-8796.141.3"
+trustcache_tag = "xnu-8796.141.3"
+abi = ["IOGPUFamily", "IOHIDFamily-2031.120.4", "IOMobileGraphicsFamily"]
+
+[ipsw]
+url = "https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw"
+product = "iPhone10,3"
+version = "16.7.16"
+build = "20H392"
+device_class = "d22ap"
+chip_id = 32789
+board_id = 6
+fetch = ["KernelCache", "DeviceTree", "StaticTrustCache"]
+
+# Identity of the iPhone X whose userland runs here (tools/mkadt.py): compatible[0] is hw.model /
+# hw.target, model is hw.machine / hw.product. The generator puts this compatible in front of the
+# board DTS's own entries.
+[adt.root.strings]
+compatible = ["D22AP", "iPhone10,3"]
+
+[adt.root.string]
+model = "iPhone10,3"
+target-type = "D22"
+
+[adt.chosen.string]
+osenvironment = "main"
+# libimg4 (cryptexd) aborts without it; A11 device trees say sha2-384.
+crypto-hash-method = "sha2-384"
+
+[adt.chosen.u32]
+# Security status of a dev-fused, undemoted board (0, 0, 1, 1): mobileactivationd takes its native
+# activated branch (mkadt.py). amfi-only-platform-code is NOT set: project-BadApple's boots run
+# ad-hoc signed programs and libraries outside the platform trust cache.
+certificate-production-status = 0
+effective-production-status-ap = 0
+certificate-security-mode = 1
+effective-security-mode-sep = 1
+
+[adt.product.string]
+product-name = "iPhone X"
+product-description = "iPhone X"
+artwork-device-idiom = "phone"
+artwork-display-gamut = "P3"
+compatible-device-fallback = "iPhone9,2"
+
+[adt.product.u32]
+artwork-device-subtype = 2436
+artwork-scale-factor = 3
+
+# MobileGestalt's HomeButtonType = /buttons home-button-type (D22AP: 2, no Home button).
+[adt.buttons.strings]
+button-names = ["volup", "voldown", "hold"]
+
+[adt.buttons.u32]
+home-button-type = 2
+opposed-power-vol-buttons = 1
+
+[userdata]
+# Disk images of this OS, in window order (the format of "unixnu userdata"). Not used by the apollo
+# board yet: its root is the HFS+ image tools/build-ios-root.sh writes to userdata.
+windows = [{ name = "OS", component = "OS" }, { name = "SystemOS", component = "Cryptex1,SystemOS", optional = true }]

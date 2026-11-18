@@ -1,0 +1,16 @@
+# Copy to local.toml (ignored by git) for machine-specific source overrides, for example a local
+# checkout of the SoC repository while editing it:
+#
+# [[source]]
+# kind = "soc"
+# name = "sm8250"
+# local = "../../UniXNU-sm8250-common"
+#
+# Build inputs (the firmware checkout, the phone's DTB, the platform seed) go in the UniXNU checkout's
+# unixnu.local.toml, [build] table (https://unixnu.com/reference/configuration#local-build-inputs):
+#
+# [build]
+# device = "../ios-apollo/unixnu-apollo"
+# uefi = "../uefi-apollo"                                  # Pistachio-Project/uefi-apollo at ab70992
+# dtb = "../ios-apollo/dtb/boot_unpacked/dtb"              # the phone's own Android DTB (tools/unpack_bootv2.py)
+# unique_chip_id = "5357454554000001"                      # project-BadApple's synthetic ECID (not secret)

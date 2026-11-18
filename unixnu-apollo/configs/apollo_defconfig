@@ -1,0 +1,10 @@
+# Kernel configuration: CONFIG_XNU_<NAME> becomes XNU_<NAME> for UniXNU's kernel build script.
+# Applied after arch:configs/common.config, soc:configs/sm8250.config and os:configs/ios.config.
+#
+# Not used in this stage: the kernel is project-BadApple's SWEET kernel (xnu.yml, MACHINE_CONFIG=SWEET,
+# KERNEL_CONFIG=DEVELOPMENT), handed to "unixnu payload --kernel". Its drivers are built in by its patch
+# series, not selected here.
+# CONFIG_XNU_ARM_DT_PLATFORM is not set
+# CONFIG_XNU_ARMCPU is not set
+# CONFIG_XNU_NATIVE_UFS is not set
+# CONFIG_XNU_NATIVE_ADRENO is not set

@@ -1,0 +1,244 @@
+schema_version = 1
+
+[device]
+name = "apollo"
+soc = "SM8250"
+os_profile = "ios-16.7.16-20H392"
+summary = "project-BadApple (iOS 16.7.16 of the iPhone X on the Mi 10T: home screen, touch, Metal on Turnip, Wi-Fi, Bluetooth, audio, haptics) moving to UniXNU's boot chain. Format 2 board, DTS and OS profile resolve; the payload builds; nothing has booted through UniXNU yet."
+
+[[area]]
+id = "configuration"
+status = "host-verified"
+components = ["DarwinBoot"]
+paths = ["board.toml", "feeds.toml", "configs/**", "os-profiles/**", "scripts/install-os-profile.sh", "unixnu.lock", ".github/**", ".gitignore", "local.toml.example", "NOTICE"]
+inputs = [
+  "UniXNU 563595abedfdfa413ad583b66b6176d82007e633 (2026-11-18); Pistachio-Project/UniXNU-sm8250-common 13f1d8739a742ebe93e7847b8547ab99bcde5b34; xnu-8796.141.3 (1b191cb58250d0705d8a51287127505aa4bc0789), the tag project-BadApple's xnu/patches applies to.",
+  "The iPhone X restore image iPhone10,3,iPhone10,6_16.7.16_20H392 (UniXNU's listed arm64 iOS target), the userland project-BadApple's root is built from.",
+]
+configuration = [
+  "board.toml: soc_source sm8250, os_profile ios-16.7.16-20H392 (os-profiles/, linked into UniXNU by scripts/install-os-profile.sh), components [DarwinBoot], empty archives, patch_series soc/os/device (all three empty in this stage).",
+  "[payload.adt] chip_id 8015 with the platform seed 5357454554000001: the identity tools/mkadt.py has always given, so IOPlatformUUID and the existing root's ByHost preferences stay the same.",
+]
+procedure = ["unixnu-apollo/scripts/install-os-profile.sh; then from UniXNU: ./unixnu defconfig apollo_defconfig -D <ios-apollo>/unixnu-apollo; ./unixnu fetch -D ...; ./unixnu status --json -D ...; ./unixnu tree -D ...; python3 scripts/porting-record.py check --device <ios-apollo>/unixnu-apollo."]
+findings = [
+  "status resolves arch (profiles/arch/arm64), SoC (UniXNU-sm8250-common), OS (ios-16.7.16-20H392) and device in that order, one component (DarwinBoot, firmware stage), an empty patch order, output out/apollo/ios-16.7.16-20H392/apollo/.",
+  "The arch series (xnu-10063) is not selected: project-BadApple's 0001-0081 are the ios-sweet baseline, a second implementation of the same layer (dragon120820/UniXNU-enchilada measured 151 of 184 rejects stacking them).",
+  "UniXNU reads OS profiles only from its own profiles/os/; the iOS 16.7.16 profile lives in os-profiles/ until it is contributed upstream (as Pistachio-Project/UniXNU-apollo does for iOS 16.5).",
+]
+completion = ["defconfig, fetch, status and tree resolve with pinned sources; status shows the four layers in order and the intended (empty) patch order."]
+limits = ["The kernel is not built by unixnu in this stage (area packaging); the defconfig and the three series are placeholders that say so."]
+next_action = ["Split xnu/patches into the OS series (0001-0081) and device/SoC patches, then build the kernel with ./unixnu kernel (area packaging)."]
+evidence = [
+  { kind = "host", command = "./unixnu defconfig apollo_defconfig; ./unixnu fetch; ./unixnu status --json; ./unixnu tree (-D unixnu-apollo)", revision = "563595abedfdfa413ad583b66b6176d82007e633", reference = "evidence/host/2026-11-18-resolve.txt", result = "Linux container, Python 3.13: all four commands exit 0; unixnu.lock written; status shows arm64, sm8250, ios-16.7.16-20H392 and device layers, component DarwinBoot, patch order empty." },
+]
+
+[[area]]
+id = "firmware"
+status = "host-verified"
+components = ["DarwinBoot"]
+paths = ["proprietary-files.txt", "board.toml"]
+inputs = [
+  "Pistachio-Project/uefi-apollo ab70992cdf353d7531df77649740bcce405365f4: Mu-Silicium apolloPkg with UniXNU, UniXNURamDiskDxe, DarwinBoot and the phone's prebuilt DiskIo/Partition drivers; Binaries = Pistachio-Project/Device-Binaries (apollo XBL drivers, BOOT.XF.3.2-00304-SM8250-2).",
+  "The phone's own Android DTB for the boot image (project-BadApple already extracts it: tools/unpack_bootv2.py backup/boot.img dtb/boot_unpacked), or uefi-apollo Resources/DTBs/apollo.dtb.",
+]
+configuration = ["[firmware] config apollo, apollo.dsc, FD 0x9FC00000 + 0x300000; [bootimg.image] header v1, base 0x10000000, pagesize 2048, ramdisk_offset 0x01000000, tags_offset 0x100, gzip (Mu-Silicium's values)."]
+procedure = ["./unixnu firmware -D unixnu-apollo --uefi ../uefi-apollo --target RELEASE; ./unixnu bootimg -D unixnu-apollo --uefi ../uefi-apollo --dtb <phone dtb>; fastboot boot out/apollo/ios-16.7.16-20H392/apollo/boot/boot.img."]
+findings = [
+  "Pistachio-Project measured on a Mi 10T (M2007J3SY, LineageOS ABL, 2026-11-12): uefi-apollo ab70992 RELEASE reaches the UniXNU menu from fastboot boot; UniXNU's default boot image header makes ABL boot Android instead, Mu-Silicium's values work; a firmware-only image needs a non-empty ramdisk.",
+  "DarwinBoot 3c757340 accepts an LC_UNIXTHREAD kernel (one 288-byte thread command, flavor 6), loads it at the start of a window it takes from the lowest free run of darwinboot-memory-size, and fills Darwin 23 boot_args (1024-byte command line, memSizeActual at 0x478). The SWEET kernel (xnu-8796, BOOT_LINE_LENGTH 608) reads the first 608 bytes; the bytes after a shorter line are zero, so its memSizeActual (0x2d8) reads 0 and xnu-8796 falls back to memSize.",
+]
+completion = ["The firmware builds, reaches the UniXNU menu on the user's phone, publishes the framebuffer and hands the payload's kernel to DarwinBoot."]
+limits = ["Built on the host only: the user's phone has never run this firmware (Pistachio-Project's menu result is from another Mi 10T).", "The host boot image used uefi-apollo's apollo.dtb and a stand-in kernel; proprietary-files.txt hashes are not measured on the user's phone yet."]
+next_action = ["Build the boot image with a real SWEET kernel and the phone's own DTB, fastboot boot it, photograph the UniXNU menu and the DARWINBOOT hand-off screen (window pa= and owned=)."]
+evidence = [
+  { kind = "host", command = "./unixnu firmware -D unixnu-apollo --uefi ../uefi-apollo --target RELEASE; ./unixnu bootimg -D unixnu-apollo --uefi ../uefi-apollo --dtb ../uefi-apollo/Resources/DTBs/apollo.dtb --target RELEASE", revision = "563595abedfdfa413ad583b66b6176d82007e633", reference = "evidence/host/2026-11-18-payload.txt", result = "uefi-apollo ab70992 with all six Mu patches applied: SILICIUM_UEFI.fd 3145728 bytes (sha256 fde1abcf...6a50); boot.img 136153088 bytes, header v1, kernel 0x10008000, ramdisk 0x11000000, tags 0x10000100, page 2048." },
+]
+
+[[area]]
+id = "cpu"
+status = "implemented"
+components = []
+paths = ["dts/apollo.dts"]
+inputs = ["Eight cores, MPIDR Aff1 0-7: 4 Cortex-A55 (0-3), 4 Cortex-A77 (4-7); GICv3 at 0x17a00000 / 0x17a60000, virtual timer INTID 27; EPSS cpufreq domains (UniXNU-sm8250-common sm8250.dtsi)."]
+configuration = ["dts/apollo.dts removes the SoC DTSI's unixnu,cluster-type from every CPU: the SWEET kernel is one SMP pset (xnu 0177), and xnu-8796 takes CLUSTER_TYPE_SMP when cluster-type is absent."]
+procedure = ["Boot with cpumask=0xf1 (boot 125's set) or without it for all eight; read SWEET CPUFREQ lines in the log."]
+findings = [
+  "Under project-BadApple's shim all eight cores run (xnu 0078 SMP), with EPSS frequency scaling and a 75 C cap (xnu 0095, 0153) and big cores first for busy threads (xnu 0177).",
+  "The generator writes state 'waiting' for secondary CPUs and no cpu-id, cluster-id, l2-cache-id or frequency properties; mkadt.py wrote 'stopped' and all of them. scripts/apollo-adt.py keeps mkadt.py's CPU nodes until the kernel is checked against the generator's.",
+]
+completion = ["Every enabled CPU reaches its entry checkpoint under DarwinBoot and timer/IPI handling works on each."]
+limits = ["Not booted through DarwinBoot yet."]
+next_action = ["After the first DarwinBoot hand-off, compare SWEET SMP's bring-up lines with boot 125's."]
+evidence = [
+  { kind = "source", reference = "https://github.com/aTechGeekDev/ios-apollo/blob/1f75f381e31da96de537653fbac2252d2eb80418/xnu/patches/0177-apollo-big-cores-first.patch", result = "SMP scheduling, cpufreq and the little-core map of the SWEET kernel (with 0078, 0095, 0153 in the same series)." },
+]
+
+[[area]]
+id = "memory"
+status = "planned"
+components = []
+paths = ["dts/**", "scripts/apollo-adt.py"]
+inputs = [
+  "DRAM 8 GiB (inferred: the SWEET kernel runs in 0x1_00000000 + 4 GiB on the user's phone, RAM only on an 8 GiB unit); bank layout measured by Pistachio-Project on an 8 GiB M2007J3SY: 0x80000000 + 0x3bb00000, 0xc0000000 + 0xc0000000, 0x180000000 + 0x100000000.",
+  "uefi-apollo's memory map: everything below 0xb0000000 reserved or used by the firmware (HYP, cmd-db, SMEM, TZ apps, PIL, display 0x9c000000, the FD at 0x9fc00000, ABL's kernel window 0xa0000000 + 256 MiB).",
+]
+configuration = [
+  "dts/apollo.dts: one memory node 0x80000000 + 8 GiB, reserved-memory for the hole and every firmware carve-out, and panic_log 0x27ff00000 + 1 MiB.",
+  "board.toml [payload.adt] owned_memory_size 0x100000000: DarwinBoot's window is 4 GiB, as shim/ gives the kernel today.",
+]
+procedure = ["unixnu payload, then scripts/apollo-adt.py payload PAYLOAD.img MKADT.adt --window BASE:SIZE --pram 0x27ff00000; read DarwinBoot's 'pa=' and 'owned=' on the hand-off screen."]
+findings = [
+  "xnu-8796 uses /chosen dram-base and dram-size only for gDramBase/gDramSize, i.e. is_dram_addr() in pmap's wimg_to_pte: a VM_WIMG_IO mapping of DRAM becomes Device-GRE instead of nGnRnE. mkadt.py gave the kernel window there, so firmware carve-outs (cmd-db, SMEM, PIL) stayed nGnRnE; the generator gives all of DRAM. scripts/apollo-adt.py keeps mkadt.py's meaning (dram = the window).",
+  "xnu-8796's check_for_panic_log maps /pram reg with ml_io_map_wcomb; without /pram the SWEET kernel hangs after kdp_core (mkadt.py). DarwinBoot chooses the window, so the log moves out of it: dts panic_log at the top of DRAM.",
+  "DarwinBoot takes the lowest free run of the window size; from uefi-apollo's map that is predicted to start near 0xc0000000 (not 0x1_00000000 as under shim/). Not observed yet.",
+]
+completion = ["The window DarwinBoot prints matches --window, the kernel's memory and the panic log do not overlap any firmware region, and each DMA engine works in the new window."]
+limits = ["Window placement and the top-of-DRAM panic region are predictions; a 6 GiB unit needs another memory node."]
+next_action = ["First hand-off: photograph DARWINBOOT's pa=/owned= line; rebuild with --window set to it if it differs from 0xc0000000:0x100000000."]
+evidence = []
+
+[[area]]
+id = "storage"
+status = "implemented"
+components = []
+paths = ["dts/apollo.dts"]
+inputs = ["UFS host 0x1d84000 + 0x3000 and PHY 0x1d87000 (sm8250.dtsi, enabled in dts/apollo.dts); the iOS root is an HFS+ image in LUN 0 userdata (sda34), written by tools/build-ios-root.sh; the kernel log ring is the last 4 MiB of userdata."]
+configuration = ["Boot arguments rd=ufsroot0 ufsrw=1 rootrw=1 ufslogsecs=1; /sweet-ufs is added by scripts/apollo-adt.py (mkadt.py) until sweet_ufs.c reads /arm-io/ufshc."]
+procedure = ["Boot, then tools/sweet-log-pull.sh from recovery: the log ring proves the root mount and writes."]
+findings = ["Under shim/ the SWEET kernel's UFS driver mounts the HFS+ root read-write from userdata on every boot since boot 1 (xnu 0028 and the ios-sweet UFS series).", "board.toml has no [userdata]: 'unixnu userdata' (APFS OS/SystemOS windows) is not used; the root stays the HFS+ image the user approved for userdata (2026-10-15)."]
+completion = ["Root: the HFS+ volume mounts and launchd starts under DarwinBoot. Persistence: writes survive reboot."]
+limits = ["The userdata GPT entry's LBAs are not recorded; DarwinBoot hand-off not tried."]
+next_action = ["From recovery: cat /sys/class/block/sda34/start /sys/class/block/sda34/size, record them; then the first DarwinBoot boot."]
+evidence = [
+  { kind = "source", reference = "https://github.com/aTechGeekDev/ios-apollo/blob/1f75f381e31da96de537653fbac2252d2eb80418/xnu/patches/0028-sweet-ufs-root-device.patch", result = "The UFS root device of the SWEET kernel (/sweet-ufs, rd=ufsroot0)." },
+]
+
+[[area]]
+id = "display"
+status = "implemented"
+components = []
+paths = ["dts/apollo.dts"]
+inputs = ["Panel 1080x2400 video-mode DSC (j3s), framebuffer 0x9c000000, stride 4320, DPU INTF_1; the firmware leaves it running (UEFI 'Display Reserved')."]
+configuration = ["sweetfb_height=2502 sweetfb_hz=60 sweetfb_noconsole=1; /arm-io/disp0 (canvas 1125x2502) and /sweet-fbcon come from scripts/apollo-adt.py (mkadt.py --display-height 2502); board.toml [adt.product] sRGB and artwork-device-subtype 2556 (Dynamic Island)."]
+procedure = ["Boot to the lock screen; read SWEET FB lines."]
+findings = ["Under shim/ iOS draws the whole UI, GPU-scaled into page-flipped buffers at 60 Hz (xnu 0148-0152, 0156, 0172-0173, 0185).", "DarwinBoot hands the GOP framebuffer in boot_args Video; whether uefi-apollo's GOP mode equals the SWEET framebuffer's 1080x2400 a8r8g8b8 is not checked."]
+completion = ["A known frame with the right geometry and colours under DarwinBoot, then the lock screen."]
+limits = ["Not booted through DarwinBoot."]
+next_action = ["Compare DARWINBOOT's video line (base, row, width, height, depth) with 0x9c000000, 4320, 1080, 2400, 32."]
+evidence = [
+  { kind = "source", reference = "https://github.com/aTechGeekDev/ios-apollo/blob/1f75f381e31da96de537653fbac2252d2eb80418/xnu/patches/0156-apollo-page-flip-no-tearing.patch", result = "The SWEET framebuffer with GPU-scaled page flips (with 0148-0152 and 0172-0185)." },
+]
+
+[[area]]
+id = "input"
+status = "implemented"
+components = []
+paths = ["dts/apollo.dts"]
+inputs = ["Novatek NT36675 on QUPv3 SE4 SPI (0x990000), RST gpio8, IRQ gpio9, firmware novatek_nt36675_j3s_fw01.bin; PM8150 power key and volume keys."]
+configuration = ["Touch firmware in /sweet-touch (mkadt.py --touch-fw) through scripts/apollo-adt.py."]
+procedure = ["Boot; touch and buttons on the lock screen."]
+findings = ["Under shim/ multitouch, the home gesture and the three buttons work (xnu 0082-0094, 0119)."]
+completion = ["Touches map to the display with stable IDs; buttons produce HID events, under DarwinBoot."]
+limits = ["Not booted through DarwinBoot."]
+next_action = ["First DarwinBoot boot: touch check."]
+evidence = [
+  { kind = "source", reference = "https://github.com/aTechGeekDev/ios-apollo/blob/1f75f381e31da96de537653fbac2252d2eb80418/xnu/patches/0093-apollo-touch-fw-download.patch", result = "The NT36675 driver's firmware download from /sweet-touch (with 0082-0094)." },
+]
+
+[[area]]
+id = "gpu"
+status = "implemented"
+components = []
+paths = ["dts/apollo.dts"]
+inputs = ["Adreno 650 + GMU + gpu SMMU (sm8250.dtsi); a650_gmu.bin, a650_sqe.fw, a650_zap.mdt/.b02 from the phone's /vendor/firmware."]
+configuration = ["sweetgpu=22 sweetgpukeep=1 sweetgpulevel=6 sweetmtl=2; firmware in /sweet-gpu through scripts/apollo-adt.py; Metal through UniXNU's metal2vulkan + Turnip (userland/metal2) on the SWEET kernel's NativeAdreno ABI client (xnu 0170)."]
+procedure = ["Boot 125's command line; read SweetGPU, MTL2T and native-metal lines."]
+findings = ["Under shim/ the A650 runs Turnip (vktest all pass) and backboardd composites on Metal (boot 118-122); boots 121/123 lost the Metal device, addressed by Turnip 0102 and xnu 0184 (boot 125 pending)."]
+completion = ["GPU submissions complete and the Metal compositor presents frames, under DarwinBoot."]
+limits = ["Adreno740/AdrenoMetal (catalog) are A740-only; the A650 driver is the SWEET kernel's own. Not booted through DarwinBoot."]
+next_action = ["Boot 125 (shim) first; then the same set through DarwinBoot."]
+evidence = [
+  { kind = "source", reference = "https://github.com/aTechGeekDev/ios-apollo/blob/1f75f381e31da96de537653fbac2252d2eb80418/xnu/patches/0170-apollo-turnip-accelerator.patch", result = "The NativeAdreno ABI client Turnip's darwin backend speaks (with the GPU series 0096-0112, 0163, 0169-0186)." },
+]
+
+[[area]]
+id = "network"
+status = "implemented"
+components = []
+paths = ["dts/apollo.dts", "proprietary-files.txt"]
+inputs = ["QCA6390 Wi-Fi on PCIe0 (amss20.bin, m3.bin, regdb.bin, bd_j3sgl.elf); QCA6390 Bluetooth on QUPv3 SE6 UART 0x998000, BT_EN GPIO 21 (htbtfw20.tlv, htnv20.bin)."]
+configuration = ["sweetwifi=12 sweetbt=6 sweetinject=/usr/local/lib/libsweet-bt.dylib:bluetoothd,BlueTool; firmware in /sweet-wifi and /sweet-bt, MAC addresses in /chosen, both through scripts/apollo-adt.py; launchd starts wifid only with an /arm-io/wlan node (mkadt.py)."]
+procedure = ["Boot; Settings: Wi-Fi join, Bluetooth pair and play A2DP."]
+findings = ["Under shim/ Wi-Fi (Linux 7.0.14 ath11k on FreeBSD LinuxKPI, xnu 0126-0133, 0135) and Bluetooth (xnu 0136-0137, 0141-0143, 0145: scan, pairing, A2DP, HFP, AVRCP) work.", "UniXNU's payload check accepts the sweetinject value (characters / and : are allowed in values at UniXNU 563595ab; ';' is not, so two injection groups need the ADT)."]
+completion = ["Association, DHCP and traffic; Bluetooth pairing and audio, under DarwinBoot."]
+limits = ["Ath12kWifi / QcaBluetooth (catalog) do not cover the QCA6390 with iOS 16; the SWEET drivers are used. Not booted through DarwinBoot."]
+next_action = ["First full DarwinBoot boot: Wi-Fi and Bluetooth checks."]
+evidence = [
+  { kind = "source", reference = "https://github.com/aTechGeekDev/ios-apollo/blob/1f75f381e31da96de537653fbac2252d2eb80418/xnu/patches/0136-apollo-bluetooth-qca6390.patch", result = "The QCA6390 Bluetooth transport (Wi-Fi: 0126-0133, 0135)." },
+]
+
+[[area]]
+id = "audio"
+status = "implemented"
+components = []
+paths = ["proprietary-files.txt"]
+inputs = ["ADSP (adsp.mdt/.bNN), two CS35L41 on QUPv3 SE3, WCD938x microphones (ACDB calibration), AW8697 haptics (aw8697_haptic.bin)."]
+configuration = ["apollo_audio=5 apollo_sound_gain=0 apollo_sound_below=80 apollo_mic=4 apollo_haptic=5; the DSP firmware is on the root (/usr/local/fw, tools/pull-audio-fw.sh)."]
+procedure = ["Boot; play a sound, record a Voice Memo, feel a haptic tap."]
+findings = ["Under shim/ speakers, both microphones and the haptic motor work (xnu 0138-0139, 0146-0147; drivers from hakios-apollo)."]
+completion = ["Playback, capture and haptics under DarwinBoot."]
+limits = ["Not booted through DarwinBoot."]
+next_action = ["First full DarwinBoot boot: audio checks."]
+evidence = [
+  { kind = "source", reference = "https://github.com/aTechGeekDev/ios-apollo/blob/1f75f381e31da96de537653fbac2252d2eb80418/xnu/patches/0139-apollo-audio-mi10t-port.patch", result = "The Mi 10T audio path (DSP, amplifiers) of the SWEET kernel." },
+]
+
+[[area]]
+id = "power"
+status = "implemented"
+components = []
+paths = ["dts/apollo.dts"]
+inputs = ["PM8150B battery and charger, PM8150L torch, PM8150 RTC, PSCI power-off and reset, WLED backlight, EPSS cpufreq."]
+configuration = ["Options in /sweet-options through scripts/apollo-adt.py (mkadt.py --option apollo_rtc=1 apollo_power=1 apollo_torch=1 sweetbattery=1 apollo_ui=1, xnu 0181-0183, 0186)."]
+procedure = ["Boot with the options; Control Center battery and flashlight; power off from iOS."]
+findings = ["Under shim/ backlight, cpufreq and the thermal cap work; battery (0182), RTC/power-off/torch (0181) were written and booted (boot 122) but their device results are not recorded yet."]
+completion = ["Battery level, charging state, time and power-off behave as observed on Android, under DarwinBoot."]
+limits = ["No sleep or suspend. Not booted through DarwinBoot."]
+next_action = ["Record boot 125's apollo pmic / SWEET BATTERY lines, then repeat under DarwinBoot."]
+evidence = [
+  { kind = "source", reference = "https://github.com/aTechGeekDev/ios-apollo/blob/1f75f381e31da96de537653fbac2252d2eb80418/xnu/patches/0181-apollo-pmic-clock-power-torch.patch", result = "PMIC clock, PSCI power-off/restart and torch, with options read from /sweet-options." },
+]
+
+[[area]]
+id = "packaging"
+status = "implemented"
+components = []
+paths = ["patches/**", "scripts/apollo-adt.py", "scripts/package.sh", "package/**"]
+inputs = ["The SWEET kernel: kernel.development.sweet from project-BadApple's xnu.yml (darwin-xnu-build, MACHINE_CONFIG=SWEET), artifact xnu-kernel; tools/mkadt.py's ADT with the firmware, root files and options of the boot."]
+configuration = ["unixnu payload --kernel xnu/out/kernel.development.sweet; then scripts/apollo-adt.py payload <payload.img> <mkadt.adt> replaces kernel.macho.adt with mkadt.py's tree plus DarwinBoot's darwinboot-memory-size and memory-map placeholders; then unixnu bootimg."]
+procedure = ["python3 tools/mkadt.py apollo.adt --highmem ... (the boot's usual arguments); UNIXNU_UNIQUE_CHIP_ID=5357454554000001 ./unixnu payload -D unixnu-apollo --kernel xnu/out/kernel.development.sweet; python3 unixnu-apollo/scripts/apollo-adt.py payload out/.../payload/payload.img apollo.adt; ./unixnu bootimg ..."]
+findings = [
+  "With a 4 MiB stand-in kernel file, unixnu payload builds the 128 MiB BADAPPLE volume: unixnu.toml with boot 125's 567-byte command line, kernel.macho, and a 14 KiB generated ADT; apollo-adt.py payload replaces that ADT in the FAT image (1.5 MiB with stand-in firmware) and the copy read back is byte-identical.",
+  "apollo-adt.py gap lists what the SWEET kernel reads and the generator does not write: 13 nodes (/arm-io gic, wdt, disp0, wlan; /sweet-fbcon, /pram, /sweet-ufs, /sweet-touch, /sweet-gpu, /sweet-wifi, /sweet-bt, /sweet-options, /sweet-files), 102 properties (chosen MAC addresses; per-CPU ids, cluster and frequency properties) and 21 differing values (dram-base/size, CPU state and compatible, arm-io device_type and ranges).",
+  "xnu-8796 reads 608 bytes of command line; UniXNU allows 1000. apollo-adt.py payload refuses a line of 608 bytes or more.",
+]
+completion = ["unixnu payload and bootimg produce an image with the real SWEET kernel that the phone's ABL accepts, and DarwinBoot hands off to it."]
+limits = ["Only a stand-in kernel has gone through unixnu payload; no boot image built yet. The kernel is not built by unixnu: xnu/patches (0001-0186, three staging scripts, the generated ath11k objects) still go through darwin-xnu-build.", "The /product of the real D22AP tree is an Apple file; only mkadt.py (from the IPSW) carries all of it."]
+next_action = ["Run the payload with the real kernel artifact and build the boot image; then move the gap items one by one into dts/apollo.dts, the profiles or a kernel patch, starting with /sweet-ufs -> /arm-io/ufshc."]
+evidence = [
+  { kind = "host", command = "UNIXNU_UNIQUE_CHIP_ID=5357454554000001 ./unixnu payload -D unixnu-apollo --kernel <4 MiB stand-in>; python3 unixnu-apollo/scripts/apollo-adt.py payload payload.img mkadt.adt; apollo-adt.py gap", revision = "563595abedfdfa413ad583b66b6176d82007e633", reference = "evidence/host/2026-11-18-payload.txt", result = "payload.img (134217728 bytes) with unixnu.toml and the generated ADT; ADT replaced in place and read back identical; gap report as in findings." },
+]
+
+[[area]]
+id = "diagnostics"
+status = "planned"
+components = []
+paths = ["evidence/**", "scripts/check-*"]
+inputs = ["The SWEET kernel's 4 MiB log ring at the end of userdata (tools/sweet-log-pull.sh from recovery); DarwinBoot's hand-off screen; uefi-apollo's AdvancedLogDxe exporter in UniXNU's Tools menu."]
+configuration = ["ufslogsecs=1 (log flush every second)."]
+procedure = ["fastboot boot recovery/recovery.img; tools/sweet-log-pull.sh logs/apollo-bootNN.txt."]
+findings = ["No serial port on apollo: before the root mount, only the screen (DarwinBoot's large-type hand-off text, then the kernel's framebuffer) shows progress."]
+completion = ["Each milestone has a command, source and image revision and a reachable log or photo."]
+limits = ["No UniXNU boot yet, so no firmware log exported."]
+next_action = ["Enable the Tools entry (board.toml [payload] tools) on the first firmware boot and export the firmware log."]
+evidence = []

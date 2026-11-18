@@ -1,0 +1,32 @@
+# unixnu-apollo host check, 2026-11-18 (Linux container, Python 3.13, dtc 1.7.0)
+# UniXNU 563595abedfdfa413ad583b66b6176d82007e633, ios-apollo 1f75f381e31da96de537653fbac2252d2eb80418 + this unixnu-apollo/
+
+$ unixnu-apollo/scripts/install-os-profile.sh
+install-os-profile.sh: ios-16.7.16-20H392 -> <UniXNU>/profiles/os/ios-16.7.16-20H392
+
+$ ./unixnu defconfig apollo_defconfig -D <ios-apollo>/unixnu-apollo
+unixnu: on Linux the kernel step uses the toolchain of scripts/linux/setup-toolchain.py; --skip-setup and seed-data-grow need macOS hdiutil
+== configuration apollo_defconfig -> <UniXNU>/out/apollo/ios-16.7.16-20H392/apollo/.config
+exit 0
+
+$ ./unixnu fetch -D <ios-apollo>/unixnu-apollo   (tail)
+== submodules <UniXNU>
+== wrote <ios-apollo>/unixnu-apollo/unixnu.lock
+exit 0
+
+$ ./unixnu status --json -D <ios-apollo>/unixnu-apollo   (selected keys)
+output <UniXNU>/out/apollo/ios-16.7.16-20H392/apollo
+configuration apollo_defconfig
+profiles {
+ "arch": "<UniXNU>/profiles/arch/arm64",
+ "soc": "<UniXNU>/out/feeds/UniXNU-sm8250-common-f14fb517",
+ "os": "<UniXNU>/profiles/os/ios-16.7.16-20H392",
+ "device": "<ios-apollo>/unixnu-apollo"
+}
+components ['DarwinBoot']
+patch_order []
+
+$ ./unixnu tree -D <ios-apollo>/unixnu-apollo
+== submodules <UniXNU>
+== tree <UniXNU>/out/apollo/ios-16.7.16-20H392/apollo/tree
+exit 0

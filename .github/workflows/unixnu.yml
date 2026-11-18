@@ -1,0 +1,67 @@
+name: unixnu
+
+# The UniXNU device repository unixnu-apollo/: resolve it with UniXNU (pinned), check its porting record,
+# compile its DTS into the ADT UniXNU's generator makes, and print the gap report against tools/mkadt.py's
+# tree (what the SWEET kernel reads and the generator does not write yet). Linux only, a few minutes; no
+# firmware, kernel or Apple file is involved.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "unixnu-apollo/**"
+      - "tools/mkadt.py"
+      - "tools/adt.py"
+      - ".github/workflows/unixnu.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unixnu-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UNIXNU_COMMIT: 563595abedfdfa413ad583b66b6176d82007e633
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # unixnu-apollo/board.toml [package] unixnu = "../../UniXNU": the two checkouts side by side.
+      - uses: actions/checkout@v4
+        with:
+          path: ios-apollo
+      - name: UniXNU
+        run: |
+          git init -q UniXNU
+          git -C UniXNU fetch -q --depth 1 https://github.com/UniXNU/UniXNU.git "$UNIXNU_COMMIT"
+          git -C UniXNU checkout -q FETCH_HEAD
+          sudo apt-get install -y -q device-tree-compiler mtools >/dev/null
+          python3 --version; dtc --version
+      - name: Resolve
+        working-directory: UniXNU
+        run: |
+          D=$GITHUB_WORKSPACE/ios-apollo/unixnu-apollo
+          "$D/scripts/install-os-profile.sh"
+          ./unixnu defconfig apollo_defconfig -D "$D"
+          ./unixnu fetch -D "$D"
+          ./unixnu status --json -D "$D" > status.json
+          python3 -c 'import json; s = json.load(open("status.json")); print(json.dumps({k: s[k] for k in ("output", "configuration", "profiles", "patch_order")}, indent=1)); print("components", [c["id"] for c in s["components"]])'
+          git -C "$GITHUB_WORKSPACE/ios-apollo" diff --exit-code -- unixnu-apollo/unixnu.lock
+      - name: Porting record
+        working-directory: UniXNU
+        run: python3 scripts/porting-record.py check --device "$GITHUB_WORKSPACE/ios-apollo/unixnu-apollo"
+      - name: DTS, ADT and the gap to the SWEET kernel's tree
+        working-directory: UniXNU
+        run: |
+          D=$GITHUB_WORKSPACE/ios-apollo/unixnu-apollo
+          SOC=$(python3 -c 'import json; print(json.load(open("status.json"))["profiles"]["soc"])')
+          dtc -I dts -O dtb -i "$SOC/dts" -o hardware.dtb "$D/dts/apollo.dts"
+          PYTHONPATH=scripts python3 scripts/make-adt.py --dtb hardware.dtb \
+            --os-profile profiles/os/ios-16.7.16-20H392/profile.toml --board "$D/board.toml" \
+            --unique-chip-id 5357454554000001 --output unixnu.adt
+          python3 "$GITHUB_WORKSPACE/ios-apollo/tools/mkadt.py" mkadt.adt --highmem --display-height 2502 --artwork-subtype 2556
+          python3 "$D/scripts/apollo-adt.py" gap unixnu.adt mkadt.adt
+          python3 "$D/scripts/apollo-adt.py" merge unixnu.adt mkadt.adt merged.adt

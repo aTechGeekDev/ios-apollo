@@ -1,0 +1,22 @@
+# Sources of this board, pinned. "unixnu fetch" writes the resolved revisions to unixnu.lock.
+
+# Shared SM8250 / kona support: Pistachio-Project's SoC repository (sm8250.dtsi with the GIC, UFS,
+# PCIe0, GPU, display, QUPv3 and SPMI resources; CPU topology; empty SoC patch series).
+[[source]]
+name = "sm8250"
+kind = "soc"
+git = "https://github.com/Pistachio-Project/UniXNU-sm8250-common"
+commit = "13f1d8739a742ebe93e7847b8547ab99bcde5b34"
+
+# The kernel source project-BadApple's series applies to (xnu/README.md, .github/workflows/xnu.yml:
+# macOS 13.5's xnu, the iOS 16 era). Same tag as the OS profile os-profiles/ios-16.7.16-20H392.
+[[source]]
+name = "xnu"
+kind = "refer"
+git = "https://github.com/apple-oss-distributions/xnu.git"
+ref = "xnu-8796.141.3"
+commit = "1b191cb58250d0705d8a51287127505aa4bc0789"
+darwin = "22.6.0"
+version = "8796.141.3"
+driverkit_tag = "xnu-8796.141.3"
+trustcache_tag = "xnu-8796.141.3"
