@@ -1,0 +1,131 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 7fa8d74..a174cdd 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -24,7 +24,7 @@
+  *   1  read-only: TLMM config/IO of the reset and IRQ pins in every tile
+  *   2  + read-only: GENI SE firmware, clock and FIFO registers
+  *   3  + reset pulse on the reset pin (TLMM writes)
+- *   4  + SE setup for SPI, chip-ID read, report loop
++ *   4  + SE4 clock votes (GCC), SE setup for SPI, chip-ID read, report loop
+  * Overrides: sweettouchse=PA, sweettouchtlmm=PA, sweettouchrst=N,
+  * sweettouchirq=N, sweettouchdiv=N (SPI clock = SE clock / N, default 4),
+  * sweettouchbuf=ADDR (event buffer), sweettouchdelay=S, sweettouch_debug=1.
+@@ -58,6 +58,19 @@ void sweet_touch_init(void);
+ #define TOUCH_SPI_DIV        4              /* 19.2 MHz XO / 4 = 4.8 MHz, guess */
+ #define GENI_PROTO_SPI       1u
+ 
++/*
++ * GCC clocks for QUP0 SE4 (Xiaomi apollo-q-oss drivers/clk/qcom/gcc-kona.c).
++ * Boot 6 hung on the first SPI register write after stage 2 read only the
++ * SE's common registers: the SE4 clock is off under fastboot boot. All
++ * branches are voted in APCS_CLOCK_BRANCH_ENA_VOTE_1; BIT(31) of each halt
++ * register is CLK_OFF. The SE4 RCG runs in DFS mode when firmware set it.
++ */
++#define TOUCH_GCC_PA         0x00100000u
++#define TOUCH_GCC_SIZE       0x60000
++#define TOUCH_GCC_VOTE       0x52008u
++#define TOUCH_GCC_VOTE_MASK  ((0xfu << 6) | (1u << 14)) /* m/s AHB, core, core 2x, S4 */
++#define TOUCH_GCC_RCG        0x174d0u       /* gcc_qupv3_wrap0_s4_clk_src */
++
+ /*
+  * SM8250 TLMM tiles (west, south, north), each with registers only for the
+  * pins it owns. Boot 4: gpio8/9 lived in north, other tiles read 0. Stage 1
+@@ -152,6 +165,7 @@ void sweet_touch_init(void);
+ static struct {
+ 	vm_offset_t se;
+ 	vm_offset_t tlmm;
++	vm_offset_t gcc;
+ 	bool started;
+ 	bool debug;
+ 	bool dumped;                     /* first non-empty report logged */
+@@ -234,6 +248,56 @@ touch_reset_pulse(void)
+ 	    touch_rd(st.tlmm, TLMM_GPIO_IN_OUT(st.irq)));
+ }
+ 
++/* ---------- GCC: QUP0 SE4 clocks ---------- */
++/*
++ * Vote the wrapper and SE4 clocks on and pick a 19.2 MHz (XO, divider 1, no
++ * M/N) source: a DFS level for SE_GENI_CLK_SEL, or the RCG itself without
++ * DFS. Returns the CLK_SEL level, or -1 (logged) when nothing safe exists.
++ */
++static int
++touch_clocks(void)
++{
++	static const uint32_t branches[] = {0x17004, 0x17008, 0x23000, 0x23008, 0x174cc};
++	int level = -1;
++
++	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | TOUCH_GCC_VOTE_MASK);
++	uint32_t dfs = touch_rd(st.gcc, TOUCH_GCC_RCG + 0x14u);
++	uint32_t cfg = touch_rd(st.gcc, TOUCH_GCC_RCG + 4u);
++	printf("SWEET TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
++	    touch_rd(st.gcc, TOUCH_GCC_VOTE), touch_rd(st.gcc, TOUCH_GCC_RCG), cfg, dfs);
++	if (dfs & 1u) {
++		for (unsigned l = 0; l < 8; ++l) {
++			uint32_t lv = touch_rd(st.gcc, TOUCH_GCC_RCG + 0x1cu + 4u * l);
++			printf("SWEET TOUCH: dfs level %u cfg=%#x\n", l, lv);
++			if (level < 0 && (lv & 0x371fu) == 1u)
++				level = (int)l;
++		}
++		if (level < 0) {
++			printf("SWEET TOUCH: no XO/1 DFS level; SE4 clock left alone\n");
++			return -1;
++		}
++	} else {
++		/* XO parent 0, HID divider 1 => 19.2 MHz. No PLL or voltage change. */
++		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
++		touch_wr(st.gcc, TOUCH_GCC_RCG + 4u, cfg);
++		touch_wr(st.gcc, TOUCH_GCC_RCG, touch_rd(st.gcc, TOUCH_GCC_RCG) | 1u);
++		if (!touch_wait_clear(st.gcc, TOUCH_GCC_RCG, 1u)) {
++			printf("SWEET TOUCH: RCG update timeout\n");
++			return -1;
++		}
++		level = 0;
++	}
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
++			printf("SWEET TOUCH: GCC branch %#x still off (%#x)\n", branches[i],
++			    touch_rd(st.gcc, branches[i]));
++			return -1;
++		}
++	}
++	printf("SWEET TOUCH: SE4 clocks on, clk-sel %d\n", level);
++	return level;
++}
++
+ /* ---------- GENI SPI ---------- */
+ /*
+  * FIFO mode, polled. Generic part as sweet's verified I2C setup (0060/0063);
+@@ -241,7 +305,7 @@ touch_reset_pulse(void)
+  * The SE serial clock source is whatever firmware left (XO assumed).
+  */
+ static bool
+-touch_spi_init(unsigned div)
++touch_spi_init(unsigned div, unsigned clk_sel)
+ {
+ 	uint32_t hw1 = touch_rd(st.se, SE_HW_PARAM_1);
+ 	if (touch_rd(st.se, SE_GENI_STATUS) & 1u) {
+@@ -259,7 +323,7 @@ touch_spi_init(unsigned div)
+ 	touch_wr(st.se, SE_DMA_GENERAL_CFG, touch_rd(st.se, SE_DMA_GENERAL_CFG) | 0x0fu);
+ 	touch_wr(st.se, SE_GENI_OUTPUT_CTRL, 0x7f);
+ 	touch_wr(st.se, SE_GENI_FORCE_DEFAULT, 1);
+-	touch_wr(st.se, SE_GENI_CLK_SEL, 0);
++	touch_wr(st.se, SE_GENI_CLK_SEL, clk_sel);
+ 	touch_wr(st.se, SE_GENI_M_CLK_CFG, ((div & 0xffu) << 4) | 1u);
+ 	touch_wr(st.se, SE_SPI_LOOPBACK, 0);
+ 	touch_wr(st.se, SE_SPI_CPHA, 0);
+@@ -533,8 +597,13 @@ touch_thread(void *arg, wait_result_t result)
+ 	if (st.stage < 4 || !spi)
+ 		goto stop;
+ 
++	printf("SWEET TOUCH: step 4: SE4 clocks\n");
++	st.gcc = ml_io_map(TOUCH_GCC_PA, TOUCH_GCC_SIZE);
++	int clk_sel = st.gcc ? touch_clocks() : -1;
++	if (clk_sel < 0)
++		goto stop;
+ 	printf("SWEET TOUCH: step 4: SPI setup + chip ID\n");
+-	if (!touch_spi_init(div))
++	if (!touch_spi_init(div, (unsigned)clk_sel))
+ 		goto out;
+ 	nvt_probe_id();
+ 

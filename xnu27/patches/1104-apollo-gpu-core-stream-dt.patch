@@ -1,0 +1,90 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 1952e62..a21f78d 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -68,7 +68,7 @@
+  * Boot 17: all three pass; GX on (gx gdsc 0xf8222800), rbbm_status 0x1.
+  *  18  write  the 3D core's memory: its ring and its microcode (a650_sqe.fw,
+  *             ADT /sweet-gpu "sqe-firmware", mkadt.py --sqe-fw) behind SMMU
+- *             context 0, streams 0 and 1 (gfx3d_user)
++ *             context 0, stream 0 mask 0x401 as the DT's gfx3d_user has it
+  *  19  write  the core's registers as Linux's hw_init for the a650 sets them
+  *             before the command processor starts, then start it and give it
+  *             its first command, CP_ME_INIT (Linux a6xx_cp_init)
+@@ -188,7 +188,7 @@ void sweet_gpu_init(void);
+ #define SMMU_CB_TLBSTATUS     0x7f4u
+ #define SMMU_CBA2R(n)         (0x800u + 4u * (n))   /* in page 1, like CBAR */
+ #define SMMU_SMR_VALID        (1u << 31)
+-#define SMMU_STREAM_MASK      0x400u                /* DT: second cell of every iommus */
++#define SMMU_STREAM_MASK      0x400u                /* DT: second cell of the GMU's iommus */
+ #define SMMU_S2CR_FAULT       (2u << 16)
+ #define SMMU_CBAR_STAGE_1     ((1u << 16) | (3u << 8) | (0xfu << 12))
+ #define SMMU_CBA2R_64_BIT     1u
+@@ -322,10 +322,9 @@ void sweet_gpu_init(void);
+ #define GPU_APRIV_VALUE       ((1u << 6) | (1u << 5) | (1u << 3) | (1u << 2) | (1u << 1))  /* a650 has HW APRIV */
+ #define GPU_SQE_MIN_VERSION   0x095u        /* Linux a6xx_ucode_check_version for a650_sqe.fw */
+ #define CP_ME_INIT            0x48u
+-#define CORE_STREAM_0         0u            /* apollo DT gfx3d_user iommus <0 0x401>: streams 0 and 1 */
+-#define CORE_STREAM_1         1u
+-#define CORE_MATCH_0          0u
+-#define CORE_MATCH_1          2u            /* match 1 is the GMU's */
++#define CORE_STREAM          0u            /* apollo DT gfx3d_user iommus <0x0 0x401>: streams 0 and 1 */
++#define CORE_STREAM_MASK      0x401u        /* boot 19: mask 0x400 read back 0; written as the DT has it */
++#define CORE_MATCH            0u            /* match 1 is the GMU's */
+ #define CORE_CONTEXT          0u
+ #define CORE_RING_VA          0x01000000u
+ #define CORE_RING_SIZE        0x8000u
+@@ -519,12 +518,12 @@ gpu_smmu_context(vm_offset_t smmu, uint32_t pg, uint32_t npg, uint32_t context,
+ }
+ 
+ static bool
+-gpu_smmu_stream(vm_offset_t smmu, uint32_t pg, uint32_t npg, uint32_t match, uint32_t stream, uint32_t context,
+-    struct gpu_space *sp)
++gpu_smmu_stream(vm_offset_t smmu, uint32_t pg, uint32_t npg, uint32_t match, uint32_t stream, uint32_t mask,
++    uint32_t context, struct gpu_space *sp)
+ {
+ 	uint32_t cb = (npg + context) * pg;
+ 	uint64_t root = sp->phys[0] | ((uint64_t)context << 48);
+-	uint32_t want = SMMU_SMR_VALID | (SMMU_STREAM_MASK << 16) | stream;
++	uint32_t want = SMMU_SMR_VALID | (mask << 16) | stream;
+ 	gpu_wr(smmu, SMMU_S2CR(match), context);
+ 	gpu_wr(smmu, SMMU_SMR(match), want);
+ 	uint32_t smr = gpu_rd(smmu, SMMU_SMR(match)), s2cr = gpu_rd(smmu, SMMU_S2CR(match));
+@@ -1041,7 +1040,7 @@ sweet_gpu_probe(unsigned steps)
+ 	    GMU_CONTEXT, SMMU_PA + ctx, (unsigned long long)gmu_space.phys[0], GMU_STREAM, GMU_MATCH);
+ 	gpu_smmu_context(smmu, pg, npg, GMU_CONTEXT, &gmu_space, 0);
+ 	gmu_smmu_on = true;
+-	if (!gpu_smmu_stream(smmu, pg, npg, GMU_MATCH, GMU_STREAM, GMU_CONTEXT, &gmu_space)) {
++	if (!gpu_smmu_stream(smmu, pg, npg, GMU_MATCH, GMU_STREAM, SMMU_STREAM_MASK, GMU_CONTEXT, &gmu_space)) {
+ 		printf("SWEET GPU: step 11: the SMMU did not take what was written\n");
+ 		goto collapse;
+ 	}
+@@ -1407,12 +1406,11 @@ sweet_gpu_probe(unsigned steps)
+ 	for (unsigned int i = 4; i < sqe_size; ++i)
+ 		((uint8_t *)core_sqe.mem)[i - 4] = sqe[i];
+ 	gpu_to_memory(core_sqe.mem, core_sqe.size);
+-	printf("SWEET GPU: step 18: SMMU context %u <- tables %#llx; streams %u, %u via matches %u, %u\n", CORE_CONTEXT,
+-	    (unsigned long long)core_space.phys[0], CORE_STREAM_0, CORE_STREAM_1, CORE_MATCH_0, CORE_MATCH_1);
++	printf("SWEET GPU: step 18: SMMU context %u <- tables %#llx; stream %u mask %#x via match %u\n", CORE_CONTEXT,
++	    (unsigned long long)core_space.phys[0], CORE_STREAM, CORE_STREAM_MASK, CORE_MATCH);
+ 	gpu_smmu_context(smmu, pg, npg, CORE_CONTEXT, &core_space, SMMU_SCTLR_HUPCF);
+ 	core_smmu_on = true;
+-	if (!gpu_smmu_stream(smmu, pg, npg, CORE_MATCH_0, CORE_STREAM_0, CORE_CONTEXT, &core_space) ||
+-	    !gpu_smmu_stream(smmu, pg, npg, CORE_MATCH_1, CORE_STREAM_1, CORE_CONTEXT, &core_space)) {
++	if (!gpu_smmu_stream(smmu, pg, npg, CORE_MATCH, CORE_STREAM, CORE_STREAM_MASK, CORE_CONTEXT, &core_space)) {
+ 		printf("SWEET GPU: step 18: the SMMU did not take what was written\n");
+ 		goto collapse;
+ 	}
+@@ -1561,10 +1559,8 @@ collapse:
+ 			}
+ 			if (core_smmu_on) {
+ 				(void)gpu_smmu_faulted(smmu_va, smmu_pg, smmu_npg, CORE_CONTEXT, "CORE");
+-				gpu_wr(smmu_va, SMMU_SMR(CORE_MATCH_0), 0);
+-				gpu_wr(smmu_va, SMMU_S2CR(CORE_MATCH_0), SMMU_S2CR_FAULT);
+-				gpu_wr(smmu_va, SMMU_SMR(CORE_MATCH_1), 0);
+-				gpu_wr(smmu_va, SMMU_S2CR(CORE_MATCH_1), SMMU_S2CR_FAULT);
++				gpu_wr(smmu_va, SMMU_SMR(CORE_MATCH), 0);
++				gpu_wr(smmu_va, SMMU_S2CR(CORE_MATCH), SMMU_S2CR_FAULT);
+ 				gpu_wr(smmu_va, (smmu_npg + CORE_CONTEXT) * smmu_pg + SMMU_CB_SCTLR, 0);
+ 				printf("SWEET GPU: core streams and SMMU context off again\n");
+ 			}

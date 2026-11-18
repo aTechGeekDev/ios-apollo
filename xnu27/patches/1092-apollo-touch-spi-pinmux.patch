@@ -1,0 +1,68 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index c76b5c2..443acfb 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -24,7 +24,7 @@
+  *   1  read-only: TLMM config/IO of the reset and IRQ pins in every tile
+  *   2  + read-only: GENI SE firmware, clock and FIFO registers
+  *   3  + reset pulse on the reset pin (TLMM writes)
+- *   4  + SE4 clock votes (GCC), SE setup for SPI, chip-ID read, report loop
++ *   4  + SE4 clock votes (GCC), SPI pin mux, SE setup, chip-ID read, report loop
+  * Overrides: sweettouchse=PA, sweettouchtlmm=PA, sweettouchrst=N,
+  * sweettouchirq=N, sweettouchdiv=N (SPI clock = SE clock / N, default 4),
+  * sweettouchbuf=ADDR (event buffer), sweettouchdelay=S, sweettouch_debug=1.
+@@ -80,6 +80,15 @@ void sweet_touch_init(void);
+ #define TOUCH_TLMM_SOUTH     0x0f500000u
+ #define TOUCH_TLMM_NORTH     0x0f900000u
+ #define TOUCH_TLMM_SIZE      0x40000        /* gpio0..63 of one tile */
++/*
++ * SE4 SPI pins: gpio8-11 (MISO, MOSI, SCLK, CS), north tile, function 1 =
++ * qup4 (Xiaomi apollo-q-oss pinctrl-kona.c PINGROUP(8..11, NORTH, qup4..)).
++ * Boot 8: transfers completed but MISO read all zero: the bootloader leaves
++ * these pins in GPIO mode. Linux muxes them with 6 mA, no pull.
++ */
++#define TOUCH_SPI_GPIO0      8
++#define TOUCH_SPI_NGPIO      4
++#define TOUCH_SPI_CFG        ((1u << 2) | (2u << 6))  /* func qup4, 6 mA, no pull */
+ 
+ #define TOUCH_MAX_FINGERS    10
+ #define TOUCH_ABS_X          1080
+@@ -308,6 +317,25 @@ touch_clocks(void)
+ 	return level;
+ }
+ 
++/* Mux gpio8-11 to qup4 in the north tile; sweettouchmux=0 skips it. */
++static bool
++touch_spi_pins(void)
++{
++	vm_offset_t north = ml_io_map(TOUCH_TLMM_NORTH, TOUCH_TLMM_SIZE);
++	if (!north) {
++		printf("SWEET TOUCH: map north tile failed\n");
++		return false;
++	}
++	for (unsigned i = 0; i < TOUCH_SPI_NGPIO; ++i) {
++		unsigned pin = TOUCH_SPI_GPIO0 + i;
++		uint32_t old = touch_rd(north, TLMM_GPIO_CFG(pin));
++		touch_wr(north, TLMM_GPIO_CFG(pin), (old & ~0x3ffu) | TOUCH_SPI_CFG);
++		printf("SWEET TOUCH: gpio%u cfg %#x -> %#x\n", pin, old,
++		    touch_rd(north, TLMM_GPIO_CFG(pin)));
++	}
++	return true;
++}
++
+ /* ---------- GENI SPI ---------- */
+ /*
+  * FIFO mode, polled. Generic part as sweet's verified I2C setup (0060/0063);
+@@ -612,6 +640,12 @@ touch_thread(void *arg, wait_result_t result)
+ 	int clk_sel = st.gcc ? touch_clocks() : -1;
+ 	if (clk_sel < 0)
+ 		goto stop;
++	int mux = 1;
++	(void)PE_parse_boot_argn("sweettouchmux", &mux, sizeof(mux));
++	printf("SWEET TOUCH: step 4: SPI pins gpio%u-%u -> qup4 (mux=%d)\n",
++	    TOUCH_SPI_GPIO0, TOUCH_SPI_GPIO0 + TOUCH_SPI_NGPIO - 1, mux);
++	if (mux && !touch_spi_pins())
++		goto stop;
+ 	printf("SWEET TOUCH: step 4: SPI setup + chip ID\n");
+ 	if (!touch_spi_init(div, (unsigned)clk_sel))
+ 		goto out;

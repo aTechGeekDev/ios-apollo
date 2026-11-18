@@ -1,0 +1,109 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index d930a7f..3bc72ba 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -1,9 +1,10 @@
+ /*
+  * Minimal polled SWEET keys. Call once after the scheduler is running.
+  * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
+- * apollo (SM8250): volume-up falls back to PPID 0x1c1 when sweet's PM6150L
+- * GPIO2 (0x4c1) is absent; boot-arg sweetvolup=PPID (SID << 8 | periph)
+- * picks any PMIC GPIO peripheral without a rebuild.
++ * apollo (SM8250): volume-up is the first PMIC GPIO of PM8150 GPIO6 (0x0c5,
++ * Xiaomi kona gpio-keys), PM6150L GPIO2 (0x4c1, sweet), 0x1c1 that exists
++ * and is enabled as an input; boot-arg sweetvolup=PPID (SID << 8 | periph)
++ * forces one. Without one, only power and volume-down are polled.
+  * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+  * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
+  */
+@@ -25,7 +26,6 @@ void sweet_keys_init(void);
+ #define KEYS_CNFG_PA     0x0c40a000u
+ #define KEYS_PON_RT      0x0810u
+ #define KEYS_GPIO_PPID   0x4c1u      /* sweet: PM6150L GPIO2, SID 4 */
+-#define KEYS_GPIO_PPID2  0x1c1u      /* apollo fallback */
+ #define KEYS_GPIO_REG(o) ((uint16_t)(((keys_gpio_ppid & 0xffu) << 8) | (o)))
+ #define KEYS_GPIO_RT     KEYS_GPIO_REG(0x10u)
+ #define KEYS_NO_APID     0xffffu
+@@ -87,6 +87,27 @@ keys_read(uint16_t apid, uint16_t addr, uint8_t *out)
+ 	return false;
+ }
+ 
++/* apid of PMIC GPIO ppid if it exists and firmware enabled it as an input. */
++static uint16_t
++keys_gpio_probe(uint32_t ppid, uint32_t count)
++{
++	uint8_t gpio = 0, mode = 0, en = 0, subtype = 0;
++	keys_gpio_ppid = ppid & 0xfffu;
++	uint16_t apid = keys_find_apid((uint16_t)keys_gpio_ppid, count);
++	bool gok = keys_read(apid, KEYS_GPIO_RT, &gpio);
++	bool mok = keys_read(apid, KEYS_GPIO_REG(0x40u), &mode);
++	bool eok = keys_read(apid, KEYS_GPIO_REG(0x46u), &en);
++	bool sok = keys_read(apid, KEYS_GPIO_REG(0x05u), &subtype);
++	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
++	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
++	    mode & 3u : (mode >> 4) & 7u;
++	bool input = gok && eok && mok && sok && (en & 0x80u) && (dir == 0 || dir == 2);
++	printf("SWEET KEYS: gpio ppid=%#x apid=%u rt=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d -> %s\n",
++	    keys_gpio_ppid, apid, gpio, gok, mode, mok, en, eok, subtype, sok,
++	    input ? "input" : "skipped");
++	return input ? apid : KEYS_NO_APID;
++}
++
+ static void
+ keys_wait(void)
+ {
+@@ -108,7 +129,8 @@ keys_thread(void *arg, wait_result_t result)
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+ 		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
+-		if (!pok || !gok) {
++		/* No volume-up GPIO is not a read error. */
++		if (!pok || (!gok && keys_gpio_apid != KEYS_NO_APID)) {
+ 			if ((errors++ % 250u) == 0) {
+ 				printf("SWEET KEYS: read error pon-ok=%d gpio-ok=%d arb-status=%#x\n",
+ 				    pok, gok, keys_last_status);
+@@ -158,33 +180,22 @@ sweet_keys_init(void)
+ 		return;
+ 	}
+ 	keys_pon_apid = keys_find_apid(0x008, count);
+-	if (PE_parse_boot_argn("sweetvolup", &keys_gpio_ppid, sizeof(keys_gpio_ppid))) {
+-		keys_gpio_ppid &= 0xfffu;
+-		keys_gpio_apid = keys_find_apid((uint16_t)keys_gpio_ppid, count);
++	uint32_t forced = 0;
++	if (PE_parse_boot_argn("sweetvolup", &forced, sizeof(forced))) {
++		keys_gpio_apid = keys_gpio_probe(forced, count);
+ 	} else {
+-		keys_gpio_apid = keys_find_apid(KEYS_GPIO_PPID, count);
+-		if (keys_gpio_apid == KEYS_NO_APID) {
+-			keys_gpio_ppid = KEYS_GPIO_PPID2;
+-			keys_gpio_apid = keys_find_apid(KEYS_GPIO_PPID2, count);
++		static const uint32_t cand[] = {0x0c5u, KEYS_GPIO_PPID, 0x1c1u};
++		for (unsigned i = 0; i < sizeof(cand) / sizeof(cand[0]) &&
++		    keys_gpio_apid == KEYS_NO_APID; ++i) {
++			keys_gpio_apid = keys_gpio_probe(cand[i], count);
+ 		}
+ 	}
+-	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
++	uint8_t pon = 0, gpio = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-	bool mok = keys_read(keys_gpio_apid, KEYS_GPIO_REG(0x40u), &mode);
+-	bool eok = keys_read(keys_gpio_apid, KEYS_GPIO_REG(0x46u), &en);
+-	bool sok = keys_read(keys_gpio_apid, KEYS_GPIO_REG(0x05u), &subtype);
+-	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio-ppid=%#x gpio-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+-	    keys_version, count, keys_pon_apid, keys_gpio_ppid, keys_gpio_apid,
+-	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
+-	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+-	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+-	    mode & 3u : (mode >> 4) & 7u;
+-	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
+-		printf("SWEET KEYS: GPIO %#x not confirmed enabled as input; volume-up withheld, PMIC unchanged\n",
+-		    keys_gpio_ppid);
+-		keys_gpio_apid = KEYS_NO_APID;
+-	}
++	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u pon=%#x/%d volume-up %s (ppid %#x)\n",
++	    keys_version, count, keys_pon_apid, pon, pok,
++	    keys_gpio_apid == KEYS_NO_APID ? "unavailable" : "on", keys_gpio_ppid);
+ 	if (!pok && !gok) {
+ 		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
+ 	}

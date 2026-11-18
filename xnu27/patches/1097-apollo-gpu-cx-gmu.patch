@@ -1,0 +1,210 @@
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index dee5e46..d316544 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -82,6 +82,17 @@ sweet_cpufreq_init(void)
+ 			printf("SWEET CPUFREQ: domain %u not enabled by firmware (%#x); left alone\n", d, en);
+ 			continue;
+ 		}
++		/* Boot 11: only 3 levels per domain and the request read back 0: dump raw words. */
++		for (uint32_t o = 0x100; o < 0x200; o += 0x20) {
++			printf("SWEET CPUFREQ:   d%u %#05x: %08x %08x %08x %08x %08x %08x %08x %08x\n", d, o,
++			    cpufreq_rd(base, o), cpufreq_rd(base, o + 4), cpufreq_rd(base, o + 8),
++			    cpufreq_rd(base, o + 12), cpufreq_rd(base, o + 16), cpufreq_rd(base, o + 20),
++			    cpufreq_rd(base, o + 24), cpufreq_rd(base, o + 28));
++		}
++		printf("SWEET CPUFREQ:   d%u 0x000: %08x %08x %08x %08x  0x900: %08x %08x %08x %08x  0x920: %08x %08x\n", d,
++		    cpufreq_rd(base, 0), cpufreq_rd(base, 4), cpufreq_rd(base, 8), cpufreq_rd(base, 12),
++		    cpufreq_rd(base, 0x900), cpufreq_rd(base, 0x904), cpufreq_rd(base, 0x908), cpufreq_rd(base, 0x90c),
++		    cpufreq_rd(base, 0x920), cpufreq_rd(base, 0x924));
+ 		unsigned n = 0, top = 0, cc0 = 0, prev_khz = 0, prev_cc = 0;
+ 		unsigned khz[CPUFREQ_LUT_MAX], cc[CPUFREQ_LUT_MAX];
+ 		for (unsigned i = 0; i < CPUFREQ_LUT_MAX; ++i) {
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index fbdfd93..5437c9b 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -15,6 +15,16 @@
+  *             it: PLL1, the GMU clock source and branches, the CX power
+  *             switch (GDSC) and the GX domain. Refused unless the config-bus
+  *             clock is confirmed on.
++ *   4  write  CX power on: clear the CX GDSC's collapse bit, wait for power
++ *             (boot 11: 0x00222001, collapsed, not under hardware control)
++ *   5  write  clocks: GCC votes for the GPLL0 taps to the GPU, the GMU clock
++ *             to 200 MHz (GPLL0 300 MHz tap / 1.5, as Linux), the GPUCC
++ *             branches the GMU and its SMMU need
++ *   6  read   the GMU (0x3d6a000, same register layout as on SM7325): reset
++ *             and boot state, HFI, power state, and its always-on counter,
++ *             which counts the 19.2 MHz crystal once the block is alive
++ * After step 4 or later the CX half is collapsed again before returning,
++ * unless boot-arg sweetgpukeep=1. The 3D core (GX) is never powered here.
+  *
+  * Addresses: apollo live DT (qcom,gpucc@3d90000 "qcom,gpucc-kona",
+  * gpu_cx_gdsc 0x3d9106c, gpu_gx_domain_addr 0x3d91508, gpu_cx_hw_ctrl
+@@ -57,6 +67,31 @@ void sweet_gpu_init(void);
+ #define GPUCC_SMMU_VOTE       0x5000u
+ 
+ #define CBCR_OFF(v)           (((v) >> 31) & 1u)
++#define GCC_DDRSS_GPU_AXI     0x71154u    /* voted: status not reliable */
++#define GDSC_SW_COLLAPSE      (1u << 0)
++#define GDSC_HW_CONTROL       (1u << 1)
++#define GDSC_PWR_ON           (1u << 31)
++#define RCG_UPDATE            (1u << 0)
++#define RCG_CFG_MASK          0x371fu     /* [4:0] hid, [10:8] source, [13:12] mode */
++#define GMU_RCG_200MHZ        ((6u << 8) | 2u)  /* GPLL0_OUT_MAIN_DIV (300 MHz) / 1.5 */
++#define GPUCC_CX_APB          0x1088u
++
++#define GMU_PA                0x03d6a000u
++#define GMU_SIZE              0x30000
++#define GMU_WORD(n)           (4u * (n))
++#define GMU_CM3_SYSRESET      GMU_WORD(0x5000)
++#define GMU_CM3_BOOT_CONFIG   GMU_WORD(0x5001)
++#define GMU_CM3_FW_INIT_RESULT GMU_WORD(0x501c)
++#define GMU_CM3_CFG           GMU_WORD(0x502d)
++#define GMU_AO_COUNTER_L      GMU_WORD(0x5088)
++#define GMU_AO_COUNTER_H      GMU_WORD(0x5089)
++#define GMU_SPTPRAC_PWR_CLK   GMU_WORD(0x50d0)
++#define GMU_RPMH_POWER_STATE  GMU_WORD(0x50ec)
++#define GMU_HFI_CTRL_STATUS   GMU_WORD(0x5180)
++#define GMU_HFI_VERSION_INFO  GMU_WORD(0x5181)
++#define GMU_AO_HOST_IRQ_STATUS GMU_WORD(0x9305)
++#define GMU_AO_GPU_CX_BUSY    GMU_WORD(0x930c)
++#define GMU_AHB_FENCE_STATUS  GMU_WORD(0x9313)
+ 
+ static uint32_t
+ gpu_rd(vm_offset_t base, uint32_t off)
+@@ -83,6 +118,31 @@ gpu_cbcr(vm_offset_t base, const char *name, uint32_t off)
+ 	    (v & 2u) ? ", hw-gated" : "");
+ }
+ 
++/* Set a branch's enable bit; true if CLK_OFF clears (or the status is not trusted). */
++static bool
++gpu_clock_on(vm_offset_t base, const char *name, uint32_t off, bool trust)
++{
++	gpu_wr(base, off, gpu_rd(base, off) | 1u);
++	for (unsigned i = 0; i < 100 && CBCR_OFF(gpu_rd(base, off)); ++i)
++		delay(10);
++	uint32_t v = gpu_rd(base, off);
++	printf("SWEET GPU:   %-22s %#07x = %#010x  %s\n", name, off, v,
++	    !CBCR_OFF(v) ? "running" : trust ? "STAYS OFF" : "off (status not reliable)");
++	return !CBCR_OFF(v) || !trust;
++}
++
++static bool
++gpu_cx_on(vm_offset_t cc)
++{
++	return ((gpu_rd(cc, GPUCC_CX_GDSC) | gpu_rd(cc, GPUCC_CX_HW_CTRL)) & GDSC_PWR_ON) != 0;
++}
++
++static void
++gpu_gmu_reg(vm_offset_t gmu, const char *name, uint32_t off)
++{
++	printf("SWEET GPU:   gmu %-22s %#07x = %#010x\n", name, off, gpu_rd(gmu, off));
++}
++
+ void
+ sweet_gpu_init(void)
+ {
+@@ -151,6 +211,102 @@ sweet_gpu_init(void)
+ 	    (cx >> 31) ? "powered" : "off", (cx & 1u) ? ", sw-collapse requested" : "");
+ 	printf("SWEET GPU:   gx domain %#x = %#010x, cx hw ctrl %#x = %#010x\n",
+ 	    GPUCC_GX_DOMAIN, gpu_rd(cc, GPUCC_GX_DOMAIN), GPUCC_CX_HW_CTRL, gpu_rd(cc, GPUCC_CX_HW_CTRL));
++	if (steps < 4)
++		goto done;
++
++	/* ---- step 4: CX power ---- */
++	if (cx & GDSC_HW_CONTROL) {
++		printf("SWEET GPU: step 4 refused: CX GDSC is under hardware control (%#010x)\n", cx);
++		goto done;
++	}
++	bool was_on = gpu_cx_on(cc);
++	if (!was_on) {
++		printf("SWEET GPU: step 4: write GPUCC %#x &= ~1 (CX power switch on)\n", GPUCC_CX_GDSC);
++		gpu_wr(cc, GPUCC_CX_GDSC, gpu_rd(cc, GPUCC_CX_GDSC) & ~GDSC_SW_COLLAPSE);
++		for (unsigned i = 0; i < 500 && !gpu_cx_on(cc); ++i)
++			delay(100);
++	}
++	printf("SWEET GPU: step 4: cx gdsc = %#010x, hw ctrl = %#010x: CX %s%s\n",
++	    gpu_rd(cc, GPUCC_CX_GDSC), gpu_rd(cc, GPUCC_CX_HW_CTRL),
++	    gpu_cx_on(cc) ? "ON" : "DOES NOT COME ON", was_on ? " (was already on)" : "");
++	if (!gpu_cx_on(cc) || steps < 5)
++		goto collapse;
++
++	/* ---- step 5: clocks ---- */
++	printf("SWEET GPU: step 5: GCC votes gpu_gpll0 + gpu_gpll0_div (%#x bits 15,16), GPU bus clocks\n", GCC_VOTE_0);
++	gpu_wr(gcc, GCC_VOTE_0, gpu_rd(gcc, GCC_VOTE_0) | (1u << 15) | (1u << 16));
++	if (!gpu_clock_on(gcc, "gcc_gpu_memnoc_gfx", GCC_GPU_MEMNOC_GFX, false) ||
++	    !gpu_clock_on(gcc, "gcc_gpu_snoc_dvm_gfx", GCC_GPU_SNOC_DVM_GFX, false) ||
++	    !gpu_clock_on(gcc, "gcc_ddrss_gpu_axi", GCC_DDRSS_GPU_AXI, false))
++		goto collapse;
++	uint32_t gcfg = gpu_rd(cc, GPUCC_GMU_RCG + 4u);
++	printf("SWEET GPU: step 5: gmu clock source %#010x -> 200 MHz (%#x)\n", gcfg, GMU_RCG_200MHZ);
++	if ((gcfg & RCG_CFG_MASK) != GMU_RCG_200MHZ) {
++		gpu_wr(cc, GPUCC_GMU_RCG + 4u, (gcfg & ~RCG_CFG_MASK) | GMU_RCG_200MHZ);
++		gpu_wr(cc, GPUCC_GMU_RCG, gpu_rd(cc, GPUCC_GMU_RCG) | RCG_UPDATE);
++		for (unsigned i = 0; i < 100 && (gpu_rd(cc, GPUCC_GMU_RCG) & RCG_UPDATE); ++i)
++			delay(10);
++		if (gpu_rd(cc, GPUCC_GMU_RCG) & RCG_UPDATE) {
++			printf("SWEET GPU: step 5: gmu clock source did not switch (cmd %#010x)\n",
++			    gpu_rd(cc, GPUCC_GMU_RCG));
++			goto collapse;
++		}
++	}
++	printf("SWEET GPU: step 5: gmu rcg cmd=%#010x cfg=%#010x; GPUCC branches on\n",
++	    gpu_rd(cc, GPUCC_GMU_RCG), gpu_rd(cc, GPUCC_GMU_RCG + 4u));
++	if (!gpu_clock_on(cc, "gpu_cc_cxo", GPUCC_CXO, true) ||
++	    !gpu_clock_on(cc, "gpu_cc_ahb", GPUCC_AHB, false) ||
++	    !gpu_clock_on(cc, "gpu_cc_cx_apb", GPUCC_CX_APB, false) ||
++	    !gpu_clock_on(cc, "gpu_cc_cx_snoc_dvm", GPUCC_CX_SNOC_DVM, false) ||
++	    !gpu_clock_on(cc, "gpu_cc_cx_gmu", GPUCC_CX_GMU, true) ||
++	    !gpu_clock_on(cc, "gpu_cc_hlos1_vote_smmu", GPUCC_SMMU_VOTE, false))
++		goto collapse;
++	if (steps < 6)
++		goto collapse;
++
++	/* ---- step 6: the first words from the GMU ---- */
++	vm_offset_t gmu = ml_io_map(GMU_PA, GMU_SIZE);
++	if (!gmu) {
++		printf("SWEET GPU: GMU map failed\n");
++		goto collapse;
++	}
++	printf("SWEET GPU: step 6: read GMU %#x\n", GMU_PA);
++	gpu_gmu_reg(gmu, "cm3_sysreset", GMU_CM3_SYSRESET);
++	gpu_gmu_reg(gmu, "cm3_boot_config", GMU_CM3_BOOT_CONFIG);
++	gpu_gmu_reg(gmu, "cm3_fw_init_result", GMU_CM3_FW_INIT_RESULT);
++	gpu_gmu_reg(gmu, "cm3_cfg", GMU_CM3_CFG);
++	gpu_gmu_reg(gmu, "hfi_ctrl_status", GMU_HFI_CTRL_STATUS);
++	gpu_gmu_reg(gmu, "hfi_version_info", GMU_HFI_VERSION_INFO);
++	gpu_gmu_reg(gmu, "rpmh_power_state", GMU_RPMH_POWER_STATE);
++	gpu_gmu_reg(gmu, "sptprac_pwr_clk_status", GMU_SPTPRAC_PWR_CLK);
++	gpu_gmu_reg(gmu, "ao_host_irq_status", GMU_AO_HOST_IRQ_STATUS);
++	gpu_gmu_reg(gmu, "ao_gpu_cx_busy", GMU_AO_GPU_CX_BUSY);
++	gpu_gmu_reg(gmu, "ahb_fence_status", GMU_AHB_FENCE_STATUS);
++	uint64_t t0 = mach_absolute_time(), ns;
++	uint32_t c0 = gpu_rd(gmu, GMU_AO_COUNTER_L);
++	delay(10000);
++	uint32_t ticks = gpu_rd(gmu, GMU_AO_COUNTER_L) - c0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	uint64_t hz = ns ? (uint64_t)ticks * 1000000000ull / ns : 0;
++	printf("SWEET GPU: step 6: GMU always-on counter %#x:%#x counts %llu Hz: %s\n",
++	    gpu_rd(gmu, GMU_AO_COUNTER_H), gpu_rd(gmu, GMU_AO_COUNTER_L), (unsigned long long)hz,
++	    (hz > 18000000ull && hz < 20500000ull) ? "the 19.2 MHz crystal, THE GPU BLOCK IS ALIVE" :
++	    "not 19.2 MHz (the counter may need GMU firmware)");
++
++collapse:
++	{
++		unsigned keep = 0;
++		(void)PE_parse_boot_argn("sweetgpukeep", &keep, sizeof(keep));
++		if (keep) {
++			printf("SWEET GPU: sweetgpukeep=1: CX left on\n");
++		} else {
++			gpu_wr(cc, GPUCC_CX_GMU, gpu_rd(cc, GPUCC_CX_GMU) & ~1u);
++			gpu_wr(cc, GPUCC_CX_GDSC, gpu_rd(cc, GPUCC_CX_GDSC) | GDSC_SW_COLLAPSE);
++			for (unsigned i = 0; i < 500 && (gpu_rd(cc, GPUCC_CX_GDSC) & GDSC_PWR_ON); ++i)
++				delay(100);
++			printf("SWEET GPU: CX collapsed again (cx gdsc %#010x)\n", gpu_rd(cc, GPUCC_CX_GDSC));
++		}
++	}
+ done:
+ 	printf("SWEET GPU: phase 1 done after step %u\n", steps);
+ }

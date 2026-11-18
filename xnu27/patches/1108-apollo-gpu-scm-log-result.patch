@@ -1,0 +1,13 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index aa93fb0..d40c18c 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -697,6 +697,8 @@ gpu_scm(const char *what, uint64_t function, uint64_t args, uint64_t a0, uint64_
+ 		session = x6;
+ 		if (x0 != SCM_INTERRUPTED) {
+ 			*answer = x1;
++			printf("SWEET GPU:   TrustZone returns %d, answer %#llx%s\n", (int32_t)x0, (unsigned long long)x1,
++			    i ? " (after resuming an interrupted call)" : "");
+ 			return (int32_t)x0;
+ 		}
+ 	}

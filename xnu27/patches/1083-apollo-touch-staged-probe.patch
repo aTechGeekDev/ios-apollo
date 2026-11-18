@@ -1,0 +1,80 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index a22c0dc..a90b08a 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -18,6 +18,15 @@
+  *   - No firmware upload, no RPMh votes, no PMIC writes
+  *   - Only read reports and feed sweet_hid_touch()
+  *
++ * Bring-up stages (boot-arg sweettouchstage, default 1), each logged
++ * BEFORE its first access so a hang names the step:
++ *   1  read-only: TLMM config/IO of the reset and IRQ pins
++ *   2  + read-only: GENI SE status and FIFO registers
++ *   3  + reset pulse on the reset pin (TLMM writes)
++ *   4  + SPI transfers and the report loop
++ * Boot 1 on apollo (2026-10-23) hung right after the init line, before
++ * "reset pulse done": the first TLMM access is the suspect.
++ *
+  * Status (unverified on hardware):
+  *   GENI SPI uses ABL's SE firmware and packing; full-duplex FIFO transfers
+  *   with the opcode in M_CMD0[31:27] as in the I2C driver. Reads follow the
+@@ -100,6 +109,7 @@ static struct {
+ 	bool dead;
+ 	bool debug;
+ 	bool dumped;                     /* first non-empty report logged */
++	unsigned stage;
+ 	unsigned errors;
+ 	uint32_t active;                 /* bitmask of currently down fingers */
+ 	int x[TOUCH_MAX_FINGERS];
+@@ -423,11 +433,33 @@ touch_thread(void *arg, wait_result_t result)
+ 	printf("SWEET TOUCH: apollo NT36675 @ SPI 0x%x  RST=gpio%u IRQ=gpio%u\n",
+ 	    TOUCH_SE_PA, TOUCH_RST_GPIO, TOUCH_IRQ_GPIO);
+ 
++	printf("SWEET TOUCH: stage %u; step 1: TLMM read gpio%u/gpio%u @ %#x\n",
++	    st.stage, TOUCH_RST_GPIO, TOUCH_IRQ_GPIO, TOUCH_TLMM_PA);
++	printf("SWEET TOUCH: rst cfg=%#x io=%#x\n",
++	    touch_rd(st.tlmm, TLMM_GPIO_CFG(TOUCH_RST_GPIO)),
++	    touch_rd(st.tlmm, TLMM_GPIO_IN_OUT(TOUCH_RST_GPIO)));
++	printf("SWEET TOUCH: irq cfg=%#x io=%#x\n",
++	    touch_rd(st.tlmm, TLMM_GPIO_CFG(TOUCH_IRQ_GPIO)),
++	    touch_rd(st.tlmm, TLMM_GPIO_IN_OUT(TOUCH_IRQ_GPIO)));
++	if (st.stage < 2)
++		goto stop;
++
++	printf("SWEET TOUCH: step 2: GENI SE read @ %#x\n", TOUCH_SE_PA);
++	printf("SWEET TOUCH: se status=%#x irq=%#x tx-fifo=%#x rx-fifo=%#x\n",
++	    touch_rd(st.se, SE_GENI_STATUS), touch_rd(st.se, SE_GENI_M_IRQ_STATUS),
++	    touch_rd(st.se, SE_GENI_TX_FIFO_STATUS), touch_rd(st.se, SE_GENI_RX_FIFO_STATUS));
++	if (st.stage < 3)
++		goto stop;
++
++	printf("SWEET TOUCH: step 3: reset pulse\n");
+ 	/* Configure IRQ as input, pull-up (common) */
+ 	touch_gpio_cfg(TOUCH_IRQ_GPIO, 3 /* pull-up */, 0, false);
+ 
+ 	touch_reset_pulse();
++	if (st.stage < 4)
++		goto stop;
+ 
++	printf("SWEET TOUCH: step 4: SPI\n");
+ 	if (!touch_spi_init()) {
+ 		printf("SWEET TOUCH: SPI init failed\n");
+ 		goto out;
+@@ -457,6 +489,8 @@ touch_thread(void *arg, wait_result_t result)
+ 		/* 10 ms while healthy; back off to 1 s while transfers keep failing */
+ 		touch_wait_ms(st.errors > 10 ? 1000 : 10);
+ 	}
++stop:
++	printf("SWEET TOUCH: stopped after stage %u (sweettouchstage=N for more)\n", st.stage);
+ out:
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+@@ -480,6 +514,8 @@ sweet_touch_init(void)
+ 	}
+ 
+ 	(void)PE_parse_boot_argn("sweettouch_debug", &st.debug, sizeof(st.debug));
++	st.stage = 1;
++	(void)PE_parse_boot_argn("sweettouchstage", &st.stage, sizeof(st.stage));
+ 
+ 	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {

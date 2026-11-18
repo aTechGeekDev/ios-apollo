@@ -1,0 +1,50 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index d68a108..7fa8d74 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -16,6 +16,8 @@
+  * The NT36675 has no flash: Linux downloads its firmware at every boot.
+  * Under fastboot boot nothing has, so the IC answers bus reads (chip ID)
+  * but produces no touch reports until a firmware download exists.
++ * Xiaomi's driver requests the file through request_firmware(); on the
++ * user's phone it is on no partition (2026-10-23 search).
+  *
+  * Bring-up stages (boot-arg sweettouchstage, default 1), each logged
+  * BEFORE its first access so a hang names the step:
+@@ -74,10 +76,16 @@ void sweet_touch_init(void);
+ #define NVT_SPI_HDR          2              /* address byte + dummy byte */
+ #define NVT_SPI_READ(a)      ((uint8_t)((a) & 0x7fu))
+ #define NVT_SPI_WRITE(a)     ((uint8_t)(((a) & 0x7fu) | 0x80u))
++/*
++ * Values from Xiaomi's apollo driver (MiCode Xiaomi_Kernel_OpenSource
++ * apollo-q-oss, drivers/input/touchscreen/nt36672c): nt36xxx_mem_map.h
++ * NT36675_memory_map and nvt_ts_check_chip_ver_trim().
++ */
+ #define NVT_SWRST_N8_ADDR    0x3f0feu       /* DT novatek,swrst-n8-addr */
+-#define NVT_TRIM_ADDR        0x1fb104u      /* chip version trim ID */
+-#define NVT_TRIM_LEN         6
+-#define NVT_EVENT_BUF_ADDR   0x2fe00u       /* NT36675 event buffer, guess */
++#define NVT_SPI_RD_FAST_ADDR 0x3f310u       /* DT novatek,spi-rd-fast-addr */
++#define NVT_TRIM_ADDR        0x1f64eu       /* page 0x1f600, offset 0x4e */
++#define NVT_TRIM_LEN         6              /* NT36675: 0c/0e xx xx 72 66 03 */
++#define NVT_EVENT_BUF_ADDR   0x22d00u       /* NT36675 EVENT_BUF_ADDR */
+ #define NVT_POINT_DATA_LEN   65
+ #define NVT_XFER_MAX         (NVT_SPI_HDR + NVT_POINT_DATA_LEN)
+ 
+@@ -392,10 +400,13 @@ nvt_probe_id(void)
+ {
+ 	uint8_t id[NVT_TRIM_LEN] = { 0 };
+ 	int we = nvt_write_addr(NVT_SWRST_N8_ADDR, 0x69); /* bootloader reset */
+-	touch_wait_ms(10);
++	touch_wait_ms(5);                                /* tBRST2FR */
++	int fe = nvt_write_addr(NVT_SPI_RD_FAST_ADDR, 0x00); /* SPI_RD_FAST off */
+ 	int re = nvt_read(NVT_TRIM_ADDR, id, sizeof(id));
+-	printf("SWEET TOUCH: NT36xxx reset=%d id-read=%d trim id %02x %02x %02x %02x %02x %02x\n",
+-	    we, re, id[0], id[1], id[2], id[3], id[4], id[5]);
++	bool nt36675 = id[3] == 0x72 && id[4] == 0x66 && id[5] == 0x03;
++	printf("SWEET TOUCH: NT36xxx reset=%d rdfast=%d id-read=%d trim id %02x %02x %02x %02x %02x %02x%s\n",
++	    we, fe, re, id[0], id[1], id[2], id[3], id[4], id[5],
++	    nt36675 ? " = NT36675" : " (not NT36675's 72 66 03)");
+ }
+ 
+ /* ---------- report parser ---------- */

@@ -1,0 +1,28 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index cfe1c38..176e63e 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -98,6 +98,10 @@ void sweet_touch_init(void);
+ #define SE_GENI_RX_TRANS_LEN 0x270
+ #define SE_GENI_CLK_SEL      0x07c
+ #define SE_GENI_CFG_SEQ_START 0x48
++#define SE_GENI_M_CLK_CFG    0x048  /* same offset; clock divider + enable */
++#define SE_GENI_FW_REVISION  0x068  /* [15:8] protocol: 1 SPI, 3 I2C */
++#define SE_HW_PARAM_0        0xe24  /* TX FIFO depth/width */
++#define SE_HW_PARAM_1        0xe28  /* RX FIFO depth/width */
+ #define SE_FIFO_WORDS(v)     ((v) & 0x1ffffffu)
+ #define SE_M_DONE            (1u << 0)
+ #define SE_M_ERRORS          0x3eu  /* overrun, illegal, failure, cancel, abort */
+@@ -478,6 +482,12 @@ touch_thread(void *arg, wait_result_t result)
+ 	printf("SWEET TOUCH: se status=%#x irq=%#x tx-fifo=%#x rx-fifo=%#x\n",
+ 	    touch_rd(st.se, SE_GENI_STATUS), touch_rd(st.se, SE_GENI_M_IRQ_STATUS),
+ 	    touch_rd(st.se, SE_GENI_TX_FIFO_STATUS), touch_rd(st.se, SE_GENI_RX_FIFO_STATUS));
++	/* Boot 4: all four above read 0 = idle, or no firmware/clock. These tell. */
++	uint32_t fw = touch_rd(st.se, SE_GENI_FW_REVISION);
++	printf("SWEET TOUCH: se fw=%#x proto=%u (1=SPI) m-clk=%#x clk-sel=%#x hw0=%#x hw1=%#x\n",
++	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_GENI_M_CLK_CFG),
++	    touch_rd(st.se, SE_GENI_CLK_SEL), touch_rd(st.se, SE_HW_PARAM_0),
++	    touch_rd(st.se, SE_HW_PARAM_1));
+ 	if (st.stage < 3)
+ 		goto stop;
+ 

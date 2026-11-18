@@ -1,0 +1,85 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 176e63e..4a476dd 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -53,7 +53,13 @@ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
+ 
+ /* ---------- apollo hardware ---------- */
+-#define TOUCH_SE_PA          0x00994000u   /* spi@994000, qcom,spi-geni */
++/*
++ * Default SE from the DT notes (spi@994000). Boot 5: it runs UART firmware
++ * (fw 0x203, protocol 2), so the touch SPI SE is elsewhere or unconfigured;
++ * sweettouchse=PA picks another SE. Transfers need protocol 1 (SPI).
++ */
++#define TOUCH_SE_PA          0x00994000u
++#define GENI_PROTO_SPI       1u
+ /*
+  * SM8250 TLMM is three tiles (west, south, north), each with its own
+  * registers for the pins it owns. Boot 3: gpio8/9 read cfg=0 io=0 in the
+@@ -122,6 +128,7 @@ static struct {
+ 	bool dead;
+ 	bool debug;
+ 	bool dumped;                     /* first non-empty report logged */
++	uint32_t se_pa;
+ 	unsigned stage;
+ 	unsigned errors;
+ 	uint32_t active;                 /* bitmask of currently down fingers */
+@@ -229,7 +236,7 @@ static bool
+ touch_spi_init(void)
+ {
+ 	uint32_t status = touch_rd(st.se, SE_GENI_STATUS);
+-	printf("SWEET TOUCH: SE status=%#x @ 0x%x\n", status, TOUCH_SE_PA);
++	printf("SWEET TOUCH: SE status=%#x @ %#x\n", status, st.se_pa);
+ 
+ 	/* Disable DMA mode — we use FIFO like the I2C path */
+ 	touch_wr(st.se, SE_GENI_DMA_MODE_EN, 0);
+@@ -435,14 +442,16 @@ touch_thread(void *arg, wait_result_t result)
+ 	printf("SWEET TOUCH: starting in %u s\n", delay_s);
+ 	touch_wait_ms(delay_s * 1000u);
+ 
+-	st.se = ml_io_map(TOUCH_SE_PA, TOUCH_SE_SIZE);
++	st.se_pa = TOUCH_SE_PA;
++	(void)PE_parse_boot_argn("sweettouchse", &st.se_pa, sizeof(st.se_pa));
++	st.se = ml_io_map(st.se_pa, TOUCH_SE_SIZE);
+ 	if (!st.se) {
+ 		printf("SWEET TOUCH: MMIO map failed (se)\n");
+ 		goto out;
+ 	}
+ 
+-	printf("SWEET TOUCH: apollo NT36675 @ SPI 0x%x  RST=gpio%u IRQ=gpio%u\n",
+-	    TOUCH_SE_PA, TOUCH_RST_GPIO, TOUCH_IRQ_GPIO);
++	printf("SWEET TOUCH: apollo NT36675 @ SE %#x  RST=gpio%u IRQ=gpio%u\n",
++	    st.se_pa, TOUCH_RST_GPIO, TOUCH_IRQ_GPIO);
+ 
+ 	uint32_t tiles[] = {TOUCH_TLMM_WEST, TOUCH_TLMM_SOUTH, TOUCH_TLMM_NORTH};
+ 	uint32_t forced = 0, tlmm_pa = 0;
+@@ -478,7 +487,7 @@ touch_thread(void *arg, wait_result_t result)
+ 	if (st.stage < 2)
+ 		goto stop;
+ 
+-	printf("SWEET TOUCH: step 2: GENI SE read @ %#x\n", TOUCH_SE_PA);
++	printf("SWEET TOUCH: step 2: GENI SE read @ %#x\n", st.se_pa);
+ 	printf("SWEET TOUCH: se status=%#x irq=%#x tx-fifo=%#x rx-fifo=%#x\n",
+ 	    touch_rd(st.se, SE_GENI_STATUS), touch_rd(st.se, SE_GENI_M_IRQ_STATUS),
+ 	    touch_rd(st.se, SE_GENI_TX_FIFO_STATUS), touch_rd(st.se, SE_GENI_RX_FIFO_STATUS));
+@@ -488,6 +497,10 @@ touch_thread(void *arg, wait_result_t result)
+ 	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_GENI_M_CLK_CFG),
+ 	    touch_rd(st.se, SE_GENI_CLK_SEL), touch_rd(st.se, SE_HW_PARAM_0),
+ 	    touch_rd(st.se, SE_HW_PARAM_1));
++	bool spi = ((fw >> 8) & 0xffu) == GENI_PROTO_SPI;
++	if (!spi)
++		printf("SWEET TOUCH: SE %#x is not SPI (proto %u: 2=UART 3=I2C); no SPI transfers\n",
++		    st.se_pa, (fw >> 8) & 0xffu);
+ 	if (st.stage < 3)
+ 		goto stop;
+ 
+@@ -498,7 +511,7 @@ touch_thread(void *arg, wait_result_t result)
+ 	touch_gpio_cfg(TOUCH_IRQ_GPIO, 3 /* pull-up */, 0, false);
+ 
+ 	touch_reset_pulse();
+-	if (st.stage < 4)
++	if (st.stage < 4 || !spi)
+ 		goto stop;
+ 
+ 	printf("SWEET TOUCH: step 4: SPI\n");

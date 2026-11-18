@@ -1,0 +1,47 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 4d0c13b..69b76b9 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -19,7 +19,10 @@
+  * Xiaomi's driver requests the file through request_firmware(); on the
+  * user's phone it is on no partition (2026-10-23 search).
+  *
+- * Bring-up stages (boot-arg sweettouchstage, default 1), each logged
++ * Boot 10 on apollo (2026-10-24): firmware running (reset state 0xa0) and
++ * touch reaches iOS, so stage 4 is the default and the start delay 20 s.
++ *
++ * Bring-up stages (boot-arg sweettouchstage, default 4), each logged
+  * BEFORE its first access so a hang names the step:
+  *   1  read-only: TLMM config/IO of the reset and IRQ pins in every tile
+  *   2  + read-only: GENI SE firmware, clock and FIFO registers
+@@ -797,7 +800,7 @@ touch_thread(void *arg, wait_result_t result)
+ 	(void)arg;
+ 	(void)result;
+ 
+-	unsigned delay_s = 45;
++	unsigned delay_s = 20;
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	(void)PE_parse_boot_argn("sweettouchdiv", &div, sizeof(div));
+ 	printf("SWEET TOUCH: starting in %u s\n", delay_s);
+@@ -883,7 +886,11 @@ touch_thread(void *arg, wait_result_t result)
+ 	(void)PE_parse_boot_argn("sweettouchfw", &dl, sizeof(dl));
+ 	if (dl) {
+ 		printf("SWEET TOUCH: step 4: firmware download\n");
+-		(void)nvt_download();
++		if (!nvt_download()) {
++			/* Without firmware the event buffer is SRAM garbage: do not poll it. */
++			printf("SWEET TOUCH: no running firmware; touch off\n");
++			goto stop;
++		}
+ 	}
+ 	st.dumped = false;
+ 
+@@ -928,7 +935,7 @@ sweet_touch_init(void)
+ 	}
+ 
+ 	(void)PE_parse_boot_argn("sweettouch_debug", &st.debug, sizeof(st.debug));
+-	st.stage = 1;
++	st.stage = 4;
+ 	st.se_pa = TOUCH_SE_PA;
+ 	st.rst = TOUCH_RST_GPIO;
+ 	st.irq = TOUCH_IRQ_GPIO;

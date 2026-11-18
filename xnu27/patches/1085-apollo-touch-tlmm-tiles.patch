@@ -1,0 +1,103 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index a90b08a..cfe1c38 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -25,7 +25,8 @@
+  *   3  + reset pulse on the reset pin (TLMM writes)
+  *   4  + SPI transfers and the report loop
+  * Boot 1 on apollo (2026-10-23) hung right after the init line, before
+- * "reset pulse done": the first TLMM access is the suspect.
++ * "reset pulse done": GPIO writes to the wrong TLMM tile are the suspect.
++ * Stage 3 refuses to write unless stage 1 found the pins' tile.
+  *
+  * Status (unverified on hardware):
+  *   GENI SPI uses ABL's SE firmware and packing; full-duplex FIFO transfers
+@@ -53,9 +54,17 @@ void sweet_touch_init(void);
+ 
+ /* ---------- apollo hardware ---------- */
+ #define TOUCH_SE_PA          0x00994000u   /* spi@994000, qcom,spi-geni */
+-#define TOUCH_TLMM_PA        0x0f100000u   /* TLMM base (SM8250) */
++/*
++ * SM8250 TLMM is three tiles (west, south, north), each with its own
++ * registers for the pins it owns. Boot 3: gpio8/9 read cfg=0 io=0 in the
++ * west tile, i.e. not there. Stage 1 reads all three and keeps the one
++ * where the pins look configured; sweettouchtlmm=PA forces a tile.
++ */
++#define TOUCH_TLMM_WEST      0x0f100000u
++#define TOUCH_TLMM_SOUTH     0x0f500000u
++#define TOUCH_TLMM_NORTH     0x0f900000u
+ #define TOUCH_SE_SIZE        0x4000
+-#define TOUCH_TLMM_SIZE      0x300000
++#define TOUCH_TLMM_SIZE      0x10000        /* gpio0..15 of one tile */
+ 
+ #define TOUCH_RST_GPIO       8
+ #define TOUCH_IRQ_GPIO       9
+@@ -422,25 +431,46 @@ touch_thread(void *arg, wait_result_t result)
+ 	printf("SWEET TOUCH: starting in %u s\n", delay_s);
+ 	touch_wait_ms(delay_s * 1000u);
+ 
+-	st.se   = ml_io_map(TOUCH_SE_PA, TOUCH_SE_SIZE);
+-	st.tlmm = ml_io_map(TOUCH_TLMM_PA, TOUCH_TLMM_SIZE);
+-	if (!st.se || !st.tlmm) {
+-		printf("SWEET TOUCH: MMIO map failed (se=%p tlmm=%p)\n",
+-		    (void *)st.se, (void *)st.tlmm);
++	st.se = ml_io_map(TOUCH_SE_PA, TOUCH_SE_SIZE);
++	if (!st.se) {
++		printf("SWEET TOUCH: MMIO map failed (se)\n");
+ 		goto out;
+ 	}
+ 
+ 	printf("SWEET TOUCH: apollo NT36675 @ SPI 0x%x  RST=gpio%u IRQ=gpio%u\n",
+ 	    TOUCH_SE_PA, TOUCH_RST_GPIO, TOUCH_IRQ_GPIO);
+ 
+-	printf("SWEET TOUCH: stage %u; step 1: TLMM read gpio%u/gpio%u @ %#x\n",
+-	    st.stage, TOUCH_RST_GPIO, TOUCH_IRQ_GPIO, TOUCH_TLMM_PA);
+-	printf("SWEET TOUCH: rst cfg=%#x io=%#x\n",
+-	    touch_rd(st.tlmm, TLMM_GPIO_CFG(TOUCH_RST_GPIO)),
+-	    touch_rd(st.tlmm, TLMM_GPIO_IN_OUT(TOUCH_RST_GPIO)));
+-	printf("SWEET TOUCH: irq cfg=%#x io=%#x\n",
+-	    touch_rd(st.tlmm, TLMM_GPIO_CFG(TOUCH_IRQ_GPIO)),
+-	    touch_rd(st.tlmm, TLMM_GPIO_IN_OUT(TOUCH_IRQ_GPIO)));
++	uint32_t tiles[] = {TOUCH_TLMM_WEST, TOUCH_TLMM_SOUTH, TOUCH_TLMM_NORTH};
++	uint32_t forced = 0, tlmm_pa = 0;
++	unsigned ntiles = sizeof(tiles) / sizeof(tiles[0]);
++	if (PE_parse_boot_argn("sweettouchtlmm", &forced, sizeof(forced)) && forced) {
++		tiles[0] = forced;
++		ntiles = 1;
++	}
++	for (unsigned t = 0; t < ntiles; ++t) {
++		printf("SWEET TOUCH: stage %u; step 1: TLMM read gpio%u/gpio%u @ %#x\n",
++		    st.stage, TOUCH_RST_GPIO, TOUCH_IRQ_GPIO, tiles[t]);
++		vm_offset_t va = ml_io_map(tiles[t], TOUCH_TLMM_SIZE);
++		if (!va) {
++			printf("SWEET TOUCH: map %#x failed\n", tiles[t]);
++			continue;
++		}
++		uint32_t rc = touch_rd(va, TLMM_GPIO_CFG(TOUCH_RST_GPIO));
++		uint32_t ri = touch_rd(va, TLMM_GPIO_IN_OUT(TOUCH_RST_GPIO));
++		uint32_t ic = touch_rd(va, TLMM_GPIO_CFG(TOUCH_IRQ_GPIO));
++		uint32_t ii = touch_rd(va, TLMM_GPIO_IN_OUT(TOUCH_IRQ_GPIO));
++		printf("SWEET TOUCH: tile %#x rst cfg=%#x io=%#x irq cfg=%#x io=%#x\n",
++		    tiles[t], rc, ri, ic, ii);
++		if (!st.tlmm && (rc | ri | ic | ii)) {
++			st.tlmm = va;
++			tlmm_pa = tiles[t];
++		}
++	}
++	if (st.tlmm)
++		printf("SWEET TOUCH: using TLMM tile %#x\n", tlmm_pa);
++	else
++		printf("SWEET TOUCH: no TLMM tile shows gpio%u/gpio%u configured; GPIO writes disabled\n",
++		    TOUCH_RST_GPIO, TOUCH_IRQ_GPIO);
+ 	if (st.stage < 2)
+ 		goto stop;
+ 
+@@ -451,6 +481,8 @@ touch_thread(void *arg, wait_result_t result)
+ 	if (st.stage < 3)
+ 		goto stop;
+ 
++	if (!st.tlmm)
++		goto stop;
+ 	printf("SWEET TOUCH: step 3: reset pulse\n");
+ 	/* Configure IRQ as input, pull-up (common) */
+ 	touch_gpio_cfg(TOUCH_IRQ_GPIO, 3 /* pull-up */, 0, false);

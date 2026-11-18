@@ -1,0 +1,134 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 60a8137..f5ed64d 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -31,6 +31,15 @@
+  *             (DTCM) and back, then restored: can its firmware be loaded?
+  * Boot 12 (2026-10-24): steps 1-6 worked, CX came on, the GMU's always-on
+  * counter counted 19198548 Hz: the GPU block is alive.
++ * Boot 13: steps 7 and 8 (IDs, SMR/S2CR) printed, then the phone froze on
++ * the first CBAR read (SMMU page 1). The SMMU's global registers are the
++ * hypervisor's emulation: it traps the access and can only carry out plain
++ * single-register loads and stores (HackiOS redwood_adreno.c says the same,
++ * and that a store of the zero register "goes horribly wrong"); a C loop
++ * may compile to a post-indexed load. All accesses here are now one
++ * non-inlined ldr/str. CBAR reads moved to step 9. The probe runs on its
++ * own thread sweetgpudelay seconds (15) after the drivers start, so the
++ * persistent log holds everything before it.
+  * After step 4 or later the CX half is collapsed again before returning,
+  * unless boot-arg sweetgpukeep=1. The 3D core (GX) is never powered here.
+  *
+@@ -45,10 +54,13 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
+ void sweet_gpu_init(void);
+ 
+ #define GPU_GCC_PA            0x00100000u
+@@ -127,19 +139,23 @@ void sweet_gpu_init(void);
+ #define SMMU_CB_TCR           0x30u
+ #define SMMU_CB_FSR           0x58u
+ 
+-static uint32_t
++/* One plain ldr / str each: the only forms the hypervisor's emulation handles. */
++static uint32_t __attribute__((noinline))
+ gpu_rd(vm_offset_t base, uint32_t off)
+ {
+-	uint32_t v = *(volatile uint32_t *)(base + off);
++	uint32_t v;
++	vm_offset_t a = base + off;
++	__asm__ volatile("ldr %w0, [%1]" : "=r"(v) : "r"(a) : "memory");
+ 	__asm__ volatile("dmb oshld" ::: "memory");
+ 	return v;
+ }
+ 
+-static void
++static void __attribute__((noinline))
+ gpu_wr(vm_offset_t base, uint32_t off, uint32_t val)
+ {
++	vm_offset_t a = base + off;
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("str %w0, [%1]" : : "r"(val), "r"(a) : "memory");
+ 	__asm__ volatile("dsb osh" ::: "memory");
+ }
+ 
+@@ -177,13 +193,9 @@ gpu_gmu_reg(vm_offset_t gmu, const char *name, uint32_t off)
+ 	printf("SWEET GPU:   gmu %-22s %#07x = %#010x\n", name, off, gpu_rd(gmu, off));
+ }
+ 
+-void
+-sweet_gpu_init(void)
++static void
++sweet_gpu_probe(unsigned steps)
+ {
+-	unsigned steps = 0;
+-	(void)PE_parse_boot_argn("sweetgpu", &steps, sizeof(steps));
+-	if (!steps)
+-		return;
+ 	printf("SWEET GPU: Adreno 650 phase 1, steps 1..%u (nothing inside the GPU is touched)\n", steps);
+ 
+ 	vm_offset_t gcc = ml_io_map(GPU_GCC_PA, GPU_GCC_SIZE);
+@@ -365,12 +377,14 @@ sweet_gpu_init(void)
+ 	for (uint32_t i = 0; i < nsmr && i < 16; ++i)
+ 		printf("SWEET GPU:   smmu smr%u=%#010x s2cr%u=%#010x\n", i, gpu_rd(smmu, SMMU_SMR(i)),
+ 		    i, gpu_rd(smmu, SMMU_S2CR(i)));
+-	for (uint32_t i = 0; i < nctx && i < 16; ++i)
+-		printf("SWEET GPU:   smmu cbar%u=%#010x\n", i, gpu_rd(smmu, pg + 4u * i));
+ 	if (steps < 9)
+ 		goto collapse;
+ 
+-	/* ---- step 9: translation context 0 ---- */
++	/* ---- step 9: context kinds (SMMU page 1) and translation context 0 ---- */
++	for (uint32_t i = 0; i < nctx && i < 16; ++i) {
++		printf("SWEET GPU: step 9: read cbar%u at %#x\n", i, SMMU_PA + pg + 4u * i);
++		printf("SWEET GPU:   smmu cbar%u=%#010x\n", i, gpu_rd(smmu, pg + 4u * i));
++	}
+ 	uint32_t cb0 = npg * pg;
+ 	printf("SWEET GPU: step 9: read SMMU context 0 at %#x\n", SMMU_PA + cb0);
+ 	printf("SWEET GPU:   cb0 sctlr=%#x ttbr0=%#x:%#x tcr=%#x fsr=%#x\n",
+@@ -413,4 +427,37 @@ collapse:
+ done:
+ 	printf("SWEET GPU: phase 1 done after step %u\n", steps);
+ }
++
++static unsigned gpu_steps;
++static int gpu_sleep_chan;
++
++static void
++gpu_thread(void *arg, wait_result_t result)
++{
++	unsigned delay_s = 15;
++	uint64_t deadline;
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("sweetgpudelay", &delay_s, sizeof(delay_s));
++	printf("SWEET GPU: probe in %u s\n", delay_s);
++	clock_interval_to_deadline(delay_s, NSEC_PER_SEC, &deadline);
++	(void)assert_wait_deadline(&gpu_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++	sweet_gpu_probe(gpu_steps);
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_gpu_init(void)
++{
++	thread_t thread;
++	(void)PE_parse_boot_argn("sweetgpu", &gpu_steps, sizeof(gpu_steps));
++	if (!gpu_steps)
++		return;
++	if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS)
++		thread_deallocate(thread);
++	else
++		printf("SWEET GPU: kernel_thread_start failed\n");
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

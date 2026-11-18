@@ -1,0 +1,196 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index b724ddf..2d52375 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_cpufreq.c		standard
++bsd/dev/sweet_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+new file mode 100644
+index 0000000..fbdfd93
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,157 @@
++/*
++ * Adreno 650 (apollo, SM8250) bring-up, phase 1: look before touching.
++ * Nothing runs unless boot-arg sweetgpu=N asks for steps 1..N; each step
++ * says what it is about to access before it does. Modelled on the staged
++ * Adreno 642L bring-up of HackiOS (github.com/oosexgang/hackios-xnu-kernel,
++ * bsd/dev/redwood_adreno.c, APSL 2.0), which found that registers of the
++ * GPU block read while their bus clock is off freeze the phone.
++ *
++ *   1  read   main clock controller (GCC 0x100000), always readable: the
++ *             GPU config-bus clock (gcc_gpu_cfg_ahb, the gate in front of
++ *             the GPU clock controller), memnoc/snoc paths, GPLL0 votes
++ *   2  write  gcc_gpu_cfg_ahb on, only if step 1 found it off (one bit, as
++ *             Linux's clk_branch enable does)
++ *   3  read   GPU clock controller (GPUCC 0x3d90000) as the bootloader left
++ *             it: PLL1, the GMU clock source and branches, the CX power
++ *             switch (GDSC) and the GX domain. Refused unless the config-bus
++ *             clock is confirmed on.
++ *
++ * Addresses: apollo live DT (qcom,gpucc@3d90000 "qcom,gpucc-kona",
++ * gpu_cx_gdsc 0x3d9106c, gpu_gx_domain_addr 0x3d91508, gpu_cx_hw_ctrl
++ * 0x3d91540, kgsl-3d0@3d00000 chipid 0x06050002, gmu@3d6a000,
++ * kgsl-smmu@3da0000). Offsets: Xiaomi apollo-q-oss drivers/clk/qcom/
++ * gcc-kona.c and gpucc-kona.c. Nothing inside the GPU (0x3d00000..) or the
++ * GMU is touched in this phase.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_gpu_init(void);
++
++#define GPU_GCC_PA            0x00100000u
++#define GPU_GCC_SIZE          0x90000
++#define GCC_GPU_CFG_AHB       0x71004u    /* hwcg bit 1 */
++#define GCC_GPU_MEMNOC_GFX    0x7100cu
++#define GCC_GPU_SNOC_DVM_GFX  0x71018u
++#define GCC_GPU_IREF_EN       0x8c014u
++#define GCC_VOTE_0            0x52000u    /* bit 15 gpu_gpll0, bit 16 gpu_gpll0_div */
++
++#define GPU_CC_PA             0x03d90000u
++#define GPU_CC_SIZE           0x9000
++#define GPUCC_PLL1            0x100u      /* Lucid: +0 mode, +4 L */
++#define GPUCC_GMU_RCG         0x1120u     /* +0 cmd, +4 cfg */
++#define GPUCC_CXO_AON         0x1004u
++#define GPUCC_GX_GMU          0x1064u
++#define GPUCC_CX_GDSC         0x106cu     /* bit 31 PWR_ON, bit 0 SW_COLLAPSE */
++#define GPUCC_AHB             0x1078u
++#define GPUCC_CX_SNOC_DVM     0x108cu
++#define GPUCC_CX_GMU          0x1098u
++#define GPUCC_CXO             0x109cu
++#define GPUCC_GX_DOMAIN       0x1508u
++#define GPUCC_CX_HW_CTRL      0x1540u
++#define GPUCC_SMMU_VOTE       0x5000u
++
++#define CBCR_OFF(v)           (((v) >> 31) & 1u)
++
++static uint32_t
++gpu_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++gpu_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++gpu_cbcr(vm_offset_t base, const char *name, uint32_t off)
++{
++	uint32_t v = gpu_rd(base, off);
++	printf("SWEET GPU:   %-22s %#07x = %#010x  %s%s%s\n", name, off, v,
++	    CBCR_OFF(v) ? "off" : "running", (v & 1u) ? ", enabled" : "",
++	    (v & 2u) ? ", hw-gated" : "");
++}
++
++void
++sweet_gpu_init(void)
++{
++	unsigned steps = 0;
++	(void)PE_parse_boot_argn("sweetgpu", &steps, sizeof(steps));
++	if (!steps)
++		return;
++	printf("SWEET GPU: Adreno 650 phase 1, steps 1..%u (nothing inside the GPU is touched)\n", steps);
++
++	vm_offset_t gcc = ml_io_map(GPU_GCC_PA, GPU_GCC_SIZE);
++	if (!gcc) {
++		printf("SWEET GPU: GCC map failed\n");
++		return;
++	}
++	printf("SWEET GPU: step 1: read GCC %#x GPU clocks\n", GPU_GCC_PA);
++	gpu_cbcr(gcc, "gcc_gpu_cfg_ahb", GCC_GPU_CFG_AHB);
++	gpu_cbcr(gcc, "gcc_gpu_memnoc_gfx", GCC_GPU_MEMNOC_GFX);
++	gpu_cbcr(gcc, "gcc_gpu_snoc_dvm_gfx", GCC_GPU_SNOC_DVM_GFX);
++	gpu_cbcr(gcc, "gcc_gpu_iref_en", GCC_GPU_IREF_EN);
++	uint32_t vote = gpu_rd(gcc, GCC_VOTE_0);
++	printf("SWEET GPU:   gcc vote %#x = %#010x  gpu_gpll0 %u, gpu_gpll0_div %u\n",
++	    GCC_VOTE_0, vote, (vote >> 15) & 1u, (vote >> 16) & 1u);
++	uint32_t ahb = gpu_rd(gcc, GCC_GPU_CFG_AHB);
++	bool ahb_ok = (ahb & 1u) || (ahb & 2u);
++	if (steps < 2)
++		goto done;
++
++	if (!ahb_ok) {
++		printf("SWEET GPU: step 2: write GCC %#x |= 1 (gcc_gpu_cfg_ahb on)\n", GCC_GPU_CFG_AHB);
++		gpu_wr(gcc, GCC_GPU_CFG_AHB, ahb | 1u);
++		for (unsigned i = 0; i < 200 && CBCR_OFF(gpu_rd(gcc, GCC_GPU_CFG_AHB)); ++i)
++			delay(10);
++		ahb = gpu_rd(gcc, GCC_GPU_CFG_AHB);
++		ahb_ok = !CBCR_OFF(ahb) || (ahb & 2u);
++		printf("SWEET GPU: step 2: gcc_gpu_cfg_ahb now %#010x (%s)\n", ahb, ahb_ok ? "on" : "STILL OFF");
++	} else {
++		printf("SWEET GPU: step 2: gcc_gpu_cfg_ahb already on (%#010x); nothing written\n", ahb);
++	}
++	if (steps < 3)
++		goto done;
++
++	if (!ahb_ok) {
++		printf("SWEET GPU: step 3 refused: GPU config-bus clock not on\n");
++		goto done;
++	}
++	vm_offset_t cc = ml_io_map(GPU_CC_PA, GPU_CC_SIZE);
++	if (!cc) {
++		printf("SWEET GPU: GPUCC map failed\n");
++		goto done;
++	}
++	printf("SWEET GPU: step 3: read GPUCC %#x\n", GPU_CC_PA);
++	uint32_t mode = gpu_rd(cc, GPUCC_PLL1), l = gpu_rd(cc, GPUCC_PLL1 + 4u);
++	printf("SWEET GPU:   pll1 mode=%#010x (%s) L=%#x (%u MHz if locked)\n", mode,
++	    (mode >> 31) ? "locked" : "not locked", l, (l & 0xffffu) * 192u / 10u);
++	printf("SWEET GPU:   gmu rcg cmd=%#010x cfg=%#010x\n",
++	    gpu_rd(cc, GPUCC_GMU_RCG), gpu_rd(cc, GPUCC_GMU_RCG + 4u));
++	gpu_cbcr(cc, "gpu_cc_ahb", GPUCC_AHB);
++	gpu_cbcr(cc, "gpu_cc_cxo", GPUCC_CXO);
++	gpu_cbcr(cc, "gpu_cc_cxo_aon", GPUCC_CXO_AON);
++	gpu_cbcr(cc, "gpu_cc_cx_gmu", GPUCC_CX_GMU);
++	gpu_cbcr(cc, "gpu_cc_gx_gmu", GPUCC_GX_GMU);
++	gpu_cbcr(cc, "gpu_cc_cx_snoc_dvm", GPUCC_CX_SNOC_DVM);
++	gpu_cbcr(cc, "gpu_cc_hlos1_vote_smmu", GPUCC_SMMU_VOTE);
++	uint32_t cx = gpu_rd(cc, GPUCC_CX_GDSC);
++	printf("SWEET GPU:   cx gdsc %#x = %#010x  %s%s\n", GPUCC_CX_GDSC, cx,
++	    (cx >> 31) ? "powered" : "off", (cx & 1u) ? ", sw-collapse requested" : "");
++	printf("SWEET GPU:   gx domain %#x = %#010x, cx hw ctrl %#x = %#010x\n",
++	    GPUCC_GX_DOMAIN, gpu_rd(cc, GPUCC_GX_DOMAIN), GPUCC_CX_HW_CTRL, gpu_rd(cc, GPUCC_CX_HW_CTRL));
++done:
++	printf("SWEET GPU: phase 1 done after step %u\n", steps);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 593ab3e..002aa8a 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_cpufreq_init(void);
++extern void sweet_gpu_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -657,6 +658,8 @@ sweet_ufs_init(void)
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	/* CPU clock first: firmware leaves the cores slow (apollo, sweet_cpufreq.c). */
+ 	sweet_cpufreq_init();
++	/* Adreno 650 probe; does nothing without boot-arg sweetgpu=N (sweet_gpu.c). */
++	sweet_gpu_init();
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */

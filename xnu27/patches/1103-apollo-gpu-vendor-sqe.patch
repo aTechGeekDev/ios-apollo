@@ -1,0 +1,22 @@
+diff --git a/bsd/dev/sweet_gpu.c b/bsd/dev/sweet_gpu.c
+index 76aefdc..1952e62 100644
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1392,10 +1392,13 @@ sweet_gpu_probe(unsigned steps)
+ 	uint32_t sqe_ver = sqe[4] | ((uint32_t)sqe[5] << 8) | ((uint32_t)sqe[6] << 16) | ((uint32_t)sqe[7] << 24);
+ 	printf("SWEET GPU: step 18: a650_sqe.fw %u bytes, version word %#x (%#x, Linux wants >= %#x)\n", sqe_size, sqe_ver,
+ 	    sqe_ver & 0xfffu, GPU_SQE_MIN_VERSION);
+-	if ((sqe_ver & 0xfffu) < GPU_SQE_MIN_VERSION) {
+-		printf("SWEET GPU: step 18: microcode too old\n");
+-		goto collapse;
+-	}
++	/*
++	 * Boot 18: apollo's a650_sqe.fw is 0x093. Linux refuses below 0x095 for
++	 * security fixes that matter once untrusted programs submit commands;
++	 * Xiaomi's kgsl runs this file. Only our own commands run here.
++	 */
++	if ((sqe_ver & 0xfffu) < GPU_SQE_MIN_VERSION)
++		printf("SWEET GPU: step 18: older than Linux's minimum (vendor kgsl runs it): used for our own commands only\n");
+ 	if (!gpu_block_new(&core_space, &core_ring, CORE_RING_VA, CORE_RING_SIZE, PTE_CORE) ||
+ 	    !gpu_block_new(&core_space, &core_sqe, CORE_SQE_VA, sqe_size - 4u, PTE_CORE | PTE_READ_ONLY)) {
+ 		printf("SWEET GPU: step 18: no memory for the core\n");

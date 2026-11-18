@@ -1,0 +1,315 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 443acfb..4d0c13b 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -24,7 +24,8 @@
+  *   1  read-only: TLMM config/IO of the reset and IRQ pins in every tile
+  *   2  + read-only: GENI SE firmware, clock and FIFO registers
+  *   3  + reset pulse on the reset pin (TLMM writes)
+- *   4  + SE4 clock votes (GCC), SPI pin mux, SE setup, chip-ID read, report loop
++ *   4  + SE4 clock votes (GCC), SPI pin mux, SE setup, chip-ID read,
++ *      firmware download from the ADT (sweettouchfw=0 skips), report loop
+  * Overrides: sweettouchse=PA, sweettouchtlmm=PA, sweettouchrst=N,
+  * sweettouchirq=N, sweettouchdiv=N (SPI clock = SE clock / N, default 4),
+  * sweettouchbuf=ADDR (event buffer), sweettouchdelay=S, sweettouch_debug=1.
+@@ -44,6 +45,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -109,6 +111,24 @@ void sweet_touch_init(void);
+ #define NVT_TRIM_LEN         6              /* NT36675: 0c/0e xx xx 72 66 03 */
+ #define NVT_EVENT_BUF_ADDR   0x22d00u       /* NT36675 EVENT_BUF_ADDR */
+ #define NVT_POINT_DATA_LEN   65
++/* Host download with HW CRC (NT36675: carrier_system 2, hw_crc 2) */
++#define NVT_EVENT_MAP_HOST_CMD 0x50u
++#define NVT_EVENT_MAP_RESET_COMPLETE 0x60u
++#define NVT_RESET_STATE_INIT 0xa0u
++#define NVT_RESET_STATE_MAX  0xafu
++#define NVT_BOOT_RDY_ADDR    0x3f10du
++#define NVT_BLD_CRC_EN_ADDR  0x3f30eu
++#define NVT_ILM_DES_ADDR     0x3f128u
++#define NVT_ILM_LENGTH_ADDR  0x3f118u
++#define NVT_G_ILM_CHECKSUM_ADDR 0x3f100u
++#define NVT_DLM_DES_ADDR     0x3f12cu
++#define NVT_DLM_LENGTH_ADDR  0x3f130u
++#define NVT_G_DLM_CHECKSUM_ADDR 0x3f104u
++#define NVT_BLD_ILM_DLM_CRC_ADDR 0x3f133u
++#define NVT_R_ILM_CHECKSUM_ADDR 0x3f120u
++#define NVT_R_DLM_CHECKSUM_ADDR 0x3f124u
++#define NVT_FW_CHUNK         4096u
++#define NVT_MAX_PARTITIONS   32u
+ #define NVT_XFER_MAX         (NVT_SPI_HDR + NVT_POINT_DATA_LEN)
+ 
+ /* GENI SE registers (common, as in sweet's I2C driver) */
+@@ -387,7 +407,7 @@ touch_spi_init(unsigned div, unsigned clk_sel)
+ 
+ /*
+  * Full-duplex transfer of len bytes (GENI SPI needs equal TX and RX
+- * lengths). TX words are queued a few at a time and the RX FIFO is drained
++ * lengths); rx may be NULL to discard what comes back. TX words are queued a few at a time and the RX FIFO is drained
+  * while the command runs, so transfers larger than the FIFO do not overrun.
+  */
+ static int
+@@ -411,7 +431,9 @@ touch_spi_xfer(const uint8_t *tx, uint8_t *rx, size_t len)
+ 	touch_wr(st.se, SE_SPI_RX_TRANS_LEN, (uint32_t)len);
+ 	touch_wr(st.se, SE_GENI_M_CMD0, (uint32_t)GENI_SPI_FULL_DUPLEX << GENI_OPCODE_SHIFT);
+ 
+-	for (unsigned spins = 0; spins < 10000; ++spins) {
++	/* Give up after 10000 polls (~10 ms) without any FIFO progress. */
++	for (unsigned idle = 0; idle < 10000; ++idle) {
++		size_t before = txi + rxi;
+ 		while (txi < len &&
+ 		    SE_FIFO_WORDS(touch_rd(st.se, SE_GENI_TX_FIFO_STATUS)) < TOUCH_TX_FIFO_SLACK) {
+ 			uint32_t word = 0;
+@@ -422,8 +444,10 @@ touch_spi_xfer(const uint8_t *tx, uint8_t *rx, size_t len)
+ 		for (uint32_t n = SE_FIFO_WORDS(touch_rd(st.se, SE_GENI_RX_FIFO_STATUS));
+ 		    n && rxi < len; --n) {
+ 			uint32_t word = touch_rd(st.se, SE_GENI_RX_FIFO);
+-			for (unsigned b = 0; b < 4 && rxi < len; ++b, ++rxi)
+-				rx[rxi] = (uint8_t)(word >> (8 * b));
++			for (unsigned b = 0; b < 4 && rxi < len; ++b, ++rxi) {
++				if (rx)
++					rx[rxi] = (uint8_t)(word >> (8 * b));
++			}
+ 		}
+ 		uint32_t irq = touch_rd(st.se, SE_GENI_M_IRQ_STATUS);
+ 		if (irq & SE_M_ERRORS) {
+@@ -439,7 +463,10 @@ touch_spi_xfer(const uint8_t *tx, uint8_t *rx, size_t len)
+ 		}
+ 		if (done && rxi >= len)
+ 			break;
+-		delay(1);
++		if (txi + rxi != before)
++			idle = 0;
++		else
++			delay(1);
+ 	}
+ 	if (!done || rxi < len) {
+ 		touch_wr(st.se, SE_GENI_M_CMD_CTRL, 2);
+@@ -511,6 +538,208 @@ nvt_probe_id(void)
+ 	    nt36675 ? " = NT36675" : " (not NT36675's 72 66 03)");
+ }
+ 
++/* ---------- firmware host download (Xiaomi nt36xxx_fw_update.c) ---------- */
++/*
++ * The NT36675 has no flash: its firmware is written into SRAM over SPI after
++ * every reset. The file (novatek_nt36675_j3s_fw01.bin from Xiaomi's vendor
++ * image, not in git) reaches the kernel as /sweet-touch "firmware" in the
++ * ADT (tools/mkadt.py --touch-fw). Flow as nvt_download_firmware_hw_crc():
++ * bootloader reset, write every partition to SRAM, program ILM/DLM
++ * destination, length and golden CRC, enable BLD and FW CRC, boot ready,
++ * wait for the reset state 0xa0..0xaf.
++ */
++struct nvt_part {
++	uint32_t sram, size, bin, crc;
++};
++static struct nvt_part nvt_parts[NVT_MAX_PARTITIONS];
++static unsigned nvt_nparts;
++static uint8_t nvt_chunk[1 + NVT_FW_CHUNK];
++
++static uint32_t
++nvt_word(const uint8_t *p)
++{
++	return p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++/* "NVT" or "MOD" at the end of a 4 KiB sector marks the image end. */
++static size_t
++nvt_fw_need_size(const uint8_t *fw, size_t size)
++{
++	for (size_t i = size / 4096; i > 0; --i) {
++		const uint8_t *e = fw + i * 4096 - 3;
++		if ((e[0] == 'N' && e[1] == 'V' && e[2] == 'T') ||
++		    (e[0] == 'M' && e[1] == 'O' && e[2] == 'D'))
++			return i * 4096;
++	}
++	return 0;
++}
++
++/* nvt_bin_header_parser() with hw_crc: CRCs come from the header. */
++static bool
++nvt_parse_header(const uint8_t *fw, size_t size)
++{
++	uint32_t end = nvt_word(fw);
++	unsigned info = 0, ovly = (fw[0x28] & 0x10) ? (fw[0x28] & 0x0fu) : 0;
++	for (uint32_t pos = 0x30; pos < end; pos += 0x10)
++		info++;
++	nvt_nparts = 2 + ovly + info;
++	if (nvt_nparts > NVT_MAX_PARTITIONS) {
++		printf("SWEET TOUCH: fw has %u partitions (max %u)\n", nvt_nparts, NVT_MAX_PARTITIONS);
++		return false;
++	}
++	for (unsigned i = 0; i < nvt_nparts; ++i) {
++		struct nvt_part *p = &nvt_parts[i];
++		if (i < 2) {
++			p->bin = nvt_word(fw + 12 * i);
++			p->sram = nvt_word(fw + 4 + 12 * i);
++			p->size = nvt_word(fw + 8 + 12 * i);
++			p->crc = nvt_word(fw + 0x18 + 4 * i);
++		} else {
++			uint32_t pos = i < 2 + info ? 0x30 + 0x10 * (i - 2) :
++			    nvt_parts[1].bin + 0x10 * (i - 2 - info);
++			if (pos + 16 > size)
++				return false;
++			p->sram = nvt_word(fw + pos);
++			p->size = nvt_word(fw + pos + 4);
++			p->bin = nvt_word(fw + pos + 8);
++			p->crc = nvt_word(fw + pos + 12);
++		}
++		if ((uint64_t)p->bin + p->size > size) {
++			printf("SWEET TOUCH: fw partition %u (bin %#x size %#x) beyond %#x\n",
++			    i, p->bin, p->size, (unsigned)size);
++			return false;
++		}
++	}
++	printf("SWEET TOUCH: fw %u partitions (ovly %u info %u), ILM sram %#x size %#x, DLM sram %#x size %#x\n",
++	    nvt_nparts, ovly, info, nvt_parts[0].sram, nvt_parts[0].size,
++	    nvt_parts[1].sram, nvt_parts[1].size);
++	return true;
++}
++
++static int
++nvt_write_sram(const uint8_t *fw, uint32_t sram, uint32_t size, uint32_t bin)
++{
++	while (size) {
++		uint32_t len = size < NVT_FW_CHUNK ? size : NVT_FW_CHUNK;
++		if (nvt_set_page(sram))
++			return -1;
++		nvt_chunk[0] = NVT_SPI_WRITE(sram);
++		for (uint32_t i = 0; i < len; ++i)
++			nvt_chunk[1 + i] = fw[bin + i];
++		if (touch_spi_xfer(nvt_chunk, NULL, 1 + len))
++			return -1;
++		sram += len;
++		bin += len;
++		size -= len;
++	}
++	return 0;
++}
++
++/* Write little-endian bytes of val (n of them) at an address in the current page. */
++static int
++nvt_write_le(uint32_t addr, uint32_t val, unsigned n)
++{
++	uint8_t b[5] = { NVT_SPI_WRITE(addr), (uint8_t)val, (uint8_t)(val >> 8),
++		(uint8_t)(val >> 16), (uint8_t)(val >> 24) };
++	return nvt_write(b, 1 + n);
++}
++
++static void
++nvt_set_crc_bank(uint32_t des, uint32_t sram, uint32_t len_addr, uint32_t size,
++    uint32_t gcrc_addr, uint32_t crc)
++{
++	(void)nvt_set_page(des);
++	(void)nvt_write_le(des, sram & 0xffffffu, 3);
++	(void)nvt_write_le(len_addr, size & 0x1ffffu, 3);   /* hw_crc 2: 4-byte write, 17 bits */
++	(void)nvt_write_le(gcrc_addr, crc, 4);
++}
++
++static int
++nvt_read_u32(uint32_t addr, uint32_t *v)
++{
++	uint8_t b[4];
++	if (nvt_read(addr, b, sizeof(b)))
++		return -1;
++	*v = nvt_word(b);
++	return 0;
++}
++
++static bool
++nvt_download(void)
++{
++	const void *prop = NULL;
++	unsigned int size = 0;
++	DTEntry node;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-touch", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "firmware", &prop, &size) != kSuccess || size < 0x1000) {
++		printf("SWEET TOUCH: no /sweet-touch firmware in the ADT (mkadt.py --touch-fw); no download\n");
++		return false;
++	}
++	const uint8_t *fw = prop;
++	size_t need = nvt_fw_need_size(fw, size);
++	if (!need) {
++		printf("SWEET TOUCH: fw (%u bytes) has no NVT/MOD end flag\n", size);
++		return false;
++	}
++	uint8_t ver = fw[need - 4096], bar = fw[need - 4096 + 1];
++	printf("SWEET TOUCH: fw %u bytes, image %#x, version %#x (bar %#x%s)\n", size,
++	    (unsigned)need, ver, bar, (ver + bar == 0xff) ? "" : ", BAD");
++	if (ver + bar != 0xff || !nvt_parse_header(fw, size))
++		return false;
++
++	for (unsigned attempt = 1; attempt <= 3; ++attempt) {
++		(void)nvt_write_addr(NVT_SWRST_N8_ADDR, 0x69);       /* bootloader reset */
++		touch_wait_ms(5);
++		(void)nvt_write_addr(NVT_SPI_RD_FAST_ADDR, 0x00);
++		bool ok = true;
++		for (unsigned i = 0; i < nvt_nparts && ok; ++i) {
++			/* Linux writes size + 1 bytes; stay inside the file. */
++			uint32_t w = nvt_parts[i].size + 1;
++			if (nvt_parts[i].bin + w > size)
++				w = size - nvt_parts[i].bin;
++			if (nvt_parts[i].size)
++				ok = !nvt_write_sram(fw, nvt_parts[i].sram, w, nvt_parts[i].bin);
++		}
++		if (!ok) {
++			printf("SWEET TOUCH: fw SRAM write failed (attempt %u)\n", attempt);
++			continue;
++		}
++		nvt_set_crc_bank(NVT_ILM_DES_ADDR, nvt_parts[0].sram, NVT_ILM_LENGTH_ADDR,
++		    nvt_parts[0].size, NVT_G_ILM_CHECKSUM_ADDR, nvt_parts[0].crc);
++		nvt_set_crc_bank(NVT_DLM_DES_ADDR, nvt_parts[1].sram, NVT_DLM_LENGTH_ADDR,
++		    nvt_parts[1].size, NVT_G_DLM_CHECKSUM_ADDR, nvt_parts[1].crc);
++		uint8_t en = 0;                                       /* BLD CRC enable */
++		(void)nvt_read(NVT_BLD_CRC_EN_ADDR, &en, 1);
++		(void)nvt_write_addr(NVT_BLD_CRC_EN_ADDR, en | 0x80u);
++		(void)nvt_write_addr(st.evbuf | NVT_EVENT_MAP_RESET_COMPLETE, 0x00);
++		(void)nvt_write_addr(st.evbuf | NVT_EVENT_MAP_HOST_CMD, 0xae); /* FW CRC on */
++		(void)nvt_write_addr(NVT_BOOT_RDY_ADDR, 1);          /* boot ready */
++		touch_wait_ms(5);
++		uint8_t state[5] = { 0 };
++		for (unsigned t = 0; t <= 20; ++t) {
++			(void)nvt_read(st.evbuf | NVT_EVENT_MAP_RESET_COMPLETE, state, sizeof(state));
++			if (state[0] >= NVT_RESET_STATE_INIT && state[0] <= NVT_RESET_STATE_MAX) {
++				printf("SWEET TOUCH: fw running, reset state %#x (attempt %u)\n",
++				    state[0], attempt);
++				return true;
++			}
++			touch_wait_ms(10);
++		}
++		uint8_t crcflag = 0;
++		uint32_t gi = 0, ri = 0, gd = 0, rd = 0;
++		(void)nvt_read(NVT_BLD_ILM_DLM_CRC_ADDR, &crcflag, 1);
++		(void)nvt_read_u32(NVT_G_ILM_CHECKSUM_ADDR, &gi);
++		(void)nvt_read_u32(NVT_R_ILM_CHECKSUM_ADDR, &ri);
++		(void)nvt_read_u32(NVT_G_DLM_CHECKSUM_ADDR, &gd);
++		(void)nvt_read_u32(NVT_R_DLM_CHECKSUM_ADDR, &rd);
++		printf("SWEET TOUCH: fw not running (attempt %u): state %02x %02x %02x %02x %02x crc-flag %#x ilm %#x/%#x/%#x dlm %#x/%#x/%#x\n",
++		    attempt, state[0], state[1], state[2], state[3], state[4], crcflag,
++		    nvt_parts[0].crc, gi, ri, nvt_parts[1].crc, gd, rd);
++	}
++	return false;
++}
++
+ /* ---------- report parser ---------- */
+ /*
+  * NT36xxx event buffer, 6 bytes per finger (nvt_ts_work_func):
+@@ -650,6 +879,13 @@ touch_thread(void *arg, wait_result_t result)
+ 	if (!touch_spi_init(div, (unsigned)clk_sel))
+ 		goto out;
+ 	nvt_probe_id();
++	int dl = 1;
++	(void)PE_parse_boot_argn("sweettouchfw", &dl, sizeof(dl));
++	if (dl) {
++		printf("SWEET TOUCH: step 4: firmware download\n");
++		(void)nvt_download();
++	}
++	st.dumped = false;
+ 
+ 	printf("SWEET TOUCH: report loop, event buffer %#x\n", st.evbuf);
+ 	for (;;) {

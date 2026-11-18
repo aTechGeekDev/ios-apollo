@@ -1,0 +1,158 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index a9f8875..b724ddf 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -110,6 +110,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_cpufreq.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+new file mode 100644
+index 0000000..dee5e46
+--- /dev/null
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -0,0 +1,119 @@
++/*
++ * SM8250 (apollo) CPU clock through the OSM hardware ("qcom,cpufreq-hw").
++ * Under fastboot boot nothing sets the CPU frequency: Android's
++ * qcom-cpufreq-hw driver raises it, XNU has none, so the cores stay where
++ * the bootloader left them (apollo 2026-10-24: touch fine, GUI slow).
++ *
++ * Per frequency domain (silver cpu0-3, gold cpu4-6, prime cpu7) the
++ * firmware-programmed table has one 32-byte row per level at 0x110:
++ * [31:30] source (0 = 300 MHz alternate PLL, else 19.2 MHz XO x [7:0]),
++ * [18:16] core count; rows with fewer cores than row 0 are boost levels.
++ * Writing a row index to 0x920 requests that level; the hardware handles
++ * voltage. Offsets from Xiaomi apollo-q-oss drivers/cpufreq/qcom-cpufreq-hw.c
++ * (cpufreq_qcom_std_offsets), domain bases from upstream sm8250.dtsi.
++ *
++ * Boot-arg sweetcpufreq: 0 = only log, 1 = highest non-boost level
++ * (default), N > 1 = highest non-boost level at or below N MHz.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_cpufreq_init(void);
++
++#define CPUFREQ_DOMAIN_PA(d)  (0x18591000u + 0x1000u * (d))
++#define CPUFREQ_DOMAINS       3u
++#define CPUFREQ_ENABLE        0x000u
++#define CPUFREQ_FREQ_LUT      0x110u
++#define CPUFREQ_PERF_STATE    0x920u
++#define CPUFREQ_LUT_ROW       32u
++#define CPUFREQ_LUT_MAX       40u
++#define CPUFREQ_ALT_KHZ       300000u     /* GPLL0 600 MHz / 2 */
++#define CPUFREQ_XO_KHZ        19200u
++
++static uint32_t
++cpufreq_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++cpufreq_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/* Microseconds for a fixed dependent-add loop on this core: relative speed. */
++static uint64_t
++cpufreq_bench(void)
++{
++	volatile uint64_t acc = 0;
++	uint64_t t0 = mach_absolute_time(), ns;
++	for (uint64_t i = 0; i < 20000000ull; ++i)
++		acc += i;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return ns / 1000;
++}
++
++void
++sweet_cpufreq_init(void)
++{
++	unsigned mode = 1;
++	(void)PE_parse_boot_argn("sweetcpufreq", &mode, sizeof(mode));
++	uint64_t before = cpufreq_bench();
++
++	for (unsigned d = 0; d < CPUFREQ_DOMAINS; ++d) {
++		vm_offset_t base = ml_io_map(CPUFREQ_DOMAIN_PA(d), 0x1000);
++		if (!base) {
++			printf("SWEET CPUFREQ: domain %u map failed\n", d);
++			continue;
++		}
++		uint32_t en = cpufreq_rd(base, CPUFREQ_ENABLE);
++		uint32_t cur = cpufreq_rd(base, CPUFREQ_PERF_STATE);
++		if (!(en & 1u)) {
++			printf("SWEET CPUFREQ: domain %u not enabled by firmware (%#x); left alone\n", d, en);
++			continue;
++		}
++		unsigned n = 0, top = 0, cc0 = 0, prev_khz = 0, prev_cc = 0;
++		unsigned khz[CPUFREQ_LUT_MAX], cc[CPUFREQ_LUT_MAX];
++		for (unsigned i = 0; i < CPUFREQ_LUT_MAX; ++i) {
++			uint32_t row = cpufreq_rd(base, CPUFREQ_FREQ_LUT + i * CPUFREQ_LUT_ROW);
++			unsigned f = (row >> 30) ? CPUFREQ_XO_KHZ * (row & 0xffu) : CPUFREQ_ALT_KHZ;
++			unsigned c = (row >> 16) & 7u;
++			if (i > 0 && f == prev_khz && c == prev_cc)
++				break;  /* repeated row = end of table */
++			if (i == 0)
++				cc0 = c;
++			khz[i] = f;
++			cc[i] = c;
++			n = i + 1;
++			if (c == cc0 && (mode <= 1 || f / 1000u <= mode))
++				top = i;
++			prev_khz = f;
++			prev_cc = c;
++		}
++		printf("SWEET CPUFREQ: domain %u: %u levels %u..%u MHz, firmware left level %u (%u MHz)\n",
++		    d, n, n ? khz[0] / 1000u : 0, n ? khz[n - 1] / 1000u : 0, cur,
++		    cur < n ? khz[cur] / 1000u : 0);
++		for (unsigned i = 0; i < n; ++i) {
++			if (cc[i] != cc0)
++				printf("SWEET CPUFREQ:   level %u %u MHz boost (%u cores)\n", i, khz[i] / 1000u, cc[i]);
++		}
++		if (mode == 0 || n == 0)
++			continue;
++		cpufreq_wr(base, CPUFREQ_PERF_STATE, top);
++		printf("SWEET CPUFREQ: domain %u -> level %u (%u MHz), readback %u\n",
++		    d, top, khz[top] / 1000u, cpufreq_rd(base, CPUFREQ_PERF_STATE));
++	}
++	printf("SWEET CPUFREQ: busy loop %llu us before, %llu us after (mode %u)\n",
++	    (unsigned long long)before, (unsigned long long)cpufreq_bench(), mode);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..593ab3e 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_cpufreq_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -654,6 +655,8 @@ sweet_ufs_init(void)
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	/* CPU clock first: firmware leaves the cores slow (apollo, sweet_cpufreq.c). */
++	sweet_cpufreq_init();
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */

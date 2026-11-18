@@ -1,0 +1,21 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index a174cdd..c76b5c2 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -288,6 +288,16 @@ touch_clocks(void)
+ 		level = 0;
+ 	}
+ 	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
++		/*
++		 * HW_CTL (bit 1) set = hardware clock gating: CLK_OFF reads 1 while
++		 * idle (boot 7: s_ahb 0x17008 = 0x80000002). Linux skips the halt
++		 * check for these (clk_branch_in_hwcg_mode).
++		 */
++		uint32_t cbcr = touch_rd(st.gcc, branches[i]);
++		if (cbcr & 2u) {
++			printf("SWEET TOUCH: GCC branch %#x hw-gated (%#x)\n", branches[i], cbcr);
++			continue;
++		}
+ 		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+ 			printf("SWEET TOUCH: GCC branch %#x still off (%#x)\n", branches[i],
+ 			    touch_rd(st.gcc, branches[i]));
