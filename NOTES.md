@@ -2,6 +2,39 @@
 
 ## Agent handoff / active work
 
+### >>> iOS 27 TRACK: RESEARCH (2026-11-18, user: "i need ios 27" / "people have done it online look") <<<
+
+**Correction of my first answer (I said iOS 27 cannot run without PAC):** arm64e iOS does run on ARMv8.2 CPUs without pointer authentication. The PAC instructions are rewritten (de-PAC) and the kernel emulates the few that cannot be rewritten. What I read (repos cloned 2026-11-18; status is the authors' own claims):
+- **[IOS-26-Hot](https://github.com/nithinyadavamaraboina-online/IOS-26-Hot)** (MIT, dipa-studio; the project our metal2 stack came from), d249939 2026-11-01:
+  - iOS 26.5.2 (23F84, iPhone 11 Pro D421AP identity) with Liquid Glass composited by HotMetal2 + Turnip.
+  - Phones: Snapdragon 855 (Realme X2 Pro, Pixel 4), Cortex-A76 without PAC.
+  - Kernel: xnu-12377.121.6 DEVELOPMENT_ARM64_SWEET, `xnu/patches-26` 0003-0151, with a `locore.s` PAC trap fast path and a `sleh.c` emulator.
+  - Userland: offline de-PAC (`tools/de-pac-arm64e.py`, `de_pac_fast.c`); HFS+ root on userdata; booted from its own shim. Our model exactly.
+- **[darwin-lisa](https://github.com/mateusseiboth/darwin-lisa)** (SM7325, A78, no PAC):
+  - iOS 26 to the home screen (its sessions 2026-11-09..12).
+  - `pacstrip` rewriter, plus a page-in rewriting pager.
+  - On the real iOS 26 cache: 12.5M rewrites, only 3,007 to emulate (LDRAA, LDRAB, FJCVTZS).
+  - `docs/ios27-migration.md` (2026-11-16) is the best iOS 27 reference.
+- **[UniXNU-zeta](https://github.com/none24smu/UniXNU-zeta)** (SD888-class Surface Duo 2): iOS 26.5.2; launchd runs in the 29.6M-word lowered cache.
+- **[Bergamota](https://github.com/ry-diffusion/bergamota):** iOS 18.7.8 to SpringBoard on an SDM845.
+- **[ios26-sweet](https://github.com/marnov999/ios26-sweet):** our lineage on 12377; preparation only.
+
+**iOS 27 itself on a CPU without PAC: nobody has published it** (darwin-lisa's survey, 2026-11-16: every UniXNU 27 board has PAC; garnet, the one without, "not bootable"). But per darwin-lisa:
+- **The same technique applies:** de-PAC does not depend on the iOS version.
+- **The CPU floor hasn't moved:** iOS 27 still supports the A13 (iPhone 11 gets 27.2.1).
+- **The kernel is the same:** UniXNU's "iOS 27" kernel is xnu-12377.121.6 + `darwin26-syscalls.patch` (pipe2, dup3, fchflagsat, getumask, aio_readv/writev, fsctlat, guarded_ftruncate_np) + `darwin26-shared-region.patch` (+ `darwin26-kpi.patch`, only for Apple kexts, which we don't load). Apple's own 27 kernel (xnu-13432) is not public.
+- **Their estimate:** 6-15 days from a working 26 port to 27.
+
+**Measured here:** IOS-26-Hot's `patches-26` without their phone patches (flame-*/rmx1931-*) on a fresh xnu-12377.121.6 (ac9718fb): 82 apply, 14 fail.
+- 0031 and 0041 need `0026-stage-hfs.sh` run first (not run here).
+- 0131/0132/0134/0136-0139/0142/0145/0148/0150/0151 are tangled with their phone drivers (sweet_gpu.c, sweet_pmem.c, redwood_apple80211.c, kern_exec.c context) and need splitting.
+
+**Proposed route (not started; waiting for the user's go):**
+1. **Kernel:** xnu-12377 for apollo = IOS-26-Hot 0000-0081 + the generic parts of their `ios26-*` patches + our apollo drivers 0082-0186 ported to 12377 (the bulk; ios26-sweet measured the same change set: 110 new files copy over, 30 of 78 edited Apple files conflict). CI is darwin-xnu-build at DXB bd886971, MACOS_VERSION 26.5.
+2. **iOS 26.5.2 userland first** (IOS-26-Hot's proven recipe: de-PAC + overlay, `tools/make-ios26-overlay.py`), first boot on apollo through the shim.
+3. **iOS 27:** add the two darwin26 patches; an iOS 27.2.1 iPhone IPSW with A13 floor (iPhone 11 Pro class); run featscan for Cortex-A77 on the 27 cache (darwin-lisa's M0: about 11 GB of download); fix hooks and ABI changes.
+4. **The GPU** (HotMetal2/Turnip/NativeAdreno) is the same stack on 26/27.
+
 ### >>> UNIXNU PORT STARTED (2026-11-18, user: "https://unixnu.com/porting/ start porting this"; branch claude/awesome-einstein-qskxih) <<<
 
 **What UniXNU is (read on unixnu.com / github.com/UniXNU/UniXNU docs, at 563595ab):** a UEFI boot chain for iOS/macOS on non-Apple ARM64. The stock ABL boots BootShim + a Mu-Silicium firmware volume, which starts UniXNU.efi. That reads `EFI/UniXNU/unixnu.toml` from the payload ramdisk and hands the kernel and its ADT sidecar to DarwinBoot, which enters XNU. Device repos are "format 2": board.toml, a DTS that a common generator turns into the ADT, a pinned SoC repo, an OS profile and porting.toml. UniXNU's own kernels prelink Apple's original kexts, which ours does not.
