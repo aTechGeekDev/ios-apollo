@@ -1,0 +1,29 @@
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -2349,7 +2349,26 @@
+ 	uint32_t random_val;
+ 	uint32_t slide_amount;
+ 
++#if defined(__arm64__)
++	/*
++	 * Darwin 26 caches fill almost all of this kernel's arm64 shared region and still name a 512 MiB maxSlide;
++	 * a slide past the room above their highest mapping fails the map. Keep the slid mappings inside the region.
++	 */
+ 	if (max_slide != 0) {
++		mach_vm_address_t highest = 0, end;
++		for (unsigned int n = 0; n < mappings_count; ++n) {
++			if (!os_add_overflow(mappings[n].sms_address, mappings[n].sms_size, &end) && end > highest) {
++				highest = end;
++			}
++		}
++		const mach_vm_address_t limit = SHARED_REGION_BASE_ARM64 + SHARED_REGION_SIZE_ARM64;
++		if (highest > SHARED_REGION_BASE_ARM64 && highest <= limit && limit - highest < max_slide) {
++			max_slide = (uint32_t)(limit - highest);
++		}
++	}
++#endif /* __arm64__ */
++
++	if (max_slide != 0) {
+ 		read_random(&random_val, sizeof random_val);
+ 		slide_amount = ((random_val % max_slide) & SLIDE_AMOUNT_MASK);
+ 	} else {

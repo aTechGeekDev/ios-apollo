@@ -1,0 +1,476 @@
+diff --git a/bsd/kern/kern_aio.c b/bsd/kern/kern_aio.c
+index 91b2501..9e14341 100644
+--- a/bsd/kern/kern_aio.c
++++ b/bsd/kern/kern_aio.c
+@@ -830,6 +830,25 @@ aio_read(proc_t p, struct aio_read_args *uap, int *retval)
+ 	return error;
+ }
+ 
++/*
++ * aio_readv and aio_writev take a vectored aiocb whose layout this kernel
++ * does not define. They fail with ENOTSUP instead of the SIGSYS of nosys,
++ * so callers can fall back to aio_read and aio_write.
++ */
++int
++aio_readv(__unused proc_t p, __unused struct aio_readv_args *uap, int *retval)
++{
++	*retval = -1;
++	return ENOTSUP;
++}
++
++int
++aio_writev(__unused proc_t p, __unused struct aio_writev_args *uap, int *retval)
++{
++	*retval = -1;
++	return ENOTSUP;
++}
++
+ 
+ /*
+  * aio_return - return the return status associated with the async IO
+diff --git a/bsd/kern/kern_descrip.c b/bsd/kern/kern_descrip.c
+index fac307f..8fbcc92 100644
+--- a/bsd/kern/kern_descrip.c
++++ b/bsd/kern/kern_descrip.c
+@@ -2525,8 +2525,43 @@ sys_dup2(proc_t p, struct dup2_args *uap, int32_t *retval)
+ 	return dup2(p, p_cred, uap->from, uap->to, retval);
+ }
+ 
++static int dup2_flags(proc_t p, kauth_cred_t p_cred, int old, int new,
++    fileproc_flags_t fp_flags, int *retval);
++
++/*
++ * dup3(from, to, flags): dup2(2) that sets O_CLOEXEC and O_CLOFORK on the
++ * new descriptor, and refuses from == to.
++ */
++int
++sys_dup3(proc_t p, struct dup3_args *uap, int32_t *retval)
++{
++	kauth_cred_t p_cred = current_cached_proc_cred(p);
++	fileproc_flags_t fp_flags = 0;
++
++	if (uap->flags & ~(O_CLOEXEC | O_CLOFORK)) {
++		return EINVAL;
++	}
++	if (uap->from == uap->to) {
++		return EINVAL;
++	}
++	if (uap->flags & O_CLOEXEC) {
++		fp_flags |= FP_CLOEXEC;
++	}
++	if (uap->flags & O_CLOFORK) {
++		fp_flags |= FP_CLOFORK;
++	}
++	return dup2_flags(p, p_cred, uap->from, uap->to, fp_flags, retval);
++}
++
+ int
+ dup2(proc_t p, kauth_cred_t p_cred, int old, int new, int *retval)
++{
++	return dup2_flags(p, p_cred, old, new, 0, retval);
++}
++
++static int
++dup2_flags(proc_t p, kauth_cred_t p_cred, int old, int new,
++    fileproc_flags_t fp_flags, int *retval)
+ {
+ 	struct filedesc *fdp = &p->p_fd;
+ 	struct fileproc *fp, *nfp;
+@@ -2605,7 +2640,7 @@ closeit:
+ 		panic("dup2: unreserved fileflags with new %d", new);
+ 	}
+ #endif
+-	error = finishdup(p, p_cred, old, new, 0, retval);
++	error = finishdup(p, p_cred, old, new, fp_flags, retval);
+ 	fp_drop(p, old, fp, 1);
+ 	proc_fdunlock(p);
+ 
+diff --git a/bsd/kern/sys_pipe.c b/bsd/kern/sys_pipe.c
+index bd682ab..312a1b7 100644
+--- a/bsd/kern/sys_pipe.c
++++ b/bsd/kern/sys_pipe.c
+@@ -388,13 +388,56 @@ expand_pipespace(struct pipe *p, int target_size)
+  */
+ 
+ /* ARGSUSED */
++static int pipe_common(proc_t p, int flags, int32_t *retval);
++
+ int
+ pipe(proc_t p, __unused struct pipe_args *uap, int32_t *retval)
++{
++	return pipe_common(p, 0, retval);
++}
++
++/*
++ * pipe2(int fildes[2], int flags): pipe(2) that stores both descriptors at
++ * fildes and applies O_CLOEXEC, O_CLOFORK and O_NONBLOCK to them.
++ */
++int
++pipe2(proc_t p, struct pipe2_args *uap, __unused int32_t *retval)
++{
++	int32_t fds[2];
++	int error;
++
++	if (uap->flags & ~(O_CLOEXEC | O_CLOFORK | O_NONBLOCK)) {
++		return EINVAL;
++	}
++	error = pipe_common(p, uap->flags, fds);
++	if (error) {
++		return error;
++	}
++	error = copyout(fds, uap->fildes, sizeof(fds));
++	if (error) {
++		kauth_cred_t p_cred = current_cached_proc_cred(p);
++
++		(void)close_nocancel(p, p_cred, fds[0]);
++		(void)close_nocancel(p, p_cred, fds[1]);
++	}
++	return error;
++}
++
++static int
++pipe_common(proc_t p, int flags, int32_t *retval)
+ {
+ 	struct fileproc *rf, *wf;
+ 	struct pipe *rpipe, *wpipe;
++	fileproc_flags_t fp_flags = 0;
+ 	int error;
+ 
++	if (flags & O_CLOEXEC) {
++		fp_flags |= FP_CLOEXEC;
++	}
++	if (flags & O_CLOFORK) {
++		fp_flags |= FP_CLOFORK;
++	}
++
+ 	error = pipepair_alloc(&rpipe, &wpipe);
+ 	if (error) {
+ 		return error;
+@@ -409,7 +452,8 @@ pipe(proc_t p, __unused struct pipe_args *uap, int32_t *retval)
+ 	if (error) {
+ 		goto freepipes;
+ 	}
+-	rf->f_flag = FREAD;
++	rf->f_flag = FREAD | (flags & O_NONBLOCK ? FNONBLOCK : 0);
++	rf->fp_flags |= fp_flags;
+ 	rf->f_ops = &pipeops;
+ 	fp_set_data(rf, rpipe);
+ 
+@@ -418,7 +462,8 @@ pipe(proc_t p, __unused struct pipe_args *uap, int32_t *retval)
+ 		fp_free(p, retval[0], rf);
+ 		goto freepipes;
+ 	}
+-	wf->f_flag = FWRITE;
++	wf->f_flag = FWRITE | (flags & O_NONBLOCK ? FNONBLOCK : 0);
++	wf->fp_flags |= fp_flags;
+ 	wf->f_ops = &pipeops;
+ 	fp_set_data(wf, wpipe);
+ 
+diff --git a/bsd/kern/syscalls.master b/bsd/kern/syscalls.master
+index c08a74c..0911b26 100644
+--- a/bsd/kern/syscalls.master
++++ b/bsd/kern/syscalls.master
+@@ -229,8 +229,8 @@
+ 145	AUE_NULL	ALL	{ int nosys(void); }   { old setrlimit }
+ 146	AUE_NULL	ALL	{ int nosys(void); }   { old killpg }
+ 147	AUE_SETSID	ALL	{ int setsid(void); }
+-148	AUE_NULL	ALL	{ int nosys(void); }   { old setquota }
+-149	AUE_NULL	ALL	{ int nosys(void); }   { old qquota }
++148	AUE_PIPE	ALL	{ int pipe2(user_addr_t fildes, int flags); }
++149	AUE_DUP2	ALL	{ int sys_dup3(u_int from, u_int to, int flags); }
+ 150	AUE_NULL	ALL	{ int nosys(void); }   { old getsockname }
+ 151	AUE_GETPGID	ALL	{ int getpgid(pid_t pid); }
+ 152	AUE_SETPRIVEXEC	ALL	{ int setprivexec(int flag); }
+@@ -309,8 +309,8 @@
+ 212	AUE_NULL	ALL	{ int nosys(void); } { old ATgetrsp }
+ 213	AUE_NULL	ALL	{ int nosys(void); } 	{ Reserved for AppleTalk }
+ 
+-214	AUE_NULL	ALL	{ int nosys(void); }
+-215	AUE_NULL	ALL	{ int nosys(void); }
++214	AUE_FCHFLAGS	ALL	{ int fchflagsat(int fd, user_addr_t path, int flags, int flag); }
++215	AUE_UMASK	ALL	{ int getumask(void); }
+ 
+ ; System Calls 216 - 230 are reserved for calls to support HFS/HFS Plus
+ ; file system semantics. Currently, we only use 215-227.  The rest is
+@@ -351,8 +351,8 @@
+ 243	AUE_INITGROUPS	ALL	{ int initgroups(u_int gidsetsize, gid_t *gidset, int gmuid) NO_SYSCALL_STUB; }
+ 244	AUE_POSIX_SPAWN	ALL	{ int posix_spawn(pid_t *pid, const char *path, const struct _posix_spawn_args_desc *adesc, char **argv, char **envp) NO_SYSCALL_STUB; }
+ 245	AUE_FFSCTL	ALL	{ int ffsctl(int fd, u_long cmd, caddr_t data, u_int options); }
+-246	AUE_NULL	ALL	{ int nosys(void); }
+-247	AUE_NULL	ALL	{ int nosys(void); } { old nfsclnt }
++246	AUE_NULL	ALL	{ int aio_readv(user_addr_t aiocbp); }
++247	AUE_NULL	ALL	{ int aio_writev(user_addr_t aiocbp); }
+ 
+ #if NFSSERVER	/* XXX */
+ 248	AUE_FHOPEN	ALL	{ int fhopen(const struct fhandle *u_fhp, int flags); } 
+@@ -360,7 +360,7 @@
+ 248	AUE_NULL	ALL	{ int nosys(void); } 
+ #endif
+ 
+-249	AUE_NULL	ALL	{ int nosys(void); }
++249	AUE_FSCTL	ALL	{ int fsctlat(int fd, const char *path, u_long cmd, caddr_t data, u_int options); }
+ 250	AUE_MINHERIT	ALL	{ int minherit(caddr_ut addr, size_ut len, int inherit); }
+ #if SYSV_SEM
+ 251	AUE_SEMSYS	ALL	{ int semsys(u_int which, int a2, int a3, int a4, int a5) NO_SYSCALL_STUB; }
+@@ -530,7 +530,7 @@
+ 349	AUE_NULL	ALL	{ int __pthread_fchdir(int fd); }
+ 350	AUE_AUDIT	ALL	{ int audit(void *record, int length); }
+ 351	AUE_AUDITON	ALL	{ int auditon(int cmd, void *data, int length); }
+-352	AUE_NULL	ALL	{ int nosys(void); }
++352	AUE_FTRUNCATE	ALL	{ int guarded_ftruncate_np(int fd, const guardid_t *guard, off_t length); }
+ 353	AUE_GETAUID	ALL	{ int getauid(au_id_t *auid); }
+ 354	AUE_SETAUID	ALL	{ int setauid(au_id_t *auid); }
+ 355	AUE_NULL	ALL	{ int nosys(void); }	{ old getaudit }
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 942dc24..efb3d69 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -8007,6 +8007,59 @@ fchflags(__unused proc_t p, struct fchflags_args *uap, __unused int32_t *retval)
+ 	return error;
+ }
+ 
++/*
++ * Change flags of a file given a path name relative to a directory
++ * descriptor; flag takes the AT_* lookup flags of fchmodat(2).
++ */
++/* ARGSUSED */
++int
++fchflagsat(__unused proc_t p, struct fchflagsat_args *uap, __unused int32_t *retval)
++{
++	vnode_t vp;
++	vfs_context_t ctx = vfs_context_current();
++	int error, follow;
++	struct nameidata nd;
++	uint32_t wantparent = 0;
++
++	if (uap->flag & ~(AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY | AT_RESOLVE_BENEATH | AT_UNIQUE)) {
++		return EINVAL;
++	}
++
++#if CONFIG_FILE_LEASES
++	wantparent = WANTPARENT;
++#endif
++
++	AUDIT_ARG(fd, uap->fd);
++	AUDIT_ARG(fflags, uap->flags);
++	follow = (uap->flag & (AT_SYMLINK_NOFOLLOW | AT_SYMLINK_NOFOLLOW_ANY)) ? NOFOLLOW : FOLLOW;
++	NDINIT(&nd, LOOKUP, OP_SETATTR, follow | AUDITVNPATH1 | wantparent,
++	    UIO_USERSPACE, uap->path, ctx);
++	if (uap->flag & AT_SYMLINK_NOFOLLOW_ANY) {
++		nd.ni_flag |= NAMEI_NOFOLLOW_ANY;
++	}
++	if (uap->flag & AT_RESOLVE_BENEATH) {
++		nd.ni_flag |= NAMEI_RESOLVE_BENEATH;
++	}
++	if (uap->flag & AT_UNIQUE) {
++		nd.ni_flag |= NAMEI_UNIQUE;
++	}
++	error = nameiat(&nd, uap->fd);
++	if (error) {
++		return error;
++	}
++	vp = nd.ni_vp;
++
++#if CONFIG_FILE_LEASES
++	vnode_breakdirlease(nd.ni_dvp, false, O_WRONLY);
++	vnode_put(nd.ni_dvp);
++#endif
++
++	nameidone(&nd);
++
++	/* we don't vnode_put() here because chflags1 does internally */
++	return chflags1(vp, uap->flags, ctx);
++}
++
+ /*
+  * Serialize chmod/chown operations to prevent race conditions.
+  * Returns 0 on success, or error from msleep if interrupted.
+@@ -8837,27 +8890,59 @@ truncate(proc_t p, struct truncate_args *uap, __unused int32_t *retval)
+  * Truncate a file given a file descriptor.
+  */
+ /* ARGSUSED */
++static int ftruncate_internal(proc_t p, int fd, off_t length, guardid_t *puguard,
++    int32_t *retval);
++
+ int
+ ftruncate(proc_t p, struct ftruncate_args *uap, int32_t *retval)
++{
++	return ftruncate_internal(p, uap->fd, uap->length, NULL, retval);
++}
++
++/*
++ * guarded_ftruncate_np(int fd, const guardid_t *guard, off_t length):
++ * ftruncate(2) of a guarded descriptor; the guard must match.
++ */
++int
++guarded_ftruncate_np(proc_t p, struct guarded_ftruncate_np_args *uap, int32_t *retval)
++{
++	guardid_t uguard;
++	int error;
++
++	AUDIT_ARG(fd, uap->fd);
++
++	if ((error = copyin(uap->guard, &uguard, sizeof(uguard))) != 0) {
++		return error;
++	}
++	return ftruncate_internal(p, uap->fd, uap->length, &uguard, retval);
++}
++
++static int
++ftruncate_internal(proc_t p, int fd, off_t length, guardid_t *puguard, int32_t *retval)
+ {
+ 	vnode_t vp = NULLVP;
+ 	struct fileproc *fp;
+ 	bool need_vnode_put = false;
+ 	int error;
+ 
+-	AUDIT_ARG(fd, uap->fd);
++	AUDIT_ARG(fd, fd);
+ 
+-	if ((error = truncate_validate_common(p, uap->length))) {
++	if ((error = truncate_validate_common(p, length))) {
+ 		return error;
+ 	}
+ 
+-	if ((error = fp_lookup(p, uap->fd, &fp, 0))) {
++	if (puguard) {
++		error = fp_lookup_guarded(p, fd, *puguard, &fp, 0);
++	} else {
++		error = fp_lookup(p, fd, &fp, 0);
++	}
++	if (error) {
+ 		return error;
+ 	}
+ 
+ 	switch (FILEGLOB_DTYPE(fp->fp_glob)) {
+ 	case DTYPE_PSXSHM:
+-		error = pshm_truncate(p, fp, uap->fd, uap->length, retval);
++		error = pshm_truncate(p, fp, fd, length, retval);
+ 		goto out;
+ 	case DTYPE_VNODE:
+ 		break;
+@@ -8893,7 +8978,7 @@ ftruncate(proc_t p, struct ftruncate_args *uap, int32_t *retval)
+ 
+ 	AUDIT_ARG(vnpath, vp, ARG_VNODE1);
+ 
+-	error = truncate_internal(vp, uap->length, fp->fp_glob->fg_cred,
++	error = truncate_internal(vp, length, fp->fp_glob->fg_cred,
+ 	    vfs_context_current(), false);
+ 	if (!error) {
+ 		fp->fp_glob->fg_flag |= FWASWRITTEN;
+@@ -8904,7 +8989,7 @@ out:
+ 		vnode_put(vp);
+ 	}
+ 
+-	file_drop(uap->fd);
++	file_drop(fd);
+ 	return error;
+ }
+ 
+@@ -11248,6 +11333,18 @@ umask(proc_t p, struct umask_args *uap, int32_t *retval)
+ 	return umask1(p, uap->newmask, UMASK_NOXSECURITY, retval);
+ }
+ 
++/*
++ * getumask: Return the file mode creation mask without changing it.
++ */
++int
++getumask(proc_t p, __unused struct getumask_args *uap, int32_t *retval)
++{
++	proc_fdlock(p);
++	*retval = p->p_fd.fd_cmask;
++	proc_fdunlock(p);
++	return 0;
++}
++
+ #define REVOKE_MOUNTED_DEVICE_ENTITLEMENT                               \
+ 	"com.apple.private.vfs.revoke-mounted-device"
+ 
+@@ -13696,9 +13793,28 @@ outdrop:
+ 	return error;
+ }
+ 
++static int fsctlat_internal(proc_t p, int fd, user_addr_t path, u_long cmd,
++    user_addr_t data, u_int options);
++
+ /* ARGSUSED */
+ int
+ fsctl(proc_t p, struct fsctl_args *uap, __unused int32_t *retval)
++{
++	return fsctlat_internal(p, AT_FDCWD, uap->path, uap->cmd,
++	           (user_addr_t)uap->data, uap->options);
++}
++
++/* ARGSUSED */
++int
++fsctlat(proc_t p, struct fsctlat_args *uap, __unused int32_t *retval)
++{
++	return fsctlat_internal(p, uap->fd, uap->path, uap->cmd,
++	           (user_addr_t)uap->data, uap->options);
++}
++
++static int
++fsctlat_internal(proc_t p, int fd, user_addr_t path, u_long cmd,
++    user_addr_t data, u_int options)
+ {
+ 	int error;
+ 	struct nameidata nd;
+@@ -13706,8 +13822,8 @@ fsctl(proc_t p, struct fsctl_args *uap, __unused int32_t *retval)
+ 	vnode_t vp = NULL;
+ 	vfs_context_t ctx = vfs_context_current();
+ 
+-	AUDIT_ARG(cmd, (int)uap->cmd);
+-	AUDIT_ARG(value32, uap->options);
++	AUDIT_ARG(cmd, (int)cmd);
++	AUDIT_ARG(value32, options);
+ 	/* Get the vnode for the file we are getting info on:  */
+ 	nameiflags = 0;
+ 	//
+@@ -13716,38 +13832,38 @@ fsctl(proc_t p, struct fsctl_args *uap, __unused int32_t *retval)
+ 	// lest the caller mistakenly thinks the only open is their own (but in
+ 	// reality it's someone elses).
+ 	//
+-	if (uap->cmd == FSIOC_FD_ONLY_OPEN_ONCE) {
++	if (cmd == FSIOC_FD_ONLY_OPEN_ONCE) {
+ 		return EINVAL;
+ 	}
+-	if ((uap->options & (FSOPT_NOFOLLOW | FSOPT_NOFOLLOW_ANY)) == 0) {
++	if ((options & (FSOPT_NOFOLLOW | FSOPT_NOFOLLOW_ANY)) == 0) {
+ 		nameiflags |= FOLLOW;
+ 	}
+-	if (uap->cmd == FSIOC_FIRMLINK_CTL) {
++	if (cmd == FSIOC_FIRMLINK_CTL) {
+ 		nameiflags |= (CN_FIRMLINK_NOFOLLOW | NOCACHE);
+ 	}
+ 	NDINIT(&nd, LOOKUP, OP_FSCTL, nameiflags | AUDITVNPATH1,
+-	    UIO_USERSPACE, uap->path, ctx);
+-	if (uap->options & FSOPT_NOFOLLOW_ANY) {
++	    UIO_USERSPACE, path, ctx);
++	if (options & FSOPT_NOFOLLOW_ANY) {
+ 		nd.ni_flag |= NAMEI_NOFOLLOW_ANY;
+ 	}
+-	if (uap->options & FSOPT_UNIQUE) {
++	if (options & FSOPT_UNIQUE) {
+ 		nd.ni_flag |= NAMEI_UNIQUE;
+ 	}
+ 
+-	if ((error = namei(&nd))) {
++	if ((error = nameiat(&nd, fd))) {
+ 		goto done;
+ 	}
+ 	vp = nd.ni_vp;
+ 	nameidone(&nd);
+ 
+ #if CONFIG_MACF
+-	error = mac_mount_check_fsctl(ctx, vnode_mount(vp), uap->cmd);
++	error = mac_mount_check_fsctl(ctx, vnode_mount(vp), cmd);
+ 	if (error) {
+ 		goto done;
+ 	}
+ #endif
+ 
+-	error = fsctl_internal(p, &vp, uap->cmd, (user_addr_t)uap->data, uap->options, ctx);
++	error = fsctl_internal(p, &vp, cmd, data, options, ctx);
+ 
+ done:
+ 	if (vp) {
