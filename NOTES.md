@@ -2,6 +2,54 @@
 
 ## Agent handoff / active work
 
+### >>> iOS 27 TRACK: KERNEL BUILD STARTED (2026-11-18, user: "start building"; branch claude/awesome-einstein-qskxih) <<<
+
+**User facts (2026-11-18):**
+- The user has a Linux VM with the build tools.
+- Windows is installed on the apollo, with a repartitioner from github.com/aTechGeekDev/renegade-apollo (Renegade / edk2-msm, which "repartitions/erases userdata").
+- **The new partition layout is not recorded anywhere** (renegade-apollo's docs give no sizes). Before any iOS root is written, ask the user for it: from recovery, `adb shell sgdisk --print /dev/block/sda` or `ls -l /dev/block/by-name`. Where the iOS 27 root goes, and whether Windows stays, is the user's decision. Confirm before anything destructive (AGENTS.md).
+
+**Kernel: `xnu27/` + `.github/workflows/xnu27.yml`.** xnu-12377.121.6, SWEET, plain arm64 (no PAC); `xnu/` and `xnu.yml` (iOS 16) are untouched. Series, in `xnu27/patches` name order:
+- **0000-0081 (+6 staging .sh):** IOS-26-Hot d249939b's SWEET baseline on 12377 (MIT, dipa-studio).
+- **0129, 0130, 0133, 0135, 0140, 0141:** IOS-26-Hot's generic iOS 26 patches: arm64e exec and shared region, the sleh.c PAC emulator, fuse query, kmem RNG guard, IPC service port, IOMFB swap layout.
+- **0900/0901:** UniXNU be2cb0c7's darwin26-syscalls / darwin26-shared-region (the iOS 27 user space's syscalls).
+- **1082-1186:** our apollo 0082-0186 (minus 0167, which 12377 has natively); 96 applied unchanged.
+  - Re-ported by hand: 1128 (Wi-Fi link line), 1153 (end-of-file block), 1181 (IOKitInitializeTime), 1177.
+  - 1177 is definitions only: big-cores-first in 12377's restructured `choose_processor`/RT paths is NOT ported, so XNU's own CPU order is used.
+- **1999 (generated in CI):** the WLFW header from Linux 7.0.14.
+
+**Checked here (Linux, no compile):** the series applied in order to a fresh xnu-12377.121.6 + darwin-xnu-build bd886971's own patches reproduces the ported tree exactly. 0031/0041 need the HFS staging CI runs first. IOS-26-Hot's staging scripts were reviewed: they fetch pinned apple-oss-distributions / bearssl.org commits and check them. They were not executed here (the session's safety check refused running downloaded scripts locally); CI runs them.
+
+**Builds:**
+- Run 44305848202 (base): cancelled by the next push.
+- Run 44306099719 (base + 0900/0901, commit 6912aef): still building when c50efed (apollo 1082-1186 + Wi-Fi steps) was pushed, so cancelled.
+- The next xnu27 run builds everything together. Its result is the first compile check of the whole series; read errors from its "Compile errors" step.
+
+**Not yet taken from IOS-26-Hot:** its other generic iOS 26 patches. They are tangled with its Pixel 4 / Realme files, which collide by name with ours (sweet_gpu.c, SweetAccelerator.cpp, ...).
+- **Conflict hunks**, measured by cherry-picking onto the base:
+  - 0132: printf.c, 1 hunk
+  - 0136: SweetPlatformExpert, 2
+  - 0137: sweet_amfi, 1
+  - 0138: the PAC fast path plus overlay/thermal/touch, ~20 across sweet_* and SweetFramebuffer
+  - 0142: SweetSurface iOS 26 IOSurface ABI, 3, built on flame's own IOSurface additions
+  - 0148: kern_exec / SweetKeyStore, 2
+  - 0131 and 0139: flame files only
+- **Per-file plan:**
+  - IOSurface: take IOS-26-Hot's final iOS 26 SweetSurface.cpp, then re-apply our apollo IOSurface changes (1115-1117, 1176).
+  - Framebuffer: keep ours (SM8250 DPU) and port their iOS 26 IOMFB changes.
+  - PAC fast path (0138, locore.s): matters less once user space is rewritten ahead of time (Scion's phone showed "0 emulated"); the 0130 emulator is in.
+
+**Next:**
+1. Fix compile errors from the xnu27 runs (12377 API changes in our 1082-1186 files).
+2. Port 0142 (IOSurface ABI) and 0138's PAC fast path / 0136 / 0137 / 0148 the per-file way.
+3. Port 1177's three scheduler sites.
+4. iOS 27 root on the user's Linux VM:
+   - Input: the iPhone 11 IPSW iPhone12,1 27.0.1 24A446 (Scion's pin; its tools check addresses in this build).
+   - Decrypt the AEA DMGs with blacktop `ipsw` and mount them with apfs-fuse (darwin-lisa did this on Linux).
+   - Copy into an HFS+ root, run Scion's `tools/ios27/a64e/a64e-rewrite.py` over the shared cache and every arm64e Mach-O (libcorecrypto skipped), then root tweaks.
+   - mkadt.py needs an iPhone 11 (N104AP) identity option.
+   - Then the partition question above.
+
 ### >>> iOS 27 TRACK: RESEARCH (2026-11-18, user: "i need ios 27" / "people have done it online look") <<<
 
 **Correction of my first answer (I said iOS 27 cannot run without PAC):** arm64e iOS does run on ARMv8.2 CPUs without pointer authentication. The PAC instructions are rewritten (de-PAC) and the kernel emulates the few that cannot be rewritten. What I read (repos cloned 2026-11-18; status is the authors' own claims):
