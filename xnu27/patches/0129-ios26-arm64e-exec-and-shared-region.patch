@@ -1,0 +1,189 @@
+diff --git a/bsd/dev/arm/kern_machdep.c b/bsd/dev/arm/kern_machdep.c
+index 58769e07a30019937e4d95cfc2508b5895831791..4b78add4ccafb49e944c5a327b97a70d9560acb8 100644
+--- a/bsd/dev/arm/kern_machdep.c
++++ b/bsd/dev/arm/kern_machdep.c
+@@ -87,6 +87,10 @@ ml_grade_binary(cpu_type_t exectype, cpu_subtype_t execsubtype, cpu_subtype_t ex
+ 		switch (hostsubtype) {
+ 		case CPU_SUBTYPE_ARM64_V8:
+ 			switch (execsubtype) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			case CPU_SUBTYPE_ARM64E:
++				return grade_arm64e_binary(execfeatures);
++#endif
+ 			case CPU_SUBTYPE_ARM64_V8:
+ 				return 10;
+ 			case CPU_SUBTYPE_ARM64_ALL:
+diff --git a/bsd/dev/arm64/sysctl.c b/bsd/dev/arm64/sysctl.c
+index f380ae5880cccbd3ac23f97b602b40b08e03aa76..ebca00f409e6948e86533416124bf01b60b54330 100644
+--- a/bsd/dev/arm64/sysctl.c
++++ b/bsd/dev/arm64/sysctl.c
+@@ -426,7 +426,7 @@ machdep_ptrauth_enabled SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(arg1, arg2, oidp)
+ 
+-#if __has_feature(ptrauth_calls)
++#if __has_feature(ptrauth_calls) && !defined(ARM64_BOARD_CONFIG_SWEET)
+ 	task_t task = current_task();
+ 	int ret = !ml_task_get_disable_user_jop(task);
+ #else
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 89acb1cb6184f818d14951916167df6b11b54e0d..183f960bcda6191f54d891f65bf792ef6c567dc8 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -2009,6 +2009,12 @@ exec_mach_imgact(struct image_params *imgp)
+ 			    imgp->ip_origcputype, imgp->ip_origcpusubtype)) {
+ 				goto grade;
+ 			}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++			if ((pref & ~CPU_ARCH_MASK) == (CPU_TYPE_ARM64 & ~CPU_ARCH_MASK) &&
++			    imgp->ip_origcputype == CPU_TYPE_ARM64) {
++				goto grade;
++			}
++#endif
+ 		}
+ 		error = EBADARCH;
+ 		goto bad;
+@@ -6990,9 +6996,9 @@ STARTUP(EARLY_BOOT, STARTUP_RANK_MIDDLE, exe_boothash_salt_generate);
+ #define DYLD_FLAGS_KEY "dyld_flags="
+ #define SUBSYSTEM_ROOT_PATH_KEY "subsystem_root_path="
+ #define APP_BOOT_SESSION_KEY "executable_boothash="
+-#if __has_feature(ptrauth_calls)
++#if __has_feature(ptrauth_calls) || defined(ARM64_BOARD_CONFIG_SWEET)
+ #define PTRAUTH_DISABLED_FLAG "ptrauth_disabled=1"
+-#endif /* __has_feature(ptrauth_calls) */
++#endif /* __has_feature(ptrauth_calls) || defined(ARM64_BOARD_CONFIG_SWEET) */
+ #define MAIN_TH_PORT_KEY "th_port="
+ 
+ #define FSID_MAX_STRING "0x1234567890abcdef,0x1234567890abcdef"
+@@ -7251,6 +7257,13 @@ exec_add_apple_strings(struct image_params *imgp,
+ 
+ 		imgp->ip_applec++;
+ 	}
++#elif defined(ARM64_BOARD_CONFIG_SWEET)
++	error = exec_add_user_string(imgp, CAST_USER_ADDR_T(PTRAUTH_DISABLED_FLAG), UIO_SYSSPACE, FALSE);
++	if (error) {
++		goto bad;
++	}
++
++	imgp->ip_applec++;
+ #endif /* __has_feature(ptrauth_calls) */
+ 
+ 	/*
+diff --git a/osfmk/vm/vm_dyld_pager.c b/osfmk/vm/vm_dyld_pager.c
+index d3cd6e8fe9bc7857301be8bf757a6770271ecd1a..ed4e765d8a54968a1975d4d879d2f8ed35d70c2e 100644
+--- a/osfmk/vm/vm_dyld_pager.c
++++ b/osfmk/vm/vm_dyld_pager.c
+@@ -60,8 +60,10 @@
+ 
+ #include <sys/kdebug_triage.h>
+ #include <mach-o/fixup-chains.h>
+-#if defined(HAS_APPLE_PAC)
++#if defined(HAS_APPLE_PAC) || defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <ptrauth.h>
++#endif /* defined(HAS_APPLE_PAC) || defined(ARM64_BOARD_CONFIG_SWEET) */
++#if defined(HAS_APPLE_PAC)
+ #include <arm/misc_protos.h>
+ #endif /* defined(HAS_APPLE_PAC) */
+ 
+@@ -557,7 +559,7 @@ fixupPage32(
+ 	return KERN_SUCCESS;
+ }
+ 
+-#if defined(HAS_APPLE_PAC)
++#if defined(HAS_APPLE_PAC) || defined(ARM64_BOARD_CONFIG_SWEET)
+ /*
+  * Sign a pointer needed for fixups.
+  */
+@@ -571,6 +573,21 @@ signPointer(
+ 	dyld_pager_t     pager,
+ 	uint64_t         *signedAddr)
+ {
++#if !defined(HAS_APPLE_PAC)
++	(void)loc;
++	(void)addrDiv;
++	(void)diversity;
++	(void)pager;
++	if (key != ptrauth_key_asia && key != ptrauth_key_asda) {
++		printf("%s(): Invalid ptr auth key %d\n", __func__, key);
++		if (panic_on_dyld_issue) {
++			panic("%s(): Invalid ptr auth key %d", __func__, key);
++		}
++		return KERN_FAILURE;
++	}
++	*signedAddr = unsignedAddr;
++	return KERN_SUCCESS;
++#else
+ 	// don't sign NULL
+ 	if (unsignedAddr == 0) {
+ 		*signedAddr = 0;
+@@ -601,6 +618,7 @@ signPointer(
+ 		return KERN_FAILURE;
+ 	}
+ 	return KERN_SUCCESS;
++#endif /* !defined(HAS_APPLE_PAC) */
+ }
+ 
+ /*
+@@ -813,7 +831,7 @@ fixupCachePageAuth64(
+ 	} while (valid_chain);
+ 	return KERN_SUCCESS;
+ }
+-#endif /* defined(HAS_APPLE_PAC) */
++#endif /* defined(HAS_APPLE_PAC) || defined(ARM64_BOARD_CONFIG_SWEET) */
+ 
+ 
+ /*
+@@ -922,7 +940,7 @@ fixup_page(
+ 	 * Route to the appropriate fixup routine
+ 	 */
+ 	switch (hdr->mwli_pointer_format) {
+-#if defined(HAS_APPLE_PAC)
++#if defined(HAS_APPLE_PAC) || defined(ARM64_BOARD_CONFIG_SWEET)
+ 	case DYLD_CHAINED_PTR_ARM64E:
+ 		fixupPageAuth64(userVA, contents, pager, segInfo, pageIndex, false);
+ 		break;
+@@ -933,7 +951,7 @@ fixup_page(
+ 	case DYLD_CHAINED_PTR_ARM64E_SHARED_CACHE:
+ 		fixupCachePageAuth64(userVA, contents, pager, segInfo, pageIndex);
+ 		break;
+-#endif /* defined(HAS_APPLE_PAC) */
++#endif /* defined(HAS_APPLE_PAC) || defined(ARM64_BOARD_CONFIG_SWEET) */
+ 	case DYLD_CHAINED_PTR_64:
+ 		fixupPage64(userVA, contents, link_info, segInfo, pageIndex, false);
+ 		break;
+diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
+index 0b688296aed75ec523d005cf20f5bccae9d18e3c..ad17b796b0c4b4089dd06a95a26a5ec36f8e99c0 100644
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -350,6 +350,13 @@ match_subtype(cpu_type_t cputype, cpu_subtype_t exist, cpu_subtype_t new)
+ 	    new == CPU_SUBTYPE_ARM64_ALL) {
+ 		return true;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (cputype == CPU_TYPE_ARM64 &&
++	    (exist == CPU_SUBTYPE_ARM64_ALL || exist == CPU_SUBTYPE_ARM64_V8 || exist == CPU_SUBTYPE_ARM64E) &&
++	    (new == CPU_SUBTYPE_ARM64_ALL || new == CPU_SUBTYPE_ARM64_V8 || new == CPU_SUBTYPE_ARM64E)) {
++		return true;
++	}
++#endif
+ 	return false;
+ }
+ 
+@@ -3345,6 +3352,8 @@ vm_shared_region_slide_page_v3(
+ 			} else {
+ 				memcpy(rebaseLocation, &value, sizeof(value));
+ 			}
++#else /* !__has_feature(ptrauth_calls) */
++			memcpy(rebaseLocation, &value, sizeof(value));
+ #endif /* __has_feature(ptrauth_calls) */
+ 		} else {
+ 			// The new value for a rebase is the low 51-bits of the threaded value plus the slide.
+@@ -3564,6 +3573,8 @@ vm_shared_region_slide_page_v5(
+ 			} else {
+ 				memcpy(rebaseLocation, &value, sizeof(value));
+ 			}
++#else /* !__has_feature(ptrauth_calls) */
++			memcpy(rebaseLocation, &value, sizeof(value));
+ #endif /* __has_feature(ptrauth_calls) */
+ 		} else {
+ 			// the value already has the correct low bits, so just add in the high8 if it exists

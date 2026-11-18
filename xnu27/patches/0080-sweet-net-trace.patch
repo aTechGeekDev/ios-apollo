@@ -1,0 +1,63 @@
+diff --git a/bsd/net/rtsock.c b/bsd/net/rtsock.c
+index b2784ac..1c4c8ef 100644
+--- a/bsd/net/rtsock.c
++++ b/bsd/net/rtsock.c
+@@ -571,6 +571,26 @@ route_output(struct mbuf *m, struct socket *so)
+ 		SIN6(info.rti_info[RTAX_DST])->sin6_addr.s6_addr16[1] = 0;
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* SWEET: which process changes IPv4 routes (network bring-up, -fbounds-safety clean). */
++	if ((RTM->rtm_type == RTM_ADD || RTM->rtm_type == RTM_DELETE || RTM->rtm_type == RTM_CHANGE) &&
++	    info.rti_info[RTAX_DST] != NULL && info.rti_info[RTAX_DST]->sa_family == AF_INET) {
++		static int sweet_rt_logged;
++		if (sweet_rt_logged++ < 200) {
++			uint32_t dip = ntohl(SIN(info.rti_info[RTAX_DST])->sin_addr.s_addr);
++			uint32_t gip = (info.rti_info[RTAX_GATEWAY] != NULL &&
++			    info.rti_info[RTAX_GATEWAY]->sa_family == AF_INET) ?
++			    ntohl(SIN(info.rti_info[RTAX_GATEWAY])->sin_addr.s_addr) : 0;
++			char pname[20];
++			proc_selfname(pname, sizeof(pname));
++			printf("SWEET NET: %s route %s %u.%u.%u.%u gw %u.%u.%u.%u ifindex %u flags 0x%x\n", pname,
++			    RTM->rtm_type == RTM_ADD ? "add" : RTM->rtm_type == RTM_DELETE ? "delete" : "change",
++			    (dip >> 24) & 0xff, (dip >> 16) & 0xff, (dip >> 8) & 0xff, dip & 0xff,
++			    (gip >> 24) & 0xff, (gip >> 16) & 0xff, (gip >> 8) & 0xff, gip & 0xff,
++			    RTM->rtm_index, RTM->rtm_flags);
++		}
++	}
++#endif
+ 	switch (RTM->rtm_type) {
+ 	case RTM_ADD:
+ 		if (info.rti_info[RTAX_GATEWAY] == NULL) {
+diff --git a/bsd/netinet/in.c b/bsd/netinet/in.c
+index 9e84d3e..8c44b67 100644
+--- a/bsd/netinet/in.c
++++ b/bsd/netinet/in.c
+@@ -1136,6 +1136,27 @@ in_control(struct socket *so, u_long cmd, caddr_t __sized_by(IOCPARM_LEN(cmd)) d
+ 	/* In case it's NULL, make sure it came from the kernel */
+ 	VERIFY(so != NULL || p == kernproc);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* SWEET: which process sets IPv4 addresses on which interface (-fbounds-safety clean). */
++	if ((cmd == SIOCAIFADDR || cmd == SIOCDIFADDR) && ifp != NULL && data != NULL) {
++		static int sweet_in_logged;
++		if (sweet_in_logged++ < 100) {
++			struct sockaddr_in tmp_sin = {};
++			if (cmd == SIOCAIFADDR) {
++				SOCKADDR_COPY(&((struct in_aliasreq *)(void *)data)->ifra_addr, &tmp_sin, sizeof(tmp_sin));
++			} else {
++				SOCKADDR_COPY(&((struct ifreq *)(void *)data)->ifr_addr, &tmp_sin, sizeof(tmp_sin));
++			}
++			uint32_t ip = ntohl(tmp_sin.sin_addr.s_addr);
++			char pname[20];
++			proc_name(proc_pid(p), pname, sizeof(pname));
++			printf("SWEET NET: %s %s %s %u.%u.%u.%u\n", pname, if_name(ifp),
++			    cmd == SIOCAIFADDR ? "add address" : "delete address",
++			    (ip >> 24) & 0xff, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff);
++		}
++	}
++#endif
++
+ 	/*
+ 	 * ioctls which don't require ifp, but require socket.
+ 	 */

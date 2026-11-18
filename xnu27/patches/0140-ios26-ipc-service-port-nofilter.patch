@@ -1,0 +1,52 @@
+From e936896067598e0ac9b64f2868114f0ee0555fe9 Mon Sep 17 00:00:00 2001
+From: XNU 26 Rebase <rebase@local>
+Date: Tue, 27 Oct 2026 12:00:56 +0000
+Subject: [PATCH] ios26: return KERN_SUCCESS for unfiltered service ports in
+ mach_port_is_connection_for_service
+
+---
+ osfmk/ipc/mach_port.c | 21 +++++++++++++--------
+ 1 file changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/osfmk/ipc/mach_port.c b/osfmk/ipc/mach_port.c
+index 7ef6a22..4f5ef03 100644
+--- a/osfmk/ipc/mach_port.c
++++ b/osfmk/ipc/mach_port.c
+@@ -2970,10 +2970,6 @@ mach_port_is_connection_for_service(
+ 		return KERN_INVALID_ARGUMENT;
+ 	}
+ 
+-	if (!mach_msg_filter_at_least(MACH_MSG_FILTER_CALLBACKS_VERSION_1)) {
+-		return KERN_NOT_SUPPORTED;
+-	}
+-
+ 	ret = ipc_port_translate_receive(space, service_port_name, &service_port);
+ 	if (ret) {
+ 		return ret;
+@@ -2985,10 +2981,19 @@ mach_port_is_connection_for_service(
+ 		return KERN_INVALID_CAPABILITY;
+ 	}
+ 
+-	/* Port is locked and active */
+-	service_port_sblabel = label.iol_service->ispl_sblabel;
+-	if (service_port_sblabel) {
+-		mach_msg_filter_retain_sblabel_callback(service_port_sblabel);
++	/*
++	 * Port is locked and active. Without Sandbox.kext registered,
++	 * ipc_service_port_derive_sblabel() returns KERN_SUCCESS with no sblabel,
++	 * whereas iOS 26 libxpc only accepts KERN_SUCCESS or KERN_INVALID_CAPABILITY
++	 * (and rejects KERN_NOT_SUPPORTED as "Bogus check-in attempt. Ignoring.").
++	 * Treat absent message-filter callbacks identically to an unfiltered
++	 * service port (service_port_sblabel == NULL -> *filter_policy_id = 0).
++	 */
++	if (mach_msg_filter_at_least(MACH_MSG_FILTER_CALLBACKS_VERSION_1)) {
++		service_port_sblabel = label.iol_service->ispl_sblabel;
++		if (service_port_sblabel) {
++			mach_msg_filter_retain_sblabel_callback(service_port_sblabel);
++		}
+ 	}
+ 	ip_mq_unlock_label_put(service_port, &label);
+ 
+-- 
+2.43.0
+

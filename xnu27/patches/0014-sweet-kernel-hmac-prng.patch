@@ -1,0 +1,277 @@
+diff --git a/osfmk/prng/entropy.c b/osfmk/prng/entropy.c
+index d999eb8..be7604d 100644
+--- a/osfmk/prng/entropy.c
++++ b/osfmk/prng/entropy.c
+@@ -40,6 +40,10 @@
+ #include <machine/machine_routines.h>
+ #include <libkern/section_keywords.h>
+ #include <sys/cdefs.h>
++#if defined(SWEET)
++#include <corecrypto/ccdigest.h>
++#include <corecrypto/ccsha2.h>
++#endif
+ 
+ // The number of samples we can hold in an entropy buffer.
+ #define ENTROPY_MAX_SAMPLE_COUNT (2048)
+@@ -93,7 +97,11 @@ typedef struct entropy_data {
+ 	// State for a SHA512 computation. This is used to accumulate
+ 	// entropy samples from across all CPUs. It is finalized when
+ 	// entropy is provided to the consumer of this module.
++#if defined(SWEET)
++	ccdigest_ctx_decl(CCSHA512_STATE_SIZE, CCSHA512_BLOCK_SIZE, sha512_ctx);
++#else
+ 	SHA512_CTX sha512_ctx;
++#endif
+ 
+ 	// A buffer to hold a bitmap with one bit per sample of an entropy
+ 	// buffer. We are able to reuse this instance across all the
+@@ -195,12 +203,44 @@ entropy_analysis_store(entropy_sample_t sample)
+ 
+ #endif  // ENTROPY_ANALYSIS_SUPPORTED
+ 
++/* SWEET uses the same built-in SHA512 digest as bootseed_init, without a kext. */
++static void
++entropy_hash_init(void)
++{
++#if defined(SWEET)
++	ccdigest_init(&ccsha512_ltc_di, entropy_data.sha512_ctx);
++#else
++	SHA512_Init(&entropy_data.sha512_ctx);
++#endif
++}
++
++static void
++entropy_hash_update(const void *data, size_t nbytes)
++{
++#if defined(SWEET)
++	ccdigest_update(&ccsha512_ltc_di, entropy_data.sha512_ctx, nbytes, data);
++#else
++	SHA512_Update(&entropy_data.sha512_ctx, data, nbytes);
++#endif
++}
++
++static void
++entropy_hash_final(void *out)
++{
++#if defined(SWEET)
++	ccdigest_final(&ccsha512_ltc_di, entropy_data.sha512_ctx, out);
++	ccdigest_ctx_clear(CCSHA512_STATE_SIZE, CCSHA512_BLOCK_SIZE, entropy_data.sha512_ctx);
++#else
++	SHA512_Final(out, &entropy_data.sha512_ctx);
++#endif
++}
++
+ __startup_func
+ void
+ entropy_init(size_t seed_size, uint8_t *seed)
+ {
+-	SHA512_Init(&entropy_data.sha512_ctx);
+-	SHA512_Update(&entropy_data.sha512_ctx, seed, seed_size);
++	entropy_hash_init();
++	entropy_hash_update(seed, seed_size);
+ 
+ 	lck_grp_init(&entropy_data.lock_group, "entropy-data", LCK_GRP_ATTR_NULL);
+ 	lck_mtx_init(&entropy_data.mutex, &entropy_data.lock_group, LCK_ATTR_NULL);
+@@ -520,7 +560,7 @@ entropy_provide(size_t *entropy_size, void *entropy, __unused void *arg)
+ 		// We accumulate the samples regardless of whether the test
+ 		// failed or a particular sample was filtered. It cannot hurt.
+ 		entropy_data.total_sample_count += filtered_sample_count;
+-		SHA512_Update(&entropy_data.sha512_ctx, e->samples, cpu_sample_count * sizeof(e->samples[0]));
++		entropy_hash_update(e->samples, cpu_sample_count * sizeof(e->samples[0]));
+ 
+ 		// "Drain" the per-CPU buffer by resetting its sample count.
+ 		os_atomic_store(&e->sample_count, 0, relaxed);
+@@ -562,14 +602,14 @@ entropy_provide(size_t *entropy_size, void *entropy, __unused void *arg)
+ 
+ 	// Extract the entropy seed from the digest context and adjust
+ 	// counters accordingly.
+-	SHA512_Final(entropy, &entropy_data.sha512_ctx);
++	entropy_hash_final(entropy);
+ 	entropy_data.read_sample_count = entropy_data.total_sample_count;
+ 	sample_count = n;
+ 	*entropy_size = SHA512_DIGEST_LENGTH;
+ 
+ 	// Reinitialize the digest context for future entropy
+ 	// conditioning.
+-	SHA512_Init(&entropy_data.sha512_ctx);
++	entropy_hash_init();
+ 
+ 	// To harden the entropy conditioner against an attacker with
+ 	// partial or temporary control of interrupts, we roll the
+@@ -585,8 +625,8 @@ entropy_provide(size_t *entropy_size, void *entropy, __unused void *arg)
+ 	// internal SHA512 block size. This will force an additional
+ 	// compression to provide backtracking resistance.
+ 	assert3u(sizeof(label) + *entropy_size, ==, SHA512_BLOCK_LENGTH);
+-	SHA512_Update(&entropy_data.sha512_ctx, label, sizeof(label));
+-	SHA512_Update(&entropy_data.sha512_ctx, entropy, *entropy_size);
++	entropy_hash_update(label, sizeof(label));
++	entropy_hash_update(entropy, *entropy_size);
+ 
+ out:
+ 	lck_mtx_unlock(&entropy_data.mutex);
+diff --git a/osfmk/prng/prng_random.c b/osfmk/prng/prng_random.c
+index 504b3fa..546e9d4 100644
+--- a/osfmk/prng/prng_random.c
++++ b/osfmk/prng/prng_random.c
+@@ -197,6 +197,139 @@ static struct {
+ 		     .strictFIPS = 0,
+ 	     }};
+ 
++#if defined(SWEET)
++/*
++ * The corecrypto kext normally installs the kernel PRNG. SWEET has no such
++ * kext: use the built-in HMAC-SHA512 DRBG matching xnu-12377's 64-byte seed
++ * size. A single mutex serializes generation and reseeding across all CPUs.
++ * This registers only the PRNG, not the unrelated g_crypto_funcs table.
++ */
++#include <kern/startup.h>
++
++static LCK_GRP_DECLARE(sweet_prng_group, "sweet-prng");
++static LCK_MTX_DECLARE(sweet_prng_lock, &sweet_prng_group);
++static struct cckprng_ctx sweet_prng_ctx;
++static const struct ccdrbg_nisthmac_custom sweet_prng_custom = {
++	.di = &ccsha512_ltc_di,
++	.strictFIPS = 0,
++};
++static cckprng_getentropy sweet_getentropy;
++static void *sweet_getentropy_arg;
++static unsigned sweet_max_ngens;
++static bool sweet_generators[MAX_CPUS];
++
++static struct ccdrbg_state *
++sweet_prng_state(struct cckprng_ctx *ctx)
++{
++	return (struct ccdrbg_state *)ctx->drbg_state;
++}
++
++static void
++sweet_prng_check(int status)
++{
++	if (status != CCDRBG_STATUS_OK) {
++		panic("SWEET HMAC DRBG error %d", status);
++	}
++}
++
++static void
++sweet_prng_init_with_getentropy(struct cckprng_ctx *ctx, unsigned max_ngens,
++    size_t seed_nbytes, const void *seed, size_t nonce_nbytes, const void *nonce,
++    cckprng_getentropy getentropy, void *getentropy_arg)
++{
++	assert(max_ngens > 0 && max_ngens <= MAX_CPUS);
++	ccdrbg_factory_nisthmac(&ctx->drbg_info, &sweet_prng_custom);
++	assert(ctx->drbg_info.size <= sizeof(ctx->drbg_state));
++	const char ps[] = "xnu sweet kernel random";
++	sweet_prng_check(ccdrbg_init(&ctx->drbg_info, sweet_prng_state(ctx),
++	    seed_nbytes, seed, nonce_nbytes, nonce, sizeof(ps) - 1, ps));
++	sweet_getentropy = getentropy;
++	sweet_getentropy_arg = getentropy_arg;
++	sweet_max_ngens = max_ngens;
++}
++
++static void
++sweet_prng_init(struct cckprng_ctx *ctx, size_t seed_nbytes, const void *seed,
++    size_t nonce_nbytes, const void *nonce, cckprng_getentropy getentropy,
++    void *getentropy_arg)
++{
++	sweet_prng_init_with_getentropy(ctx, MAX_CPUS, seed_nbytes, seed,
++	    nonce_nbytes, nonce, getentropy, getentropy_arg);
++}
++
++static void
++sweet_prng_initgen(__unused struct cckprng_ctx *ctx, unsigned gen_idx)
++{
++	lck_mtx_lock(&sweet_prng_lock);
++	assert(gen_idx < sweet_max_ngens);
++	assert(!sweet_generators[gen_idx]);
++	sweet_generators[gen_idx] = true;
++	lck_mtx_unlock(&sweet_prng_lock);
++}
++
++static void
++sweet_prng_reseed(struct cckprng_ctx *ctx, size_t nbytes, const void *seed)
++{
++	lck_mtx_lock(&sweet_prng_lock);
++	sweet_prng_check(ccdrbg_reseed(&ctx->drbg_info, sweet_prng_state(ctx),
++	    nbytes, seed, 0, NULL));
++	lck_mtx_unlock(&sweet_prng_lock);
++}
++
++static void
++sweet_prng_refresh(struct cckprng_ctx *ctx)
++{
++	/* The entropy callback also uses try-lock; refresh must not wait. */
++	if (!lck_mtx_try_lock(&sweet_prng_lock)) {
++		return;
++	}
++	uint8_t entropy[CCKPRNG_ENTROPY_SIZE];
++	size_t nbytes = sizeof(entropy);
++	int32_t nsamples = sweet_getentropy(&nbytes, entropy, sweet_getentropy_arg);
++	if (nsamples < 0) {
++		panic("SWEET PRNG entropy health test failed");
++	}
++	if (nsamples > 0) {
++		assert(nbytes >= SEED_SIZE && nbytes <= sizeof(entropy));
++		sweet_prng_check(ccdrbg_reseed(&ctx->drbg_info, sweet_prng_state(ctx),
++		    nbytes, entropy, 0, NULL));
++	}
++	cc_clear(sizeof(entropy), entropy);
++	lck_mtx_unlock(&sweet_prng_lock);
++}
++
++static void
++sweet_prng_generate(struct cckprng_ctx *ctx, unsigned gen_idx,
++    size_t nbytes, void *out)
++{
++	assert(nbytes <= CCKPRNG_GENERATE_MAX_NBYTES);
++	lck_mtx_lock(&sweet_prng_lock);
++	assert(gen_idx < sweet_max_ngens && sweet_generators[gen_idx]);
++	sweet_prng_check(ccdrbg_generate(&ctx->drbg_info, sweet_prng_state(ctx),
++	    nbytes, out, 0, NULL));
++	lck_mtx_unlock(&sweet_prng_lock);
++}
++
++__startup_func
++static void
++sweet_prng_startup(void)
++{
++	/* Ensure the boot seed exists before registration erases the early DRBG. */
++	(void)early_random();
++	const struct cckprng_funcs funcs = {
++		.init = sweet_prng_init,
++		.initgen = sweet_prng_initgen,
++		.reseed = sweet_prng_reseed,
++		.refresh = sweet_prng_refresh,
++		.generate = sweet_prng_generate,
++		.init_with_getentropy = sweet_prng_init_with_getentropy,
++	};
++	register_and_init_prng(&sweet_prng_ctx, &funcs);
++	kprintf("SWEET PRNG: HMAC-SHA512 registered\n");
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_FIRST, sweet_prng_startup);
++#endif /* SWEET */
++
+ __attribute__((noinline))
+ static void
+ early_random_init(void)
+@@ -419,11 +552,21 @@ write_random(void * buffer, u_int numbytes)
+ 	uint8_t seed[SHA512_DIGEST_LENGTH] = {0};
+ 
+ 	if (numbytes > SHA512_DIGEST_LENGTH) {
++#if defined(SWEET)
++		/* Hash without depending on the absent corecrypto kext's dispatch table. */
++		const struct ccdigest_info *di = &ccsha512_ltc_di;
++		ccdigest_di_decl(di, ctx);
++		ccdigest_init(di, ctx);
++		ccdigest_update(di, ctx, numbytes, buffer);
++		ccdigest_final(di, ctx, seed);
++		ccdigest_di_clear(di, ctx);
++#else
+ 		/* hash the input to minimize the time we need to hold the lock */
+ 		SHA512_CTX ctx;
+ 		SHA512_Init(&ctx);
+ 		SHA512_Update(&ctx, buffer, numbytes);
+ 		SHA512_Final(seed, &ctx);
++#endif
+ 	} else {
+ 		memcpy(seed, buffer, numbytes);
+ 	}

@@ -1,0 +1,203 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 19e7e67..76a7e1e 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -4952,8 +4952,9 @@ pmap_page_protect_options_with_flush_range(
+ 			}
+ #endif
+ 			if (remove && (options & PMAP_OPTIONS_COMPRESSOR)) {
+-				panic("pmap_page_protect: attempt to compress ppnum 0x%x owned by iommu %p, pve_p=%p",
+-				    ppnum, ptep_get_iommu(pte_p), pve_p);
++				/* ptep_get_iommu() only exists in Apple's PPL builds: report the raw PV entry */
++				panic("pmap_page_protect: attempt to compress ppnum 0x%x owned by iommu pte %p, pve_p=%p",
++				    ppnum, pte_p, pve_p);
+ 			}
+ 			goto protect_skip_pve_pass1;
+ 		}
+@@ -6180,6 +6181,9 @@ pmap_construct_pte(
+ 	return pte;
+ }
+ 
++/* defined further down; used by pmap_enter_options_internal() */
++MARK_AS_PMAP_TEXT static void pmap_phys_write_disable(vm_address_t va);
++
+ MARK_AS_PMAP_TEXT kern_return_t
+ pmap_enter_options_internal(
+ 	pmap_t pmap,
+@@ -12243,7 +12247,8 @@ pmap_cs_lockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
+ #if XNU_MONITOR
+ 	pmap_ppl_lockdown_pages(kva, size, PVH_FLAG_LOCKDOWN_CS, ppl_writable);
+ #else
+-	pmap_ppl_lockdown_pages(kva, size, 0, ppl_writable);
++	/* No PPL: nothing can lock pages down (pmap_ppl_lockdown_pages is PPL-only) */
++#pragma unused(kva, size, ppl_writable)
+ #endif
+ }
+ 
+@@ -12253,7 +12258,7 @@ pmap_cs_unlockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
+ #if XNU_MONITOR
+ 	pmap_ppl_unlockdown_pages(kva, size, PVH_FLAG_LOCKDOWN_CS, ppl_writable);
+ #else
+-	pmap_ppl_unlockdown_pages(kva, size, 0, ppl_writable);
++#pragma unused(kva, size, ppl_writable)
+ #endif
+ }
+ 
+diff --git a/osfmk/arm/pmap/pmap_misc.c b/osfmk/arm/pmap/pmap_misc.c
+index dacf3b5..471f6c3 100644
+--- a/osfmk/arm/pmap/pmap_misc.c
++++ b/osfmk/arm/pmap/pmap_misc.c
+@@ -39,6 +39,19 @@
+  */
+ 
+ 
++#if SCHED_HYGIENE_DEBUG && (DEVELOPMENT || DEBUG) && !XNU_MONITOR
++/*
++ * sweet: pmap.h declares this out of line for these configs, but the only
++ * definition ships in Apple's closed per-SoC pmap. Without the PPL there is
++ * no extra state to check.
++ */
++bool
++pmap_pending_preemption(void)
++{
++	return _pmap_pending_preemption_real();
++}
++#endif /* SCHED_HYGIENE_DEBUG && (DEVELOPMENT || DEBUG) && !XNU_MONITOR */
++
+ void
+ pmap_abandon_measurement(void)
+ {
+diff --git a/osfmk/arm64/amcc_rorgn_common.c b/osfmk/arm64/amcc_rorgn_common.c
+new file mode 100644
+index 0000000..963cdc1
+--- /dev/null
++++ b/osfmk/arm64/amcc_rorgn_common.c
+@@ -0,0 +1,9 @@
++/*
++ * sweet: files.arm64 builds this for nos_arm_asm, but the source only ships
++ * in Apple's closed per-SoC library. It implements the AMCC read-only region
++ * (KTRR/CTRR kernel text lockdown), which needs Apple memory controller
++ * hardware; nothing references it on SWEET (no KERNEL_INTEGRITY_KTRR/CTRR).
++ */
++#include <stdint.h>
++
++static const uint8_t sweet_no_amcc_rorgn __attribute__((unused)) = 0;
+diff --git a/osfmk/arm64/amcc_rorgn_ppl.c b/osfmk/arm64/amcc_rorgn_ppl.c
+new file mode 100644
+index 0000000..963cdc1
+--- /dev/null
++++ b/osfmk/arm64/amcc_rorgn_ppl.c
+@@ -0,0 +1,9 @@
++/*
++ * sweet: files.arm64 builds this for nos_arm_asm, but the source only ships
++ * in Apple's closed per-SoC library. It implements the AMCC read-only region
++ * (KTRR/CTRR kernel text lockdown), which needs Apple memory controller
++ * hardware; nothing references it on SWEET (no KERNEL_INTEGRITY_KTRR/CTRR).
++ */
++#include <stdint.h>
++
++static const uint8_t sweet_no_amcc_rorgn __attribute__((unused)) = 0;
+diff --git a/osfmk/arm64/amcc_rorgn_ppl_amcc.c b/osfmk/arm64/amcc_rorgn_ppl_amcc.c
+new file mode 100644
+index 0000000..963cdc1
+--- /dev/null
++++ b/osfmk/arm64/amcc_rorgn_ppl_amcc.c
+@@ -0,0 +1,9 @@
++/*
++ * sweet: files.arm64 builds this for nos_arm_asm, but the source only ships
++ * in Apple's closed per-SoC library. It implements the AMCC read-only region
++ * (KTRR/CTRR kernel text lockdown), which needs Apple memory controller
++ * hardware; nothing references it on SWEET (no KERNEL_INTEGRITY_KTRR/CTRR).
++ */
++#include <stdint.h>
++
++static const uint8_t sweet_no_amcc_rorgn __attribute__((unused)) = 0;
+diff --git a/osfmk/arm64/amcc_rorgn_pv_ctrr.c b/osfmk/arm64/amcc_rorgn_pv_ctrr.c
+new file mode 100644
+index 0000000..963cdc1
+--- /dev/null
++++ b/osfmk/arm64/amcc_rorgn_pv_ctrr.c
+@@ -0,0 +1,9 @@
++/*
++ * sweet: files.arm64 builds this for nos_arm_asm, but the source only ships
++ * in Apple's closed per-SoC library. It implements the AMCC read-only region
++ * (KTRR/CTRR kernel text lockdown), which needs Apple memory controller
++ * hardware; nothing references it on SWEET (no KERNEL_INTEGRITY_KTRR/CTRR).
++ */
++#include <stdint.h>
++
++static const uint8_t sweet_no_amcc_rorgn __attribute__((unused)) = 0;
+diff --git a/osfmk/arm64/caches_asm.s b/osfmk/arm64/caches_asm.s
+index 1588830..4d96073 100644
+--- a/osfmk/arm64/caches_asm.s
++++ b/osfmk/arm64/caches_asm.s
+@@ -213,6 +213,7 @@ L_ipui_loop:
+ 	.globl EXT(CleanPoC_Dcache)
+ 	.globl EXT(clean_mmu_dcache)
+ LEXT(CleanPoC_Dcache)
++LEXT(clean_mmu_dcache)		/* sweet: was exported without a label */
+ 	ARM64_PROLOG
+ #if  defined(APPLE_ARM64_ARCH_FAMILY)
+ 	dsb		sy
+@@ -354,6 +355,24 @@ LEXT(CleanPoC_DcacheRegion_Force)
+ 	b		EXT(CleanPoC_DcacheRegion_internal)
+ #endif /* APPLE_ARM64_ARCH_FAMILY */
+ 
++#if !defined(APPLE_ARM64_ARCH_FAMILY)
++/*
++ *	void CleanPoC_DcacheRegion_Force_nopreempt(vm_offset_t va, size_t length)
++ *	void CleanPoC_DcacheRegion_Force_nopreempt_nohid(vm_offset_t va, size_t length)
++ *
++ *		sweet: the Apple variants toggle HID bits around DC CVAC; generic
++ *		ARMv8 has no such bits, so both are the plain region clean.
++ */
++	.text
++	.align 2
++	.globl EXT(CleanPoC_DcacheRegion_Force_nopreempt)
++	.globl EXT(CleanPoC_DcacheRegion_Force_nopreempt_nohid)
++LEXT(CleanPoC_DcacheRegion_Force_nopreempt)
++LEXT(CleanPoC_DcacheRegion_Force_nopreempt_nohid)
++	ARM64_PROLOG
++	b		EXT(CleanPoC_DcacheRegion_internal)
++#endif /* !APPLE_ARM64_ARCH_FAMILY */
++
+ /*
+  *	void FlushPoC_Dcache(void)
+  *
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index 07143d5..4406fde 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2622,6 +2622,18 @@ ml_get_decrementer(void)
+ 	return dec;
+ }
+ 
++#if defined(SWEET)
++/*
++ * sweet: arm_vm_init() calls this unconditionally; Apple's definition (it
++ * enters the PPL/monitor) ships only in the closed per-SoC library. There is
++ * no monitor on SWEET.
++ */
++void
++ml_enable_monitor(void)
++{
++}
++#endif /* SWEET */
++
+ boolean_t
+ ml_get_timer_pending(void)
+ {
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index cd29a71..3a7d3ea 100644
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -207,8 +207,8 @@ Lskip_cpu_reset_handler:
+ 	.align 3
+ 	.global EXT(LowResetVectorEnd)
+ LEXT(LowResetVectorEnd)
+-	.global	EXT(SleepToken)
+ #if WITH_CLASSIC_S2R
++	.global	EXT(SleepToken)
+ LEXT(SleepToken)
+ 	.space	(stSize_NUM),0
+ #endif

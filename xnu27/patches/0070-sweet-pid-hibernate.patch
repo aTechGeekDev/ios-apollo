@@ -1,0 +1,54 @@
+diff --git a/bsd/kern/kern_proc.c b/bsd/kern/kern_proc.c
+index dfb3a45..6a4f663 100644
+--- a/bsd/kern/kern_proc.c
++++ b/bsd/kern/kern_proc.c
+@@ -6687,7 +6687,12 @@ out:
+ 	return error;
+ }
+ 
+-#if !XNU_TARGET_OS_OSX
++#if !XNU_TARGET_OS_OSX || defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * SWEET runs the iOS userland on the macOS config: SpringBoard calls
++ * pid_hibernate when an app leaves the foreground, and nosys (SIGSYS)
++ * killed it. Without CONFIG_FREEZE return 0 on SWEET, as earlier iOS did.
++ */
+ /*
+  * Freeze the specified process (provided in args->pid), or find and freeze a PID.
+  * When a process is specified, this call is blocking, otherwise we wake up the
+@@ -6709,11 +6714,13 @@ pid_hibernate(struct proc *p __unused, struct pid_hibernate_args *args, int *ret
+ 	}
+ 
+ #ifndef CONFIG_FREEZE
++#if !defined(ARM64_BOARD_CONFIG_SWEET)
+ 	if (pid != -2) {
+ 		os_log(OS_LOG_DEFAULT, "%s: pid %d not supported when freezer is disabled.",
+ 		    __func__, pid);
+ 		error = ENOTSUP;
+ 	}
++#endif
+ #else
+ 
+ 	/*
+@@ -6760,7 +6767,7 @@ out:
+ 	*ret = error;
+ 	return error;
+ }
+-#endif /* !XNU_TARGET_OS_OSX */
++#endif /* !XNU_TARGET_OS_OSX || SWEET */
+ 
+ #if SOCKETS
+ 
+diff --git a/bsd/kern/syscalls.master b/bsd/kern/syscalls.master
+index c08a74c..c19d42f 100644
+--- a/bsd/kern/syscalls.master
++++ b/bsd/kern/syscalls.master
+@@ -650,7 +650,7 @@
+ 432	AUE_NULL	ALL	{ int audit_session_port(au_asid_t asid, user_addr_t portnamep); }
+ 433	AUE_NULL	ALL	{ int pid_suspend(int pid); }
+ 434	AUE_NULL	ALL	{ int pid_resume(int pid); }
+-#if CONFIG_EMBEDDED
++#if CONFIG_EMBEDDED || defined(ARM64_BOARD_CONFIG_SWEET)
+ 435	AUE_NULL	ALL	{ int pid_hibernate(int pid); }
+ #else
+ 435     AUE_NULL        ALL     { int nosys(void); }

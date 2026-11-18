@@ -1,0 +1,1020 @@
+diff --git a/bsd/dev/arm64/sysctl.c b/bsd/dev/arm64/sysctl.c
+index ebca00f409e6948e86533416124bf01b60b54330..ae5fe8a1b39bc3ad6e4105be97cfd510a0a9e475 100644
+--- a/bsd/dev/arm64/sysctl.c
++++ b/bsd/dev/arm64/sysctl.c
+@@ -441,6 +441,31 @@ SYSCTL_PROC(_machdep, OID_AUTO, ptrauth_enabled,
+     0, 0,
+     machdep_ptrauth_enabled, "I", "");
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern size_t sweet_emu_format_stats(char *buf, size_t buflen);
++
++static int
++sysctl_sweet_emu_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	char buf[384];
++	size_t len = sweet_emu_format_stats(buf, sizeof(buf));
++	return SYSCTL_OUT(req, buf, len + 1);
++}
++
++SYSCTL_NODE(, OID_AUTO, sweet, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "sweet");
++
++SYSCTL_PROC(_sweet, OID_AUTO, emu_stats,
++    CTLTYPE_STRING | CTLFLAG_KERN | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0,
++    sysctl_sweet_emu_stats, "A", "SWEET ARM64e/ARMv8.4 instruction emulation counters");
++
++SYSCTL_PROC(_machdep, OID_AUTO, sweet_emu_stats,
++    CTLTYPE_STRING | CTLFLAG_KERN | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0,
++    sysctl_sweet_emu_stats, "A", "SWEET ARM64e/ARMv8.4 instruction emulation counters");
++#endif /* defined(ARM64_BOARD_CONFIG_SWEET) */
++
+ static const char _ctrr_type[] =
+ #if defined(KERNEL_CTRR_VERSION)
+     "ctrrv" STRINGIFY(KERNEL_CTRR_VERSION);
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index c25aae74c76e705c293258632a58f7542676c3b3..2902910556d6661f414ed4571740b8c1b75fbb3b 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -170,6 +170,955 @@ extern kern_return_t arm_fast_fault(pmap_t, vm_map_address_t, vm_prot_t, bool, b
+ 
+ static void handle_uncategorized(arm_saved_state_t *);
+ 
++#if defined(SWEET)
++/*
++ * iOS 26 arm64e / ARMv8.3-A / ARMv8.4-A EL0 instruction emulator for SM8150
++ * (Kryo 485 = Cortex-A76 + Cortex-A55, ARMv8.2-A without hardware PAC/JSCVT/
++ * FCMA/LRCPC2/FlagM/DIT/SHA3).
++ *
++ * Offline-rewritten binaries execute native ARMv8.2 instructions directly;
++ * this trap handler emulates any remaining or dynamically generated opcodes
++ * cleanly using integer-only (-msoft-float safe) arithmetic.
++ */
++enum sweet_emu_cat {
++	SWEET_EMU_PAC_RET = 0,
++	SWEET_EMU_PAC_BR,
++	SWEET_EMU_PAC_SIGN_AUTH,
++	SWEET_EMU_PAC_STRIP,
++	SWEET_EMU_PACGA,
++	SWEET_EMU_LDRAA,
++	SWEET_EMU_JSCVT,
++	SWEET_EMU_FCMA,
++	SWEET_EMU_LRCPC2,
++	SWEET_EMU_FLAGM_DIT,
++	SWEET_EMU_SHA3,
++	SWEET_EMU_CAT_COUNT
++};
++
++static uint64_t sweet_emu_total = 0;
++static uint64_t sweet_emu_counts[SWEET_EMU_CAT_COUNT];
++size_t sweet_emu_format_stats(char *buf, size_t buflen);
++
++static const char *const sweet_emu_cat_names[SWEET_EMU_CAT_COUNT] = {
++	"pac_ret",
++	"pac_br",
++	"pac_sign_auth",
++	"pac_strip",
++	"pacga",
++	"ldraa",
++	"jscvt",
++	"fcma",
++	"lrcpc2",
++	"flagm_dit",
++	"sha3",
++};
++
++static inline void
++sweet_emu_record(enum sweet_emu_cat cat, uint64_t pc, uint32_t insn)
++{
++	uint64_t prev_cat = os_atomic_inc_orig(&sweet_emu_counts[cat], relaxed);
++	uint64_t prev_tot = os_atomic_inc_orig(&sweet_emu_total, relaxed);
++
++	if (__improbable(prev_cat == 0)) {
++		printf("SWEET EMU: first %s emulated (pid=%d pc=0x%llx insn=0x%08x)\n",
++		    sweet_emu_cat_names[cat], task_pid(current_task()),
++		    (unsigned long long)pc, insn);
++	} else if (__improbable(((prev_tot + 1ULL) & 0xFFFFFULL) == 0)) {
++		printf("SWEET EMU: total=%llu pac_ret=%llu pac_br=%llu sign_auth=%llu "
++		    "strip=%llu pacga=%llu ldraa=%llu jscvt=%llu fcma=%llu "
++		    "lrcpc2=%llu flagm_dit=%llu sha3=%llu\n",
++		    (unsigned long long)(prev_tot + 1ULL),
++		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PAC_RET], relaxed),
++		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PAC_BR], relaxed),
++		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PAC_SIGN_AUTH], relaxed),
++		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PAC_STRIP], relaxed),
++		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PACGA], relaxed),
++		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_LDRAA], relaxed),
++		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_JSCVT], relaxed),
++		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_FCMA], relaxed),
++		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_LRCPC2], relaxed),
++		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_FLAGM_DIT], relaxed),
++		    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_SHA3], relaxed));
++	}
++}
++
++size_t
++sweet_emu_format_stats(char *buf, size_t buflen)
++{
++	int n = snprintf(buf, buflen,
++	    "total=%llu pac_ret=%llu pac_br=%llu pac_sign_auth=%llu "
++	    "pac_strip=%llu pacga=%llu ldraa=%llu jscvt=%llu fcma=%llu "
++	    "lrcpc2=%llu flagm_dit=%llu sha3=%llu",
++	    (unsigned long long)os_atomic_load(&sweet_emu_total, relaxed),
++	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PAC_RET], relaxed),
++	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PAC_BR], relaxed),
++	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PAC_SIGN_AUTH], relaxed),
++	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PAC_STRIP], relaxed),
++	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_PACGA], relaxed),
++	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_LDRAA], relaxed),
++	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_JSCVT], relaxed),
++	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_FCMA], relaxed),
++	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_LRCPC2], relaxed),
++	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_FLAGM_DIT], relaxed),
++	    (unsigned long long)os_atomic_load(&sweet_emu_counts[SWEET_EMU_SHA3], relaxed));
++	if (n < 0) {
++		return 0;
++	}
++	return ((size_t)n < buflen) ? (size_t)n : (buflen - 1);
++}
++
++static inline uint64_t
++sweet_emu_read_x(const arm_saved_state64_t *ss, unsigned int r, bool sp_for_31)
++{
++	if (r < 29U) {
++		return ss->x[r];
++	}
++	if (r == 29U) {
++		return ss->fp;
++	}
++	if (r == 30U) {
++		return ss->lr;
++	}
++	return sp_for_31 ? ss->sp : 0ULL;
++}
++
++static inline void
++sweet_emu_write_x(arm_saved_state64_t *ss, unsigned int r, uint64_t val, bool sp_for_31)
++{
++	if (r < 29U) {
++		ss->x[r] = val;
++	} else if (r == 29U) {
++		ss->fp = val;
++	} else if (r == 30U) {
++		ss->lr = val;
++	} else if (sp_for_31) {
++		ss->sp = val;
++	}
++}
++
++static inline uint64_t
++sweet_emu_strip_code_ptr(uint64_t p)
++{
++	if ((p & (1ULL << 55)) == 0) {
++		return p & 0x0000FFFFFFFFFFFFULL;
++	}
++	return p;
++}
++
++static inline uint64_t
++sweet_emu_strip_data_ptr(uint64_t p)
++{
++	if ((p & (1ULL << 55)) == 0) {
++		return p & ~0x007F000000000000ULL;
++	}
++	return p;
++}
++
++static inline uint64_t
++sweet_emu_tbi_uaddr(uint64_t p)
++{
++	/* XNU copyin/copyout bans TBI top-byte tags; strip [63:56] for user VAs (bit 55 == 0). */
++	if ((p & (1ULL << 55)) == 0) {
++		return p & 0x00FFFFFFFFFFFFFFULL;
++	}
++	return p;
++}
++
++static void __dead2
++sweet_emu_deliver_bad_access(uint64_t fault_addr)
++{
++	mach_exception_data_type_t codes[2] = {
++		KERN_INVALID_ADDRESS,
++		(mach_exception_data_type_t)fault_addr,
++	};
++	exception_triage(EXC_BAD_ACCESS, codes, 2);
++	__builtin_unreachable();
++}
++
++/* Pure-integer IEEE-754 helpers for ARMv8.3 FCADD/FCMLA (-msoft-float safe) */
++static inline uint32_t
++sweet_f16_to_f32(uint16_t h)
++{
++	uint32_t sign = ((uint32_t)(h & 0x8000U)) << 16;
++	uint32_t exp  = (h >> 10) & 0x1FU;
++	uint32_t frac = h & 0x03FFU;
++
++	if (exp == 0) {
++		if (frac == 0) {
++			return sign;
++		}
++		exp = 1;
++		while ((frac & 0x0400U) == 0) {
++			frac <<= 1;
++			exp--;
++		}
++		frac &= 0x03FFU;
++		return sign | ((exp + (127U - 15U)) << 23) | (frac << 13);
++	}
++	if (exp == 0x1FU) {
++		if (frac == 0) {
++			return sign | 0x7F800000U;
++		}
++		return 0x7FC00000U | sign | (frac << 13);
++	}
++	return sign | ((exp + (127U - 15U)) << 23) | (frac << 13);
++}
++
++static inline uint16_t
++sweet_f32_to_f16(uint32_t f)
++{
++	uint16_t sign = (uint16_t)((f >> 16) & 0x8000U);
++	int32_t  exp  = (int32_t)((f >> 23) & 0xFFU) - 127 + 15;
++	uint32_t frac = f & 0x007FFFFFU;
++
++	if (((f >> 23) & 0xFFU) == 0xFFU) {
++		if (frac == 0) {
++			return (uint16_t)(sign | 0x7C00U);
++		}
++		return (uint16_t)(sign | 0x7E00U | (uint16_t)(frac >> 13));
++	}
++	if (exp >= 0x1F) {
++		return (uint16_t)(sign | 0x7C00U);
++	}
++	if (exp <= 0) {
++		if (exp < -10) {
++			return sign;
++		}
++		uint32_t mant = 0x00800000U | frac;
++		uint32_t shift = (uint32_t)(14 - exp);
++		uint32_t out_f = mant >> shift;
++		uint32_t rem = mant & ((1U << shift) - 1U);
++		uint32_t half = 1U << (shift - 1U);
++		if (rem > half || (rem == half && (out_f & 1U))) {
++			out_f++;
++		}
++		return (uint16_t)(sign | out_f);
++	}
++	uint32_t out_f = frac >> 13;
++	uint32_t rem = frac & 0x1FFFU;
++	if (rem > 0x1000U || (rem == 0x1000U && (out_f & 1U))) {
++		out_f++;
++		if (out_f >= 0x0400U) {
++			out_f = 0;
++			exp++;
++			if (exp >= 0x1F) {
++				return (uint16_t)(sign | 0x7C00U);
++			}
++		}
++	}
++	return (uint16_t)(sign | ((uint16_t)exp << 10) | (uint16_t)out_f);
++}
++
++static inline uint32_t
++sweet_f32_pack_rne(uint32_t sign, int32_t exp2, uint64_t sig)
++{
++	if (sig == 0) {
++		return 0;
++	}
++	int lz = __builtin_clzll(sig);
++	if (lz < 13) {
++		int shr = 13 - lz;
++		uint64_t sticky = (sig & ((1ULL << shr) - 1ULL)) ? 1ULL : 0ULL;
++		sig = (sig >> shr) | sticky;
++		exp2 += shr;
++	} else if (lz > 13) {
++		int shl = lz - 13;
++		sig <<= shl;
++		exp2 -= shl;
++	}
++	int32_t bexp = exp2 + 127;
++	if (bexp >= 255) {
++		return (sign << 31) | 0x7F800000U;
++	}
++	if (bexp <= 0) {
++		int shr = 1 - bexp;
++		if (shr >= 52) {
++			return sign << 31;
++		}
++		uint64_t sticky = (sig & ((1ULL << shr) - 1ULL)) ? 1ULL : 0ULL;
++		sig = (sig >> shr) | sticky;
++		bexp = 0;
++	}
++	uint32_t out_frac = (uint32_t)((sig >> 27) & 0x007FFFFFULL);
++	uint64_t rem = sig & 0x07FFFFFFULL;
++	uint64_t half = 0x04000000ULL;
++	if (rem > half || (rem == half && (out_frac & 1U))) {
++		out_frac++;
++		if (out_frac >= 0x00800000U) {
++			out_frac = 0;
++			bexp++;
++			if (bexp >= 255) {
++				return (sign << 31) | 0x7F800000U;
++			}
++		}
++	} else if (bexp == 0 && (sig & (1ULL << 50))) {
++		bexp = 1;
++	}
++	return (sign << 31) | ((uint32_t)bexp << 23) | out_frac;
++}
++
++static inline void
++sweet_f32_unpack(uint32_t f, uint32_t *sign, int32_t *exp2, uint64_t *sig23, int *kind)
++{
++	*sign = f >> 31;
++	uint32_t bexp = (f >> 23) & 0xFFU;
++	uint32_t frac = f & 0x007FFFFFU;
++	if (bexp == 0xFFU) {
++		*kind = (frac == 0) ? 2 : 3;
++		*exp2 = 0;
++		*sig23 = frac;
++	} else if (bexp == 0) {
++		if (frac == 0) {
++			*kind = 0;
++			*exp2 = 0;
++			*sig23 = 0;
++		} else {
++			int lz = __builtin_clz(frac) - 8;
++			*kind = 1;
++			*exp2 = -126 - lz;
++			*sig23 = (uint64_t)frac << lz;
++		}
++	} else {
++		*kind = 1;
++		*exp2 = (int32_t)bexp - 127;
++		*sig23 = 0x00800000ULL | frac;
++	}
++}
++
++static uint32_t
++sweet_f32_add(uint32_t a, uint32_t b)
++{
++	uint32_t sa, sb;
++	int32_t ea, eb;
++	uint64_t ma, mb;
++	int ka, kb;
++	sweet_f32_unpack(a, &sa, &ea, &ma, &ka);
++	sweet_f32_unpack(b, &sb, &eb, &mb, &kb);
++
++	if (ka == 3 || kb == 3) {
++		return 0x7FC00000U;
++	}
++	if (ka == 2 && kb == 2) {
++		return (sa == sb) ? a : 0x7FC00000U;
++	}
++	if (ka == 2) {
++		return a;
++	}
++	if (kb == 2) {
++		return b;
++	}
++	if (ka == 0 && kb == 0) {
++		return (sa & sb) << 31;
++	}
++	if (ka == 0) {
++		return b;
++	}
++	if (kb == 0) {
++		return a;
++	}
++
++	ma <<= 27;
++	mb <<= 27;
++	if (ea < eb || (ea == eb && ma < mb)) {
++		uint32_t ts = sa; sa = sb; sb = ts;
++		int32_t te = ea; ea = eb; eb = te;
++		uint64_t tm = ma; ma = mb; mb = tm;
++	}
++	int32_t diff = ea - eb;
++	if (diff >= 55) {
++		mb = 1ULL;
++	} else if (diff > 0) {
++		uint64_t sticky = (mb & ((1ULL << diff) - 1ULL)) ? 1ULL : 0ULL;
++		mb = (mb >> diff) | sticky;
++	}
++	uint64_t mres = (sa == sb) ? (ma + mb) : (ma - mb);
++	return sweet_f32_pack_rne(sa, ea, mres);
++}
++
++static uint32_t
++sweet_f32_fma(uint32_t acc, uint32_t x, uint32_t y)
++{
++	uint32_t sx, sy, sc;
++	int32_t ex, ey, ec;
++	uint64_t mx, my, mc;
++	int kx, ky, kc;
++	sweet_f32_unpack(x, &sx, &ex, &mx, &kx);
++	sweet_f32_unpack(y, &sy, &ey, &my, &ky);
++	sweet_f32_unpack(acc, &sc, &ec, &mc, &kc);
++
++	uint32_t sp = sx ^ sy;
++	if (kx == 3 || ky == 3 || kc == 3) {
++		return 0x7FC00000U;
++	}
++	if ((kx == 2 && ky == 0) || (kx == 0 && ky == 2)) {
++		return 0x7FC00000U;
++	}
++	if (kx == 2 || ky == 2) {
++		if (kc == 2 && sc != sp) {
++			return 0x7FC00000U;
++		}
++		return (sp << 31) | 0x7F800000U;
++	}
++	if (kc == 2) {
++		return acc;
++	}
++	if (kx == 0 || ky == 0) {
++		if (kc == 0) {
++			return (sc & sp) << 31;
++		}
++		return acc;
++	}
++
++	uint64_t mp = mx * my;
++	int32_t ep = ex + ey;
++	if (mp & (1ULL << 47)) {
++		ep += 1;
++		mp <<= 3;
++	} else {
++		mp <<= 4;
++	}
++	if (kc == 0) {
++		return sweet_f32_pack_rne(sp, ep, mp);
++	}
++	mc <<= 27;
++	uint32_t sres = sp;
++	int32_t eres = ep;
++	uint64_t ma = mp, mb = mc;
++	if (ep < ec || (ep == ec && ma < mb)) {
++		sres = sc;
++		eres = ec;
++		ma = mc;
++		mb = mp;
++	}
++	int32_t diff = eres - ((eres == ep) ? ec : ep);
++	if (diff >= 55) {
++		mb = 1ULL;
++	} else if (diff > 0) {
++		uint64_t sticky = (mb & ((1ULL << diff) - 1ULL)) ? 1ULL : 0ULL;
++		mb = (mb >> diff) | sticky;
++	}
++	uint64_t mres = (sp == sc) ? (ma + mb) : (ma - mb);
++	return sweet_f32_pack_rne(sres, eres, mres);
++}
++
++static inline uint32_t
++sweet_fcmla_lane_f32(uint32_t acc, uint32_t x, uint32_t y, bool neg_prod)
++{
++	if (neg_prod) {
++		x ^= 0x80000000U;
++	}
++	return sweet_f32_fma(acc, x, y);
++}
++
++static inline uint16_t
++sweet_fcmla_lane_f16(uint16_t acc, uint16_t x, uint16_t y, bool neg_prod)
++{
++	if (neg_prod) {
++		x ^= 0x8000U;
++	}
++	return sweet_f32_to_f16(sweet_f32_fma(sweet_f16_to_f32(acc),
++	    sweet_f16_to_f32(x), sweet_f16_to_f32(y)));
++}
++
++static bool
++sweet_emulate_user_arm64(arm_context_t *context)
++{
++	arm_saved_state_t *state = &context->ss;
++
++	if (!is_saved_state64(state) || !PSR64_IS_USER64(get_saved_state_cpsr(state))) {
++		return false;
++	}
++
++	arm_saved_state64_t *ss = saved_state64(state);
++	uint64_t pc = ss->pc;
++	uint32_t insn = 0;
++
++	if (copyin((user_addr_t)sweet_emu_tbi_uaddr(pc), (char *)&insn, sizeof(insn)) != 0) {
++		return false;
++	}
++
++	/* 1a. PAC returns: retaa (0xd65f0bff), retab (0xd65f0fff) */
++	if ((insn & 0xFFFFFBFFU) == 0xD65F0BFFU) {
++		ss->pc = sweet_emu_strip_code_ptr(ss->lr);
++		sweet_emu_record(SWEET_EMU_PAC_RET, pc, insn);
++		return true;
++	}
++
++	/* 1b. PAC branches: braaz/brabz, blraaz/blrabz, braa/brab, blraa/blrab */
++	if ((insn & 0xFFFFF81FU) == 0xD61F081FU ||
++	    (insn & 0xFFFFF800U) == 0xD71F0800U) {
++		unsigned int rn = (insn >> 5) & 31U;
++		uint64_t target = sweet_emu_strip_code_ptr(sweet_emu_read_x(ss, rn, false));
++		ss->pc = target;
++		sweet_emu_record(SWEET_EMU_PAC_BR, pc, insn);
++		return true;
++	}
++	if ((insn & 0xFFFFF81FU) == 0xD63F081FU ||
++	    (insn & 0xFFFFF800U) == 0xD73F0800U) {
++		unsigned int rn = (insn >> 5) & 31U;
++		uint64_t target = sweet_emu_strip_code_ptr(sweet_emu_read_x(ss, rn, false));
++		ss->lr = pc + 4ULL;
++		ss->pc = target;
++		sweet_emu_record(SWEET_EMU_PAC_BR, pc, insn);
++		return true;
++	}
++
++	/* 1c. PAC 1-source/2-source sign & auth: pacia/b, pacda/b, autia/b, autda/b, pac*za/zb, aut*za/zb */
++	if ((insn & 0xFFFFE000U) == 0xDAC10000U ||
++	    (insn & 0xFFFFE3E0U) == 0xDAC123E0U) {
++		unsigned int rd = insn & 31U;
++		if (rd != 31U) {
++			uint64_t val = sweet_emu_read_x(ss, rd, false);
++			sweet_emu_write_x(ss, rd, sweet_emu_strip_data_ptr(val), false);
++		}
++		ss->pc = pc + 4ULL;
++		sweet_emu_record(SWEET_EMU_PAC_SIGN_AUTH, pc, insn);
++		return true;
++	}
++
++	/* 1d. PAC strip: xpaci (0xdac143e0 | Rd), xpacd (0xdac147e0 | Rd) */
++	if ((insn & 0xFFFFFBE0U) == 0xDAC143E0U) {
++		unsigned int rd = insn & 31U;
++		bool is_data = ((insn >> 10) & 1U) != 0;
++		if (rd != 31U) {
++			uint64_t val = sweet_emu_read_x(ss, rd, false);
++			val = is_data ? sweet_emu_strip_data_ptr(val) : sweet_emu_strip_code_ptr(val);
++			sweet_emu_write_x(ss, rd, val, false);
++		}
++		ss->pc = pc + 4ULL;
++		sweet_emu_record(SWEET_EMU_PAC_STRIP, pc, insn);
++		return true;
++	}
++
++	/* 1e. PACGA Xd, Xn, <Xm|SP> */
++	if ((insn & 0xFFE0FC00U) == 0x9AC03000U) {
++		unsigned int rd = insn & 31U;
++		unsigned int rn = (insn >> 5) & 31U;
++		unsigned int rm = (insn >> 16) & 31U;
++		if (rd != 31U) {
++			uint64_t vn = sweet_emu_read_x(ss, rn, false);
++			uint64_t vm = sweet_emu_read_x(ss, rm, true); /* Rm==31 is SP */
++			uint64_t h = vn ^ (vm + 0x9E3779B97F4A7C15ULL + (vn << 6) + (vn >> 2));
++			h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ULL;
++			h = (h ^ (h >> 27)) * 0x94D049BB133111EBULL;
++			h = h ^ (h >> 31);
++			uint32_t h32 = (uint32_t)(h >> 32) ^ (uint32_t)h;
++			if (h32 == 0U) {
++				h32 = 0x5A5A5A5AU;
++			}
++			sweet_emu_write_x(ss, rd, ((uint64_t)h32) << 32, false);
++		}
++		ss->pc = pc + 4ULL;
++		sweet_emu_record(SWEET_EMU_PACGA, pc, insn);
++		return true;
++	}
++
++	/* 1f. LDRAA / LDRAB Xt, [Xn|SP, #simm]{!} */
++	if ((insn & 0xFF200400U) == 0xF8200400U) {
++		unsigned int rt = insn & 31U;
++		unsigned int rn = (insn >> 5) & 31U;
++		bool writeback  = ((insn >> 11) & 1U) != 0;
++		uint32_t imm9   = (insn >> 12) & 0x1FFU;
++		uint32_t s_bit  = (insn >> 22) & 1U;
++		int64_t simm10  = (int64_t)(((int32_t)((s_bit << 9) | imm9) << 22) >> 22);
++		int64_t offset  = simm10 * 8;
++		uint64_t base   = sweet_emu_strip_data_ptr(sweet_emu_read_x(ss, rn, true));
++		uint64_t addr   = base + (uint64_t)offset;
++		uint64_t val    = 0;
++
++		if (copyin((user_addr_t)sweet_emu_tbi_uaddr(addr), (char *)&val, sizeof(val)) != 0) {
++			sweet_emu_deliver_bad_access(addr);
++		}
++		if (writeback) {
++			sweet_emu_write_x(ss, rn, addr, true);
++		}
++		sweet_emu_write_x(ss, rt, val, false);
++		ss->pc = pc + 4ULL;
++		sweet_emu_record(SWEET_EMU_LDRAA, pc, insn);
++		return true;
++	}
++
++	/* 2a. ARMv8.3-A FJCVTZS Wd, Dn (JavaScript float64 -> int32 modulo 2^32) */
++	if ((insn & 0xFFFFFC00U) == 0x1E7E0000U) {
++		if (!is_neon_saved_state64(&context->ns)) {
++			return false;
++		}
++		arm_neon_saved_state64_t *ns = neon_state64(&context->ns);
++		unsigned int rd = insn & 31U;
++		unsigned int rn = (insn >> 5) & 31U;
++		uint64_t qv[2];
++		memcpy(qv, &ns->v.q[rn], sizeof(qv));
++		uint64_t bits = qv[0];
++		uint32_t sign = (uint32_t)(bits >> 63);
++		int32_t raw_exp = (int32_t)((bits >> 52) & 0x7FFULL);
++		uint64_t frac = bits & 0x000FFFFFFFFFFFFFULL;
++		uint32_t u32 = 0;
++		uint32_t z_flag = 0;
++
++		if (raw_exp == 0 && frac == 0) {
++			u32 = 0;
++			z_flag = sign ? 0U : PSR64_Z;
++		} else if (raw_exp == 0x7FF || raw_exp < 1023) {
++			u32 = 0;
++			z_flag = 0;
++		} else {
++			int32_t exp = raw_exp - 1023;
++			uint64_t mant = (1ULL << 52) | frac;
++			bool exact = true;
++			if (exp < 52 && (mant & ((1ULL << (52 - exp)) - 1ULL)) != 0) {
++				exact = false;
++			}
++			if (sign == 0) {
++				if (exp > 30) {
++					exact = false;
++				}
++			} else {
++				if (exp > 31 || (exp == 31 && frac != 0)) {
++					exact = false;
++				}
++			}
++			if (exp >= 84) {
++				u32 = 0;
++			} else if (exp >= 52) {
++				u32 = (uint32_t)(mant << (exp - 52));
++			} else {
++				u32 = (uint32_t)(mant >> (52 - exp));
++			}
++			if (sign) {
++				u32 = 0U - u32;
++			}
++			z_flag = exact ? PSR64_Z : 0U;
++		}
++
++		sweet_emu_write_x(ss, rd, (uint64_t)u32, false);
++		ss->cpsr = (ss->cpsr & ~PSR64_NZCV_MASK) | z_flag;
++		ss->pc = pc + 4ULL;
++		sweet_emu_record(SWEET_EMU_JSCVT, pc, insn);
++		return true;
++	}
++
++	/* 2b. ARMv8.3-A FCADD Vd.<T>, Vn.<T>, Vm.<T>, #<rot> */
++	if ((insn & 0xBF20EC00U) == 0x2E00E400U) {
++		uint32_t size = (insn >> 22) & 3U;
++		if ((size == 1U || size == 2U) && is_neon_saved_state64(&context->ns)) {
++			arm_neon_saved_state64_t *ns = neon_state64(&context->ns);
++			bool q = ((insn >> 30) & 1U) != 0;
++			uint32_t rot = (insn >> 12) & 1U; /* 0=#90, 1=#270 */
++			unsigned int rd = insn & 31U;
++			unsigned int rn = (insn >> 5) & 31U;
++			unsigned int rm = (insn >> 16) & 31U;
++
++			if (size == 2U) {
++				uint32_t vn[4], vm[4], vd[4] = {0, 0, 0, 0};
++				memcpy(vn, &ns->v.q[rn], 16);
++				memcpy(vm, &ns->v.q[rm], 16);
++				unsigned int pairs = q ? 2U : 1U;
++				for (unsigned int p = 0; p < pairs; p++) {
++					uint32_t b_im = vm[2U * p + 1U];
++					uint32_t b_re = vm[2U * p];
++					if (rot == 0U) {
++						vd[2U * p]      = sweet_f32_add(vn[2U * p], b_im ^ 0x80000000U);
++						vd[2U * p + 1U] = sweet_f32_add(vn[2U * p + 1U], b_re);
++					} else {
++						vd[2U * p]      = sweet_f32_add(vn[2U * p], b_im);
++						vd[2U * p + 1U] = sweet_f32_add(vn[2U * p + 1U], b_re ^ 0x80000000U);
++					}
++				}
++				memcpy(&ns->v.q[rd], vd, 16);
++			} else {
++				uint16_t vn[8], vm[8], vd[8] = {0};
++				memcpy(vn, &ns->v.q[rn], 16);
++				memcpy(vm, &ns->v.q[rm], 16);
++				unsigned int pairs = q ? 4U : 2U;
++				for (unsigned int p = 0; p < pairs; p++) {
++					uint16_t b_im = vm[2U * p + 1U];
++					uint16_t b_re = vm[2U * p];
++					if (rot == 0U) {
++						vd[2U * p]      = sweet_f32_to_f16(sweet_f32_add(sweet_f16_to_f32(vn[2U * p]), sweet_f16_to_f32(b_im ^ 0x8000U)));
++						vd[2U * p + 1U] = sweet_f32_to_f16(sweet_f32_add(sweet_f16_to_f32(vn[2U * p + 1U]), sweet_f16_to_f32(b_re)));
++					} else {
++						vd[2U * p]      = sweet_f32_to_f16(sweet_f32_add(sweet_f16_to_f32(vn[2U * p]), sweet_f16_to_f32(b_im)));
++						vd[2U * p + 1U] = sweet_f32_to_f16(sweet_f32_add(sweet_f16_to_f32(vn[2U * p + 1U]), sweet_f16_to_f32(b_re ^ 0x8000U)));
++					}
++				}
++				memcpy(&ns->v.q[rd], vd, 16);
++			}
++			ss->pc = pc + 4ULL;
++			sweet_emu_record(SWEET_EMU_FCMA, pc, insn);
++			return true;
++		}
++	}
++
++	/* 2c. ARMv8.3-A FCMLA Vd.<T>, Vn.<T>, Vm.<T>, #<rot> (vector) */
++	if ((insn & 0xBF20E400U) == 0x2E00C400U) {
++		uint32_t size = (insn >> 22) & 3U;
++		if ((size == 1U || size == 2U) && is_neon_saved_state64(&context->ns)) {
++			arm_neon_saved_state64_t *ns = neon_state64(&context->ns);
++			bool q = ((insn >> 30) & 1U) != 0;
++			uint32_t rot = (insn >> 11) & 3U;
++			unsigned int rd = insn & 31U;
++			unsigned int rn = (insn >> 5) & 31U;
++			unsigned int rm = (insn >> 16) & 31U;
++
++			if (size == 2U) {
++				uint32_t vd[4], vn[4], vm[4], out[4] = {0, 0, 0, 0};
++				memcpy(vd, &ns->v.q[rd], 16);
++				memcpy(vn, &ns->v.q[rn], 16);
++				memcpy(vm, &ns->v.q[rm], 16);
++				unsigned int pairs = q ? 2U : 1U;
++				for (unsigned int p = 0; p < pairs; p++) {
++					uint32_t x_sel = (rot & 1U) ? vn[2U * p + 1U] : vn[2U * p];
++					uint32_t y0    = (rot & 1U) ? vm[2U * p + 1U] : vm[2U * p];
++					uint32_t y1    = (rot & 1U) ? vm[2U * p]      : vm[2U * p + 1U];
++					bool neg0 = (rot == 1U || rot == 2U);
++					bool neg1 = (rot == 2U || rot == 3U);
++					out[2U * p]      = sweet_fcmla_lane_f32(vd[2U * p], x_sel, y0, neg0);
++					out[2U * p + 1U] = sweet_fcmla_lane_f32(vd[2U * p + 1U], x_sel, y1, neg1);
++				}
++				memcpy(&ns->v.q[rd], out, 16);
++			} else {
++				uint16_t vd[8], vn[8], vm[8], out[8] = {0};
++				memcpy(vd, &ns->v.q[rd], 16);
++				memcpy(vn, &ns->v.q[rn], 16);
++				memcpy(vm, &ns->v.q[rm], 16);
++				unsigned int pairs = q ? 4U : 2U;
++				for (unsigned int p = 0; p < pairs; p++) {
++					uint16_t x_sel = (rot & 1U) ? vn[2U * p + 1U] : vn[2U * p];
++					uint16_t y0    = (rot & 1U) ? vm[2U * p + 1U] : vm[2U * p];
++					uint16_t y1    = (rot & 1U) ? vm[2U * p]      : vm[2U * p + 1U];
++					bool neg0 = (rot == 1U || rot == 2U);
++					bool neg1 = (rot == 2U || rot == 3U);
++					out[2U * p]      = sweet_fcmla_lane_f16(vd[2U * p], x_sel, y0, neg0);
++					out[2U * p + 1U] = sweet_fcmla_lane_f16(vd[2U * p + 1U], x_sel, y1, neg1);
++				}
++				memcpy(&ns->v.q[rd], out, 16);
++			}
++			ss->pc = pc + 4ULL;
++			sweet_emu_record(SWEET_EMU_FCMA, pc, insn);
++			return true;
++		}
++	}
++
++	/* 2d. ARMv8.3-A FCMLA Vd.<T>, Vn.<T>, Vm.<Ts>[idx], #<rot> (by element) */
++	if ((insn & 0xBF009400U) == 0x2F001000U) {
++		uint32_t size = (insn >> 22) & 3U;
++		bool q = ((insn >> 30) & 1U) != 0;
++		uint32_t l_bit = (insn >> 21) & 1U;
++		uint32_t h_bit = (insn >> 11) & 1U;
++		uint32_t rot   = (insn >> 13) & 3U;
++		unsigned int rd = insn & 31U;
++		unsigned int rn = (insn >> 5) & 31U;
++
++		if (size == 2U && q && l_bit == 0U && is_neon_saved_state64(&context->ns)) {
++			arm_neon_saved_state64_t *ns = neon_state64(&context->ns);
++			unsigned int rm = (insn >> 16) & 31U;
++			unsigned int idx = h_bit;
++			uint32_t vd[4], vn[4], vm[4], out[4];
++			memcpy(vd, &ns->v.q[rd], 16);
++			memcpy(vn, &ns->v.q[rn], 16);
++			memcpy(vm, &ns->v.q[rm], 16);
++			uint32_t m_re = vm[2U * idx];
++			uint32_t m_im = vm[2U * idx + 1U];
++			for (unsigned int p = 0; p < 2U; p++) {
++				uint32_t x_sel = (rot & 1U) ? vn[2U * p + 1U] : vn[2U * p];
++				uint32_t y0    = (rot & 1U) ? m_im : m_re;
++				uint32_t y1    = (rot & 1U) ? m_re : m_im;
++				bool neg0 = (rot == 1U || rot == 2U);
++				bool neg1 = (rot == 2U || rot == 3U);
++				out[2U * p]      = sweet_fcmla_lane_f32(vd[2U * p], x_sel, y0, neg0);
++				out[2U * p + 1U] = sweet_fcmla_lane_f32(vd[2U * p + 1U], x_sel, y1, neg1);
++			}
++			memcpy(&ns->v.q[rd], out, 16);
++			ss->pc = pc + 4ULL;
++			sweet_emu_record(SWEET_EMU_FCMA, pc, insn);
++			return true;
++		}
++		if (size == 1U && (((insn >> 20) & 1U) == 0U) && is_neon_saved_state64(&context->ns)) {
++			/* Note: for FP16 indexed FCMLA, M (bit 20) is 0 because Rm is 4-bit V0..V15 */
++			arm_neon_saved_state64_t *ns = neon_state64(&context->ns);
++			unsigned int rm = (insn >> 16) & 15U;
++			unsigned int idx = (h_bit << 1) | l_bit;
++			uint16_t vd[8], vn[8], vm[8], out[8] = {0};
++			memcpy(vd, &ns->v.q[rd], 16);
++			memcpy(vn, &ns->v.q[rn], 16);
++			memcpy(vm, &ns->v.q[rm], 16);
++			uint16_t m_re = vm[2U * idx];
++			uint16_t m_im = vm[2U * idx + 1U];
++			unsigned int pairs = q ? 4U : 2U;
++			for (unsigned int p = 0; p < pairs; p++) {
++				uint16_t x_sel = (rot & 1U) ? vn[2U * p + 1U] : vn[2U * p];
++				uint16_t y0    = (rot & 1U) ? m_im : m_re;
++				uint16_t y1    = (rot & 1U) ? m_re : m_im;
++				bool neg0 = (rot == 1U || rot == 2U);
++				bool neg1 = (rot == 2U || rot == 3U);
++				out[2U * p]      = sweet_fcmla_lane_f16(vd[2U * p], x_sel, y0, neg0);
++				out[2U * p + 1U] = sweet_fcmla_lane_f16(vd[2U * p + 1U], x_sel, y1, neg1);
++			}
++			memcpy(&ns->v.q[rd], out, 16);
++			ss->pc = pc + 4ULL;
++			sweet_emu_record(SWEET_EMU_FCMA, pc, insn);
++			return true;
++		}
++	}
++
++	/* 3a. ARMv8.4-A FEAT_LRCPC2: stlurb/h/w/x, ldapurb/sb/h/sh/w/sw/x */
++	if ((insn & 0x3F200C00U) == 0x19000000U) {
++		uint32_t size = (insn >> 30) & 3U;
++		uint32_t opc  = (insn >> 22) & 3U;
++		bool valid = (opc == 0U) || (opc == 1U) ||
++		    (opc == 2U && size <= 2U) ||
++		    (opc == 3U && size <= 1U);
++		if (valid) {
++			unsigned int rt = insn & 31U;
++			unsigned int rn = (insn >> 5) & 31U;
++			int64_t simm9   = (int64_t)(((int32_t)((insn >> 12) & 0x1FFU) << 23) >> 23);
++			uint64_t addr   = sweet_emu_read_x(ss, rn, true) + (uint64_t)simm9;
++			uint64_t uaddr  = sweet_emu_tbi_uaddr(addr);
++			vm_size_t nbytes = (vm_size_t)1U << size;
++
++			if (opc == 0U) {
++				uint64_t val = sweet_emu_read_x(ss, rt, false);
++				__c11_atomic_thread_fence(__ATOMIC_RELEASE);
++				if (copyout((const char *)&val, (user_addr_t)uaddr, nbytes) != 0) {
++					sweet_emu_deliver_bad_access(addr);
++				}
++			} else {
++				uint64_t raw = 0;
++				if (copyin((user_addr_t)uaddr, (char *)&raw, nbytes) != 0) {
++					sweet_emu_deliver_bad_access(addr);
++				}
++				__c11_atomic_thread_fence(__ATOMIC_ACQUIRE);
++				uint64_t res = raw;
++				if (opc == 2U) {
++					if (size == 0U) {
++						res = (uint64_t)(int64_t)(int8_t)(uint8_t)raw;
++					} else if (size == 1U) {
++						res = (uint64_t)(int64_t)(int16_t)(uint16_t)raw;
++					} else {
++						res = (uint64_t)(int64_t)(int32_t)(uint32_t)raw;
++					}
++				} else if (opc == 3U) {
++					if (size == 0U) {
++						res = (uint64_t)(uint32_t)(int32_t)(int8_t)(uint8_t)raw;
++					} else {
++						res = (uint64_t)(uint32_t)(int32_t)(int16_t)(uint16_t)raw;
++					}
++				}
++				sweet_emu_write_x(ss, rt, res, false);
++			}
++			ss->pc = pc + 4ULL;
++			sweet_emu_record(SWEET_EMU_LRCPC2, pc, insn);
++			return true;
++		}
++	}
++
++	/* 3b. ARMv8.4-A FEAT_FlagM & FEAT_DIT: cfinv, rmif, setf8, setf16, msr/mrs DIT */
++	if (insn == 0xD500401FU) {
++		ss->cpsr ^= PSR64_C;
++		ss->pc = pc + 4ULL;
++		sweet_emu_record(SWEET_EMU_FLAGM_DIT, pc, insn);
++		return true;
++	}
++	if ((insn & 0xFFE07C10U) == 0xBA000400U) {
++		uint32_t imm6  = (insn >> 15) & 0x3FU;
++		uint32_t mask4 = insn & 0xFU;
++		uint64_t xn    = sweet_emu_read_x(ss, (insn >> 5) & 31U, false);
++		uint32_t rot4  = (uint32_t)(((imm6 == 0U) ? xn : ((xn >> imm6) | (xn << (64U - imm6)))) & 0xFULL);
++		uint32_t cur4  = (ss->cpsr >> 28) & 0xFU;
++		uint32_t new4  = (cur4 & ~mask4) | (rot4 & mask4);
++		ss->cpsr = (ss->cpsr & ~PSR64_NZCV_MASK) | (new4 << 28);
++		ss->pc = pc + 4ULL;
++		sweet_emu_record(SWEET_EMU_FLAGM_DIT, pc, insn);
++		return true;
++	}
++	if ((insn & 0xFFFFBC1FU) == 0x3A00080DU) {
++		bool is16   = ((insn >> 14) & 1U) != 0;
++		uint32_t wn = (uint32_t)sweet_emu_read_x(ss, (insn >> 5) & 31U, false);
++		uint32_t n_b, z_b, v_b;
++		if (!is16) {
++			n_b = (wn >> 7) & 1U;
++			z_b = ((wn & 0xFFU) == 0U) ? 1U : 0U;
++			v_b = ((wn >> 8) ^ (wn >> 7)) & 1U;
++		} else {
++			n_b = (wn >> 15) & 1U;
++			z_b = ((wn & 0xFFFFU) == 0U) ? 1U : 0U;
++			v_b = ((wn >> 16) ^ (wn >> 15)) & 1U;
++		}
++		uint32_t c_b = (ss->cpsr >> 29) & 1U;
++		ss->cpsr = (ss->cpsr & ~PSR64_NZCV_MASK) |
++		    (n_b << 31) | (z_b << 30) | (c_b << 29) | (v_b << 28);
++		ss->pc = pc + 4ULL;
++		sweet_emu_record(SWEET_EMU_FLAGM_DIT, pc, insn);
++		return true;
++	}
++	if ((insn & 0xFFFFF0FFU) == 0xD503405FU ||
++	    (insn & 0xFFFFFFE0U) == 0xD51B42A0U) {
++		/* MSR DIT, #imm or MSR DIT, Xt */
++		ss->pc = pc + 4ULL;
++		sweet_emu_record(SWEET_EMU_FLAGM_DIT, pc, insn);
++		return true;
++	}
++	if ((insn & 0xFFFFFFE0U) == 0xD53B42A0U) {
++		/* MRS Xt, DIT */
++		sweet_emu_write_x(ss, insn & 31U, 0ULL, false);
++		ss->pc = pc + 4ULL;
++		sweet_emu_record(SWEET_EMU_FLAGM_DIT, pc, insn);
++		return true;
++	}
++
++	/* 3c. FEAT_SHA3 SIMD bitwise instructions: EOR3, BCAX, RAX1, XAR */
++	if ((insn & 0xFFE08000U) == 0xCE000000U ||
++	    (insn & 0xFFE08000U) == 0xCE200000U ||
++	    (insn & 0xFFE0FC00U) == 0xCE608C00U ||
++	    (insn & 0xFFE00000U) == 0xCE800000U) {
++		if (!is_neon_saved_state64(&context->ns)) {
++			return false;
++		}
++		arm_neon_saved_state64_t *ns = neon_state64(&context->ns);
++		unsigned int rd = insn & 31U;
++		unsigned int rn = (insn >> 5) & 31U;
++		unsigned int rm = (insn >> 16) & 31U;
++		uint64_t qn[2], qm[2], qd[2];
++		memcpy(qn, &ns->v.q[rn], 16);
++		memcpy(qm, &ns->v.q[rm], 16);
++
++		if ((insn & 0xFFE08000U) == 0xCE000000U) {
++			/* EOR3 Vd.16B, Vn.16B, Vm.16B, Va.16B */
++			unsigned int ra = (insn >> 10) & 31U;
++			uint64_t qa[2];
++			memcpy(qa, &ns->v.q[ra], 16);
++			qd[0] = qn[0] ^ qm[0] ^ qa[0];
++			qd[1] = qn[1] ^ qm[1] ^ qa[1];
++		} else if ((insn & 0xFFE08000U) == 0xCE200000U) {
++			/* BCAX Vd.16B, Vn.16B, Vm.16B, Va.16B */
++			unsigned int ra = (insn >> 10) & 31U;
++			uint64_t qa[2];
++			memcpy(qa, &ns->v.q[ra], 16);
++			qd[0] = qn[0] ^ (qm[0] & ~qa[0]);
++			qd[1] = qn[1] ^ (qm[1] & ~qa[1]);
++		} else if ((insn & 0xFFE0FC00U) == 0xCE608C00U) {
++			/* RAX1 Vd.2D, Vn.2D, Vm.2D */
++			qd[0] = qn[0] ^ ((qm[0] << 1) | (qm[0] >> 63));
++			qd[1] = qn[1] ^ ((qm[1] << 1) | (qm[1] >> 63));
++		} else {
++			/* XAR Vd.2D, Vn.2D, Vm.2D, #imm6 */
++			uint32_t imm6 = (insn >> 10) & 0x3FU;
++			uint64_t x0 = qn[0] ^ qm[0];
++			uint64_t x1 = qn[1] ^ qm[1];
++			qd[0] = (imm6 == 0U) ? x0 : ((x0 >> imm6) | (x0 << (64U - imm6)));
++			qd[1] = (imm6 == 0U) ? x1 : ((x1 >> imm6) | (x1 << (64U - imm6)));
++		}
++		memcpy(&ns->v.q[rd], qd, 16);
++		ss->pc = pc + 4ULL;
++		sweet_emu_record(SWEET_EMU_SHA3, pc, insn);
++		return true;
++	}
++
++	return false;
++}
++#endif /* defined(SWEET) */
++
++
+ static void handle_kernel_breakpoint(arm_saved_state_t *, uint64_t);
+ 
+ static void handle_user_breakpoint(arm_saved_state_t *, uint64_t) __dead2;
+@@ -951,6 +1900,11 @@ sleh_synchronous(arm_context_t *context, uint64_t esr, vm_offset_t far, __unused
+ 		break;
+ 
+ 	case ESR_EC_MSR_TRAP:
++#if defined(SWEET)
++		if (is_user && sweet_emulate_user_arm64(context)) {
++			break;
++		}
++#endif
+ 		handle_msr_trap(state, esr);
+ 		break;
+ /**
+@@ -1011,6 +1965,11 @@ sleh_synchronous(arm_context_t *context, uint64_t esr, vm_offset_t far, __unused
+ 			break;
+ 		}
+ #endif /* CONFIG_XNUPOST */
++#if defined(SWEET)
++		if (is_user && sweet_emulate_user_arm64(context)) {
++			break;
++		}
++#endif
+ 		handle_uncategorized(&context->ss);
+ 		break;
+ 

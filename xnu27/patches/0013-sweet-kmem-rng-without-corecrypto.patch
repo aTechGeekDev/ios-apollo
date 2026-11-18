@@ -1,0 +1,106 @@
+diff --git a/libkern/crypto/corecrypto_rand.c b/libkern/crypto/corecrypto_rand.c
+index d46815b..b4ddac1 100644
+--- a/libkern/crypto/corecrypto_rand.c
++++ b/libkern/crypto/corecrypto_rand.c
+@@ -29,6 +29,45 @@
+ #include <libkern/crypto/crypto_internal.h>
+ #include <corecrypto/ccrng.h>
+ #include <libkern/crypto/rand.h>
++#if defined(SWEET)
++#include <kern/assert.h>
++#include <prng/random.h>
++#include <string.h>
++
++/*
++ * No corecrypto kext is loaded on SWEET. VM/allocator callers (such as
++ * vm_map_store) require a lock-free per-CPU generator seeded during EARLY_BOOT
++ * from early_random().
++ *
++ * SplitMix64: Sebastiano Vigna, 2015, public-domain reference:
++ * https://prng.di.unimi.it/splitmix64.c
++ */
++struct sweet_kmem_rng {
++	uint64_t state;
++};
++
++static uint64_t
++sweet_kmem_random64(struct sweet_kmem_rng *rng)
++{
++	uint64_t value = (rng->state += 0x9e3779b97f4a7c15ULL);
++	value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
++	value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
++	return value ^ (value >> 31);
++}
++
++static uint64_t
++sweet_kmem_uniform(struct sweet_kmem_rng *rng, uint64_t bound)
++{
++	assert(bound != 0);
++	/* Reject the incomplete residue interval to avoid modulo bias. */
++	const uint64_t threshold = -bound % bound;
++	uint64_t value;
++	do {
++		value = sweet_kmem_random64(rng);
++	} while (value < threshold);
++	return value % bound;
++}
++#endif /* SWEET */
+ 
+ int
+ cc_rand_generate(void *out, size_t outlen)
+@@ -58,6 +97,19 @@ crypto_random_generate(
+ 	void *random,
+ 	size_t random_size)
+ {
++#if defined(SWEET)
++	if (g_crypto_funcs == NULL) {
++		uint8_t *dst = (uint8_t *)random;
++		while (random_size > 0) {
++			uint64_t word = sweet_kmem_random64((struct sweet_kmem_rng *)ctx);
++			size_t chunk = random_size < sizeof(word) ? random_size : sizeof(word);
++			memcpy(dst, &word, chunk);
++			dst += chunk;
++			random_size -= chunk;
++		}
++		return;
++	}
++#endif
+ 	g_crypto_funcs->random_generate_fn(ctx, random, random_size);
+ }
+ 
+@@ -67,12 +119,23 @@ crypto_random_uniform(
+ 	uint64_t bound,
+ 	uint64_t *random)
+ {
++#if defined(SWEET)
++	if (g_crypto_funcs == NULL) {
++		*random = sweet_kmem_uniform((struct sweet_kmem_rng *)ctx, bound);
++		return;
++	}
++#endif
+ 	g_crypto_funcs->random_uniform_fn(ctx, bound, random);
+ }
+ 
+ size_t
+ crypto_random_kmem_ctx_size(void)
+ {
++#if defined(SWEET)
++	if (g_crypto_funcs == NULL) {
++		return sizeof(struct sweet_kmem_rng);
++	}
++#endif
+ 	return g_crypto_funcs->random_kmem_ctx_size_fn();
+ }
+ 
+@@ -80,5 +143,11 @@ void
+ crypto_random_kmem_init(
+ 	crypto_random_ctx_t ctx)
+ {
++#if defined(SWEET)
++	if (g_crypto_funcs == NULL) {
++		((struct sweet_kmem_rng *)ctx)->state = early_random();
++		return;
++	}
++#endif
+ 	g_crypto_funcs->random_kmem_init_fn(ctx);
+ }

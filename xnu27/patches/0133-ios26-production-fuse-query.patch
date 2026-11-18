@@ -1,0 +1,20 @@
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+index a330beb..acde519 100644
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2649,6 +2649,15 @@ void
+ ml_enable_monitor(void)
+ {
+ }
++
++/* No Apple fuse controller on SWEET. Match the conservative x86 fallback:
++ * do not advertise an engineering-sample device through hw target sysctls.
++ * This does not inspect or modify Qualcomm fuse state. */
++boolean_t
++ml_device_is_prod_fused(void)
++{
++	return TRUE;
++}
+ #endif /* SWEET */
+ 
+ boolean_t

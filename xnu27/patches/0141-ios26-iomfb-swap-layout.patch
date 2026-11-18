@@ -1,0 +1,65 @@
+From d628a6a0a48af83462e99221382c455d81b218c2 Mon Sep 17 00:00:00 2001
+From: XNU 26 Rebase <rebase@local>
+Date: Tue, 27 Oct 2026 16:26:54 +0000
+Subject: [PATCH] ios26: normalize 0x588-byte SwapEnd record (+0x48 layer
+ offset) in SweetFramebuffer
+
+---
+ iokit/Kernel/arm/SweetFramebuffer.cpp | 20 +++++++++++++++-----
+ 1 file changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3193b0c..b9369c8 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -82,6 +82,8 @@ enum {
+ };
+ 
+ #define SWEET_FB_SWAP_REC_SIZE          0x46c
++#define SWEET_FB_SWAP_REC_SIZE_26       0x588   /* iOS 26 SwapEnd record (+0x48 layer shift) */
++#define SWEET_FB_SWAP_OFF_26            0x48
+ #define SWEET_FB_LAYERS                 4
+ #define SWEET_FB_NOTIFY_TYPES           8
+ #define SWEET_FB_NOTIFY_VSYNC           5
+@@ -830,7 +832,7 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+ 	    kIOUserNotifyOptionCanDrop);
+ }
+ 
+-static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
++static uint64_t sweet_fb_logged[2];     /* selectors already logged (< 128) */
+ 
+ IOReturn
+ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+@@ -859,7 +861,15 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+-		memcpy(rec, args->structureInput, sizeof(rec));
++		const uint8_t *in = (const uint8_t *)args->structureInput;
++		if (args->structureInputSize >= SWEET_FB_SWAP_REC_SIZE_26) {
++			bzero(rec, sizeof(rec));
++			memcpy(rec, in, 0x50);
++			memcpy(rec + 0x50, in + 0x50 + SWEET_FB_SWAP_OFF_26,
++			    SWEET_FB_SWAP_REC_SIZE - 0x50 - SWEET_FB_SWAP_OFF_26);
++		} else {
++			memcpy(rec, in, sizeof(rec));
++		}
+ 		fFB->swap(rec);
+ 		break;
+ 	}
+@@ -920,9 +930,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
+ 		bzero(args->structureOutput, args->structureOutputSize);
+ 	}
+-	if (selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {
+-		if (selector < 64) {
+-			sweet_fb_logged |= 1ULL << selector;
++	if (selector >= 128 || !(sweet_fb_logged[selector >> 6] & (1ULL << (selector & 63)))) {
++		if (selector < 128) {
++			sweet_fb_logged[selector >> 6] |= 1ULL << (selector & 63);
+ 		}
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+-- 
+2.43.0
+

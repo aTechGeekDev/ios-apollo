@@ -1,0 +1,156 @@
+name: xnu27
+
+# The iOS 26/27-generation kernel for apollo: Apple's xnu-12377.121.6 (macOS 26.5's xnu, the source UniXNU and
+# Scion run iOS 27 on) with xnu27/patches, MACHINE_CONFIG=SWEET, plain arm64 (no pointer authentication: the
+# SM8250 has none; arm64e user space is rewritten, see NOTES.md "iOS 27 TRACK"). The build recipe is
+# IOS-26-Hot's (github.com/nithinyadavamaraboina-online/IOS-26-Hot, MIT, d249939b): blacktop's darwin-xnu-build
+# at a pinned commit, a stand-in Kernel Debug Kit with only the CoreEntitlements v2 headers (SWEET links no
+# closed KDK archive), then every xnu27/patches/*.sh staging script and every *.patch, fail-fast.
+# The iOS 16 kernel (xnu/patches, xnu.yml) is untouched.
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_config:
+        description: RELEASE / DEVELOPMENT / DEBUG
+        default: DEVELOPMENT
+      keep_going:
+        description: make -k (collect all compile errors in one run)
+        default: "true"
+  push:
+    paths:
+      - "xnu27/**"
+      - ".github/workflows/xnu27.yml"
+
+concurrency:
+  group: xnu27-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: bd88697145b2d8008bbed951fef99795308262f0
+  MACOS_VERSION: "26.5"
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+  MACHINE_CONFIG: SWEET
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch build script
+        run: |
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          p = Path("dxb/build.sh")
+          s = p.read_text()
+          # 1. Use the stand-in KDK given in KDKROOT instead of downloading Apple's (an Apple account).
+          s, n = re.subn(r"KDKROOT='(/Library/Developer/KDKs/[^']+)'", r'KDKROOT="${KDKROOT:-\1}"', s)
+          assert n > 0, "KDKROOT not found in dxb/build.sh"
+          # 2. libfirehose_kernel is built arm64e-only upstream; the SWEET kernel is plain arm64.
+          old_arch = 'ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"'
+          assert old_arch in s, "libfirehose_kernel ARCHS not found in dxb/build.sh"
+          s = s.replace(old_arch, 'ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"', 1)
+          # 3. After dxb's own (conditional) 26.0 patches: our staging scripts, then our patches, fail-fast.
+          old = ('        for PATCH in "${PATCH_DIR}"/*.patch; do\n'
+                 '            if git apply --check "$PATCH" 2> /dev/null; then\n'
+                 '                running "Applying patch: ${PATCH}"\n'
+                 '                git apply "$PATCH"\n'
+                 '            fi\n'
+                 '        done')
+          assert old in s, "patch loop not found in dxb/build.sh"
+          new = (old + '\n'
+                 '        SWEET_PATCH_DIR="${GITHUB_WORKSPACE}/xnu27/patches"\n'
+                 '        for SCRIPT in "${SWEET_PATCH_DIR}"/*.sh; do\n'
+                 '            running "Running staging script: ${SCRIPT}"\n'
+                 '            bash "${SCRIPT}"\n'
+                 '        done\n'
+                 '        for PATCH in "${SWEET_PATCH_DIR}"/*.patch; do\n'
+                 '            running "Applying xnu27 patch: ${PATCH}"\n'
+                 '            git apply --verbose "$PATCH"\n'
+                 '        done')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          ls xnu27/patches | wc -l
+
+      - name: Deps
+        run: |
+          for pkg in jq gum bash cmake ninja; do
+            command -v "$pkg" >/dev/null 2>&1 || brew install "$pkg"
+          done
+          # build.sh only checks that xcodes exists
+          if ! command -v xcodes >/dev/null 2>&1; then
+            printf '#!/bin/sh\nexit 0\n' | sudo tee "$(brew --prefix)/bin/xcodes" >/dev/null
+            sudo chmod +x "$(brew --prefix)/bin/xcodes"
+          fi
+          mkdir -p "$PWD/fake-kdk"
+          KDKROOT="$PWD/fake-kdk" bash xnu27/patches/0000-stage-coreentitlements-v2.sh
+          echo "KDKROOT=$PWD/fake-kdk" >> "$GITHUB_ENV"
+          sw_vers
+          ls -d /Applications/Xcode*.app
+          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1 || true)
+          [ -n "$XC" ] || XC=/Applications/Xcode.app
+          sudo xcode-select -s "$XC"
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          xcodebuild -version
+          xcrun --find iig
+
+      - name: Build
+        working-directory: dxb
+        env:
+          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee ../build.log
+
+      # The full log is too long to read the errors from its tail: repeat them at the end.
+      - name: Compile errors
+        if: failure()
+        run: |
+          grep -c -E ' error:' build.log || true
+          grep -n -B4 -A8 -E ' error:|^error: |patch does not apply|No such file' build.log | head -600 || true
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out out-debug
+          for f in dxb/fakeroot/System/Library/Kernels/kernel.*; do
+            [ -e "$f" ] || continue
+            b=$(basename "$f")
+            case "$b" in
+              *.dSYM|*.link|*.unstripped) cp -R "$f" "out-debug/$b" ;;
+              *) [ -f "$f" ] && cp "$f" "out/$b" ;;
+            esac
+          done
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) 2>/dev/null || true
+          ls -la out out-debug
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu27-kernel
+          path: out/
+          if-no-files-found: warn
+
+      - name: Package build tree for local compiles
+        if: failure()
+        run: |
+          tar czf buildtree.tgz --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' \
+            --exclude='*.unstripped' --exclude='.git' -C dxb build/xnu.obj xnu 2>/dev/null || true
+          ls -la buildtree.tgz || true
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: xnu27-buildtree
+          path: buildtree.tgz
+          retention-days: 7
