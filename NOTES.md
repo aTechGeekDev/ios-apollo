@@ -30,6 +30,12 @@
 - Run 44312965616 (6ca2002): BSD and osfmk errors in 6 files.
   - Base files: kern_exec.c / necp_client.c CodeSignature/Entitlements.h and kCSWebBrowserNetworkEntitlement, sleh.c INTERRUPT_MASKED_DEBUG_*, exception.c VM calls. All fixed by IOS-26-Hot 0132, now taken without its printf.c hunk.
   - Ours: MAX_SCHED_CPUS (1153/1180) becomes MAX_CPUS, and the -fbounds-safety errors in 1135's uipc_syscalls.c diagnostics are fixed. Both are in 1900.
+- **Run 44317699128 (86d68c0): GREEN.** The first xnu-12377 (iOS 26/27 generation) SWEET kernel with all apollo drivers.
+  - `kernel.development.sweet`, 21,965,360 bytes; Xcode 26.6.0, macOS 26.5 SDK.
+  - The "Check the Wi-Fi driver is in" step passed (ath11k's `unified ready` and sweet_wifi.c's `THE DRIVER IS UP` strings are in the binary).
+  - Artifact `xnu27-kernel` (id 14434580323, zip sha256 815f1247...). Download:
+    `gh run download 44317699128 -R aTechGeekDev/ios-apollo -n xnu27-kernel -D xnu27/out`
+  - **Not booted.** It needs an ADT with the iPhone 11 identity, the iOS 27 root, and the partition answer from the user.
 
 **Not yet taken from IOS-26-Hot:** its other generic iOS 26 patches. They are tangled with its Pixel 4 / Realme files, which collide by name with ours (sweet_gpu.c, SweetAccelerator.cpp, ...).
 - **Conflict hunks**, measured by cherry-picking onto the base:

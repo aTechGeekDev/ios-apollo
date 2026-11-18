@@ -24,7 +24,9 @@ iOS 26 patches (0134 firehose, 0136, 0137, 0138 PAC fast path, 0142 IOSurface AB
 also edit those phones' code; they are being split (NOTES.md, "iOS 27 TRACK") and join as their generic parts are
 resolved.
 
-Applying is not compiling: xnu-12377's API changes will show in the first builds and get fixed in these files.
+**Builds:** run 44317699128 (commit 86d68c0) is the first green one: `kernel.development.sweet`, 21,965,360 bytes,
+Xcode 26.6.0 / macOS 26.5 SDK, the Wi-Fi driver linked. Not booted yet. Download:
+`gh run download 44317699128 -R aTechGeekDev/ios-apollo -n xnu27-kernel -D xnu27/out`.
 
 ## Licenses
 
