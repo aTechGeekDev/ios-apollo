@@ -26,7 +26,7 @@
 - **`unixnu-apollo/scripts/apollo-adt.py`:**
   - `gap`: lists what our kernel reads and UniXNU's generator does not write (the migration worklist).
   - `payload`: puts mkadt.py's tree plus DarwinBoot's `darwinboot-memory-size` and memory-map placeholders into payload.img; sets `dram-base`/`dram-size` to the window (`--window`, default 0xc0000000:0x100000000) and `/pram` to 0x27ff00000 (`--pram`); refuses a command line ≥ 608 bytes.
-- **CI: `.github/workflows/unixnu.yml`** (Linux): resolve, record check, DTS → ADT, gap report.
+- **CI: `.github/workflows/unixnu.yml`** (Linux): resolve, record check, DTS → ADT, gap report. First run 44291202732 (commit 15f0329) GREEN in 47 s.
 - **Environment:** at the user's request ("allow everything to resolve") this cloud environment's network is now unrestricted (it was limited; unixnu.com was blocked).
 
 **Host results (observed here; logs in `unixnu-apollo/evidence/host/`):**
